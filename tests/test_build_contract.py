@@ -1,4 +1,5 @@
 import pathlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -80,6 +81,11 @@ class BuildContractTest(unittest.TestCase):
             source.index("[build] OpenSBI"),
             source.index("[build] U-Boot"),
             "OpenSBI must exist before U-Boot binman assembles its ITB",
+        )
+        self.assertRegex(
+            source,
+            re.compile(r'merge_config\.sh" \\\n\s+-m '),
+            "merge_config must not run make from the superproject root",
         )
         subprocess.run(["bash", "-n", str(BUILD_SCRIPT)], check=True)
 

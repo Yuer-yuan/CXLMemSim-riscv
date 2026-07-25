@@ -127,7 +127,7 @@ make -C "${ROOT}/components/linux" O="${BUILD}/linux" \
 	ARCH=riscv CROSS_COMPILE="${CROSS_COMPILE}" defconfig
 ARCH=riscv CROSS_COMPILE="${CROSS_COMPILE}" \
 	"${ROOT}/components/linux/scripts/kconfig/merge_config.sh" \
-	-O "${BUILD}/linux" \
+	-m -O "${BUILD}/linux" \
 	"${BUILD}/linux/.config" \
 	"${ROOT}/configs/linux-cxl.config"
 "${ROOT}/components/linux/scripts/config" \
