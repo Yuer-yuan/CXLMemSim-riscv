@@ -132,15 +132,18 @@ class Console:
             pass
         return self.process.returncode
 
+    def terminate(self):
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+
     def close(self):
         try:
-            if self.process.poll() is None:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
+            self.terminate()
             while self._read_once(0):
                 pass
         finally:
@@ -527,6 +530,18 @@ def wait_for_shm_removed(
         )
 
 
+def finish_qemu(console):
+    console.wait("reboot: Power down")
+    try:
+        return_code = console.wait_for_exit(timeout=5)
+    except TimeoutError:
+        console.terminate()
+        return "terminated-by-harness"
+    if return_code != 0:
+        raise RuntimeError(f"QEMU exited with status {return_code}")
+    return "guest-poweroff"
+
+
 def execute_workflow(paths, benchmark_bytes, timeout, shm_path=SHM_PATH):
     manifest = load_verified_manifest(paths)
     command = build_qemu_command(paths)
@@ -548,9 +563,7 @@ def execute_workflow(paths, benchmark_bytes, timeout, shm_path=SHM_PATH):
             paths,
             benchmark_bytes=benchmark_bytes,
         )
-        return_code = console.wait_for_exit(timeout=30)
-        if return_code != 0:
-            raise RuntimeError(f"QEMU exited with status {return_code}")
+        finish_qemu(console)
     finally:
         if console is not None:
             console.close()

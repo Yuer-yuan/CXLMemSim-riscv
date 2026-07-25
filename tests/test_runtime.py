@@ -371,6 +371,23 @@ class RuntimeContractTest(unittest.TestCase):
         self.assertIn("READY", persisted)
         self.assertIn("DONE hello", persisted)
 
+    def test_finish_qemu_terminates_owned_process_after_powerdown(self):
+        finish_qemu = self.require_api("finish_qemu")
+        console = mock.Mock()
+        console.wait_for_exit.side_effect = TimeoutError(
+            "timed out waiting for QEMU to exit"
+        )
+        self.assertEqual(finish_qemu(console), "terminated-by-harness")
+        console.wait.assert_called_once_with("reboot: Power down")
+        console.terminate.assert_called_once_with()
+
+    def test_finish_qemu_accepts_clean_exit(self):
+        finish_qemu = self.require_api("finish_qemu")
+        console = mock.Mock()
+        console.wait_for_exit.return_value = 0
+        self.assertEqual(finish_qemu(console), "guest-poweroff")
+        console.terminate.assert_not_called()
+
     def test_result_schema_records_all_proof_boundaries(self):
         runtime = self.runtime()
         build_result = self.require_api("build_result")
