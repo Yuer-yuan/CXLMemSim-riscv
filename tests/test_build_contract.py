@@ -56,6 +56,7 @@ class BuildContractTest(unittest.TestCase):
             "--disable-werror",
             "sifive_unleashed_qemu_cxl_defconfig",
             "prepare_uboot_pylibfdt.py",
+            'OPENSBI="${BUILD}/opensbi/platform/generic/firmware/fw_dynamic.bin"',
             "PLATFORM=generic",
             "-march=rv64imafdc",
             "-mabi=lp64d",
@@ -73,6 +74,11 @@ class BuildContractTest(unittest.TestCase):
             "NO_PYTHON=1",
             source,
             "binman needs the in-tree pylibfdt built for the selected Python",
+        )
+        self.assertLess(
+            source.index("[build] OpenSBI"),
+            source.index("[build] U-Boot"),
+            "OpenSBI must exist before U-Boot binman assembles its ITB",
         )
         subprocess.run(["bash", "-n", str(BUILD_SCRIPT)], check=True)
 
