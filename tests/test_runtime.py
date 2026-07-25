@@ -306,7 +306,7 @@ class RuntimeContractTest(unittest.TestCase):
         self.assertEqual(console.commands[2], "cxl init")
         self.assertEqual(
             console.commands[3],
-            "setenv bootargs 'earlycon=sbi console=ttySIF0 loglevel=4 "
+            "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=4 "
             "cxl_bench_bytes=1048576'",
         )
         self.assertEqual(
