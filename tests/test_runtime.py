@@ -1,7 +1,12 @@
+import dataclasses
 import importlib.util
 import json
 import pathlib
+import struct
+import subprocess
+import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -24,6 +29,14 @@ class RuntimeContractTest(unittest.TestCase):
     def runtime(self):
         self.assertIsNotNone(RUNTIME, "scripts/run.py is missing")
         return RUNTIME
+
+    def require_api(self, name):
+        runtime = self.runtime()
+        self.assertTrue(
+            hasattr(runtime, name),
+            f"scripts/run.py is missing {name}()",
+        )
+        return getattr(runtime, name)
 
     def paths(self):
         runtime = self.runtime()
@@ -112,6 +125,121 @@ class RuntimeContractTest(unittest.TestCase):
             with self.subTest(transport_error=transport_error):
                 with self.assertRaises(ValueError):
                     runtime.validate_console(console + "\n" + transport_error)
+
+    def test_shm_header_requires_protocol_one_ready_and_256_mib(self):
+        runtime = self.runtime()
+        values = (
+            0x43584C53484D454D,
+            1,
+            64,
+            1,
+            1,
+            0,
+            268435456,
+            4194304,
+            1,
+            128,
+        )
+        header = struct.pack("<QIIIIQQQII8x", *values)
+        parse_shm_header = self.require_api("parse_shm_header")
+        parsed = parse_shm_header(header)
+        self.assertEqual(parsed["magic"], values[0])
+        self.assertEqual(parsed["version"], 1)
+        self.assertEqual(parsed["server_ready"], 1)
+        self.assertEqual(parsed["memory_size"], 268435456)
+        self.assertEqual(parsed["num_slots"], 64)
+        for index, replacement in (
+            (0, 0),
+            (1, 2),
+            (3, 0),
+            (6, 1048576),
+        ):
+            invalid = list(values)
+            invalid[index] = replacement
+            with self.subTest(index=index):
+                with self.assertRaises(ValueError):
+                    parse_shm_header(
+                        struct.pack("<QIIIIQQQII8x", *invalid)
+                    )
+        with self.assertRaises(ValueError):
+            parse_shm_header(b"short")
+
+    def test_preexisting_shm_fails_before_server_launch(self):
+        runtime = self.runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = pathlib.Path(temporary)
+            shm_path = temporary_path / "cxlmemsim_pgas"
+            shm_path.write_bytes(b"owned")
+            paths = dataclasses.replace(
+                self.paths(),
+                logs=temporary_path / "logs",
+            )
+            factory = mock.Mock()
+            start_server = self.require_api("start_server")
+            with self.assertRaises(FileExistsError):
+                start_server(
+                    paths,
+                    shm_path=shm_path,
+                    popen_factory=factory,
+                )
+            factory.assert_not_called()
+
+    def test_cleanup_escalates_only_the_owned_child(self):
+        runtime = self.runtime()
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = (
+            subprocess.TimeoutExpired(["server"], 10),
+            subprocess.TimeoutExpired(["server"], 5),
+            0,
+        )
+        stop_owned_process = self.require_api("stop_owned_process")
+        stop_owned_process(process)
+        process.send_signal.assert_called_once()
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 3)
+
+    def test_server_start_failure_cleans_up_the_created_child(self):
+        runtime = self.runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = pathlib.Path(temporary)
+            paths = dataclasses.replace(
+                self.paths(),
+                logs=temporary_path / "logs",
+            )
+            process = mock.Mock()
+            with mock.patch.object(
+                runtime,
+                "wait_for_shm",
+                side_effect=TimeoutError("not ready"),
+            ), mock.patch.object(
+                runtime,
+                "stop_owned_process",
+            ) as stop:
+                with self.assertRaises(TimeoutError):
+                    runtime.start_server(
+                        paths,
+                        shm_path=temporary_path / "cxlmemsim_pgas",
+                        popen_factory=mock.Mock(return_value=process),
+                    )
+            stop.assert_called_once_with(process)
+
+    def test_qemu_environment_explicitly_disables_latency_injection(self):
+        runtime = self.runtime()
+        build_environment = self.require_api("build_qemu_environment")
+        environment = build_environment(
+            self.paths(),
+            {"PATH": "/usr/bin", "KEEP": "yes"},
+        )
+        self.assertEqual(
+            environment["PATH"],
+            "/x/runtime-bin:/usr/bin",
+        )
+        self.assertEqual(environment["CXL_TRANSPORT_MODE"], "shm")
+        self.assertEqual(environment["CXL_PGAS_SHM"], "/cxlmemsim_pgas")
+        self.assertEqual(environment["CXL_LATENCY_INJECT"], "0")
+        self.assertEqual(environment["KEEP"], "yes")
 
 
 if __name__ == "__main__":
