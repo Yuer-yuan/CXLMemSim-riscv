@@ -1,0 +1,21 @@
+[submodule "components/qemu"]
+	path = components/qemu
+	url = https://github.com/Zettai-US/qemu-cxl-type2.git
+[submodule "components/u-boot"]
+	path = components/u-boot
+	url = https://github.com/SlugLab/u-boot.git
+[submodule "components/linux"]
+	path = components/linux
+	url = https://github.com/vickiegpt/linux-cxl-type2.git
+[submodule "components/cxlmemsim"]
+	path = components/cxlmemsim
+	url = https://github.com/SlugLab/CXLMemSim.git
+[submodule "components/opensbi"]
+	path = components/opensbi
+	url = https://github.com/riscv-software-src/opensbi.git
+[submodule "components/hifive-premier-tools"]
+	path = components/hifive-premier-tools
+	url = https://github.com/SlugLab/hifive-premier-p550-tools.git
+[submodule "components/meta-sifive"]
+	path = components/meta-sifive
+	url = https://github.com/SlugLab/meta-sifive.git
