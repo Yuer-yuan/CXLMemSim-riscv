@@ -114,6 +114,11 @@ class GuestBuildTest(unittest.TestCase):
     def test_init_freestanding_contract(self):
         self.require_source(INIT)
         source = INIT.read_text(encoding="utf-8")
+        self.assertIn("#define SYS_DUP3 24", source)
+        self.assertLess(
+            source.index("\treopen_console();"),
+            source.index('\twrite_text("CXL_GUEST_INIT_START'),
+        )
         for marker in (
             "CXL_GUEST_INIT_START",
             "CXL_DISK_PASS",

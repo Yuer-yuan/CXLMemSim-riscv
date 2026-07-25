@@ -3,9 +3,11 @@ typedef unsigned long uint64_t;
 
 #define AT_FDCWD (-100)
 #define O_RDONLY 0
+#define O_RDWR 2
 #define MS_RDONLY 1
 #define SIGCHLD 17
 
+#define SYS_DUP3 24
 #define SYS_MKDIRAT 34
 #define SYS_MOUNT 40
 #define SYS_OPENAT 56
@@ -200,6 +202,27 @@ static void mount_one(const char *source, const char *target,
 
 	if (result < 0 && result != -16)
 		fail(phase, result);
+}
+
+static void reopen_console(void)
+{
+	long console;
+	long result;
+	int target;
+
+	console = syscall4(SYS_OPENAT, AT_FDCWD, (long)"/dev/console",
+			   O_RDWR, 0);
+	if (console < 0)
+		fail("open-console", console);
+	for (target = 0; target <= 2; target++) {
+		if (console == target)
+			continue;
+		result = syscall3(SYS_DUP3, console, target, 0);
+		if (result < 0)
+			fail("dup-console", result);
+	}
+	if (console > 2)
+		syscall1(SYS_CLOSE, console);
 }
 
 static long read_file(const char *path, char *buffer, size_t capacity)
@@ -398,7 +421,6 @@ static void init_main(void)
 {
 	uint64_t bytes;
 
-	write_text("CXL_GUEST_INIT_START\n");
 	make_directory("/proc");
 	make_directory("/sys");
 	make_directory("/dev");
@@ -406,6 +428,8 @@ static void init_main(void)
 	mount_one("proc", "/proc", "proc", 0, "mount-proc");
 	mount_one("sysfs", "/sys", "sysfs", 0, "mount-sys");
 	mount_one("devtmpfs", "/dev", "devtmpfs", 0, "mount-dev");
+	reopen_console();
+	write_text("CXL_GUEST_INIT_START\n");
 	wait_for_disk();
 	mount_one("/dev/vda", "/mnt", "ext2", MS_RDONLY, "mount-ext2");
 	write_text("CXL_DISK_PASS\n");
