@@ -7,6 +7,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BENCHMARK = ROOT / "guest" / "cxl_mmap_bench.c"
+INIT = ROOT / "guest" / "init.c"
 CROSS_FLAGS = [
     "-O2",
     "-std=c11",
@@ -102,6 +103,34 @@ class GuestBuildTest(unittest.TestCase):
                 check=True,
             )
             self.assert_static_riscv_without_vector(binary)
+
+    def test_init_freestanding_contract(self):
+        self.require_source(INIT)
+        source = INIT.read_text(encoding="utf-8")
+        for marker in (
+            "CXL_GUEST_INIT_START",
+            "CXL_DISK_PASS",
+            "CXL_TOPOLOGY_PASS",
+            "CXL_QEMU_UBOOT_LINUX_BENCH_PASS",
+            "CXL_GUEST_INIT_FAIL",
+        ):
+            self.assertIn(marker, source)
+        self.assertNotIn("system(", source)
+        self.assertNotIn("popen(", source)
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = pathlib.Path(temporary) / "init.riscv64"
+            subprocess.run(
+                [
+                    "riscv64-linux-gnu-gcc",
+                    *CROSS_FLAGS,
+                    str(INIT),
+                    "-o",
+                    str(binary),
+                ],
+                check=True,
+            )
+            self.assert_static_riscv_without_vector(binary)
+
 
 if __name__ == "__main__":
     unittest.main()
