@@ -17,13 +17,6 @@ die()
 	exit 2
 }
 
-python_is_compatible_with_pinned_uboot()
-{
-	command -v "$1" >/dev/null 2>&1 &&
-		"$1" -c \
-			'import sys; raise SystemExit(0 if sys.version_info < (3, 13) else 1)'
-}
-
 while (($#)); do
 	case "$1" in
 	--jobs)
@@ -39,21 +32,6 @@ done
 
 [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] ||
 	die "jobs must be a positive integer"
-
-if [[ -n "${UBOOT_PYTHON:-}" ]]; then
-	python_is_compatible_with_pinned_uboot "${UBOOT_PYTHON}" ||
-		die "UBOOT_PYTHON must name Python older than 3.13"
-else
-	UBOOT_PYTHON=
-	for python_candidate in python3.12 python3; do
-		if python_is_compatible_with_pinned_uboot "${python_candidate}"; then
-			UBOOT_PYTHON="$(command -v "${python_candidate}")"
-			break
-		fi
-	done
-	[[ -n "${UBOOT_PYTHON}" ]] ||
-		die "pinned U-Boot pylibfdt requires Python older than 3.13; set UBOOT_PYTHON"
-fi
 
 mkdir -p \
 	"${BUILD}/qemu" \
@@ -81,10 +59,14 @@ ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
 
 printf '%s\n' "[build] U-Boot sifive_unleashed_qemu_cxl_defconfig"
 make -C "${ROOT}/components/u-boot" O="${BUILD}/u-boot" \
-	CROSS_COMPILE="${CROSS_COMPILE}" PYTHON3="${UBOOT_PYTHON}" \
+	CROSS_COMPILE="${CROSS_COMPILE}" \
 	sifive_unleashed_qemu_cxl_defconfig
+python3 "${ROOT}/scripts/prepare_uboot_pylibfdt.py" \
+	--source \
+	"${ROOT}/components/u-boot/scripts/dtc/pylibfdt/libfdt.i_shipped" \
+	--output "${BUILD}/u-boot/scripts/dtc/pylibfdt/libfdt.i"
 make -C "${ROOT}/components/u-boot" O="${BUILD}/u-boot" \
-	CROSS_COMPILE="${CROSS_COMPILE}" PYTHON3="${UBOOT_PYTHON}" -j "${JOBS}"
+	CROSS_COMPILE="${CROSS_COMPILE}" -j "${JOBS}"
 
 printf '%s\n' "[build] OpenSBI generic fw_dynamic"
 make -C "${ROOT}/components/opensbi" O="${BUILD}/opensbi" \

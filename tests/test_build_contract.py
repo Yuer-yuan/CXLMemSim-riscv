@@ -1,11 +1,13 @@
 import pathlib
 import subprocess
+import tempfile
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "linux-cxl.config"
 BUILD_SCRIPT = ROOT / "scripts" / "build.sh"
+PYLIBFDT_PREP = ROOT / "scripts" / "prepare_uboot_pylibfdt.py"
 REQUIRED_BUILTINS = (
     "CONFIG_PCI",
     "CONFIG_PCIEPORTBUS",
@@ -53,8 +55,7 @@ class BuildContractTest(unittest.TestCase):
             "--target-list=riscv64-softmmu",
             "--disable-werror",
             "sifive_unleashed_qemu_cxl_defconfig",
-            'PYTHON3="${UBOOT_PYTHON}"',
-            "sys.version_info < (3, 13)",
+            "prepare_uboot_pylibfdt.py",
             "PLATFORM=generic",
             "-march=rv64imafdc",
             "-mabi=lp64d",
@@ -74,6 +75,34 @@ class BuildContractTest(unittest.TestCase):
             "binman needs the in-tree pylibfdt built for the selected Python",
         )
         subprocess.run(["bash", "-n", str(BUILD_SCRIPT)], check=True)
+
+    def test_pylibfdt_adapter_rewrites_all_legacy_swig_calls(self):
+        legacy = (
+            "SWIG_Python_AppendOutput(resultobj, buff);\n"
+            "SWIG_Python_AppendOutput(resultobj, val);\n"
+            "SWIG_Python_AppendOutput(resultobj, val);\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary) / "libfdt.i_shipped"
+            output = pathlib.Path(temporary) / "libfdt.i"
+            source.write_text(legacy, encoding="utf-8")
+            run = subprocess.run(
+                [
+                    "python3",
+                    str(PYLIBFDT_PREP),
+                    "--source",
+                    str(source),
+                    "--output",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            adapted = output.read_text(encoding="utf-8")
+        self.assertNotIn("SWIG_Python_AppendOutput", adapted)
+        self.assertEqual(adapted.count("SWIG_AppendOutput"), 3)
 
 
 if __name__ == "__main__":
