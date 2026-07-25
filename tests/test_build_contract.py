@@ -51,6 +51,7 @@ class BuildContractTest(unittest.TestCase):
         source = BUILD_SCRIPT.read_text(encoding="utf-8")
         for contract in (
             "--target-list=riscv64-softmmu",
+            "--disable-werror",
             "sifive_unleashed_qemu_cxl_defconfig",
             "NO_PYTHON=1",
             "PLATFORM=generic",

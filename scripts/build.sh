@@ -52,6 +52,7 @@ printf '%s\n' "[build] QEMU riscv64-softmmu"
 	"${ROOT}/components/qemu/configure" \
 		--target-list=riscv64-softmmu \
 		--disable-docs \
+		--disable-werror \
 		--prefix="${BUILD}/qemu-install"
 )
 ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
