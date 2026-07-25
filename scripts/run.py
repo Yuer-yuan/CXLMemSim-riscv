@@ -371,7 +371,7 @@ def run_uboot_guest(console, paths, benchmark_bytes):
         raise ValueError("second cxl init did not reproduce decoder state")
 
     bootargs = (
-        "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=4 "
+        "setenv bootargs 'earlycon=sbi console=ttySIF0 loglevel=4 "
         f"cxl_bench_bytes={benchmark_bytes}'"
     )
     run_console_command(console, bootargs)
