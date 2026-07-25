@@ -1,9 +1,11 @@
 import pathlib
+import subprocess
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "linux-cxl.config"
+BUILD_SCRIPT = ROOT / "scripts" / "build.sh"
 REQUIRED_BUILTINS = (
     "CONFIG_PCI",
     "CONFIG_PCIEPORTBUS",
@@ -43,6 +45,29 @@ class BuildContractTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(values.get(name), "y")
         self.assertNotIn("CONFIG_INITRAMFS_SOURCE", values)
+
+    def test_build_script_names_every_required_build_contract(self):
+        self.assertTrue(BUILD_SCRIPT.is_file(), "scripts/build.sh is missing")
+        source = BUILD_SCRIPT.read_text(encoding="utf-8")
+        for contract in (
+            "--target-list=riscv64-softmmu",
+            "sifive_unleashed_qemu_cxl_defconfig",
+            "NO_PYTHON=1",
+            "PLATFORM=generic",
+            "-march=rv64imafdc",
+            "-mabi=lp64d",
+            "-nostdlib",
+            "CONFIG_INITRAMFS_SOURCE",
+            "olddefconfig",
+            "mke2fs",
+            "debugfs",
+            "cxlmemsim_server",
+            "write_manifest.py",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, source)
+        subprocess.run(["bash", "-n", str(BUILD_SCRIPT)], check=True)
+
 
 if __name__ == "__main__":
     unittest.main()
