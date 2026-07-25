@@ -53,7 +53,6 @@ class BuildContractTest(unittest.TestCase):
             "--target-list=riscv64-softmmu",
             "--disable-werror",
             "sifive_unleashed_qemu_cxl_defconfig",
-            "NO_PYTHON=1",
             "PLATFORM=generic",
             "-march=rv64imafdc",
             "-mabi=lp64d",
@@ -67,6 +66,11 @@ class BuildContractTest(unittest.TestCase):
         ):
             with self.subTest(contract=contract):
                 self.assertIn(contract, source)
+        self.assertNotIn(
+            "NO_PYTHON=1",
+            source,
+            "binman needs the in-tree pylibfdt built for the selected Python",
+        )
         subprocess.run(["bash", "-n", str(BUILD_SCRIPT)], check=True)
 
 

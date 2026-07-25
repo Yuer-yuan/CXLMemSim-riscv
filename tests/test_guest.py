@@ -103,6 +103,13 @@ class GuestBuildTest(unittest.TestCase):
                 check=True,
             )
             self.assert_static_riscv_without_vector(binary)
+            strings = subprocess.run(
+                ["strings", str(binary)],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout
+            self.assertIn("CXL_BENCH_JSON ", strings)
 
     def test_init_freestanding_contract(self):
         self.require_source(INIT)

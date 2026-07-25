@@ -59,10 +59,10 @@ ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
 
 printf '%s\n' "[build] U-Boot sifive_unleashed_qemu_cxl_defconfig"
 make -C "${ROOT}/components/u-boot" O="${BUILD}/u-boot" \
-	CROSS_COMPILE="${CROSS_COMPILE}" NO_PYTHON=1 \
+	CROSS_COMPILE="${CROSS_COMPILE}" \
 	sifive_unleashed_qemu_cxl_defconfig
 make -C "${ROOT}/components/u-boot" O="${BUILD}/u-boot" \
-	CROSS_COMPILE="${CROSS_COMPILE}" NO_PYTHON=1 -j "${JOBS}"
+	CROSS_COMPILE="${CROSS_COMPILE}" -j "${JOBS}"
 
 printf '%s\n' "[build] OpenSBI generic fw_dynamic"
 make -C "${ROOT}/components/opensbi" O="${BUILD}/opensbi" \

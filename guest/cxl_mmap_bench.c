@@ -299,7 +299,7 @@ static void print_result(const struct bench_result *result, size_t bytes,
 	int index;
 
 	output.length = 0;
-	append_text(&output, "{\"status\":\"pass\",\"bytes\":");
+	append_text(&output, "CXL_BENCH_JSON {\"status\":\"pass\",\"bytes\":");
 	append_u64(&output, bytes);
 	append_text(&output, ",\"iterations\":3,\"write_seconds\":[");
 	for (index = 0; index < BENCH_ITERATIONS; index++) {
