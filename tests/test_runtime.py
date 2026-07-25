@@ -4,6 +4,7 @@ import json
 import pathlib
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -240,6 +241,257 @@ class RuntimeContractTest(unittest.TestCase):
         self.assertEqual(environment["CXL_PGAS_SHM"], "/cxlmemsim_pgas")
         self.assertEqual(environment["CXL_LATENCY_INJECT"], "0")
         self.assertEqual(environment["KEEP"], "yes")
+
+    def test_uboot_state_machine_sends_exact_commands(self):
+        runtime = self.runtime()
+        run_uboot_guest = self.require_api("run_uboot_guest")
+        guest = {
+            "status": "pass",
+            "bytes": 1048576,
+            "write_seconds": [1, 1, 1],
+            "read_seconds": [1, 1, 1],
+            "write_mib_s_median": 1,
+            "read_mib_s_median": 1,
+            "random_ns_per_load": 1,
+            "verified": True,
+        }
+
+        class FakeConsole:
+            def __init__(self):
+                self.output = "\n".join(
+                    (
+                        runtime.SHM_CONNECTED,
+                        runtime.HOST_DECODER,
+                        runtime.TYPE3_DECODER,
+                        "=> ",
+                    )
+                )
+                self.commands = []
+                self.responses = [
+                    "41.00.0 Type 3\n=> ",
+                    "41.00.0 0000000010000000\n=> ",
+                    runtime.HOST_DECODER
+                    + "\n"
+                    + runtime.TYPE3_DECODER
+                    + "\n=> ",
+                    "=> ",
+                    "\n".join(
+                        (
+                            "CXL_GUEST_INIT_START",
+                            "CXL_DISK_PASS",
+                            "CXL_TOPOLOGY_PASS",
+                            "CXL_BENCH_JSON " + json.dumps(guest),
+                            runtime.GUEST_PASS,
+                        )
+                    ),
+                ]
+
+            def send(self, command):
+                self.commands.append(command)
+                self.output += "\n" + self.responses.pop(0)
+
+            def wait(self, text, start=0):
+                if text not in self.output[start:]:
+                    raise AssertionError(f"missing wait marker: {text}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            image = pathlib.Path(temporary) / "Image"
+            image.write_bytes(b"x" * 4660)
+            paths = dataclasses.replace(self.paths(), linux=image)
+            console = FakeConsole()
+            result = run_uboot_guest(console, paths, 1048576)
+        self.assertEqual(result, guest)
+        self.assertEqual(console.commands[0], "cxl list")
+        self.assertEqual(console.commands[1], "cxl info 41.00.0")
+        self.assertEqual(console.commands[2], "cxl init")
+        self.assertEqual(
+            console.commands[3],
+            "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=4 "
+            "cxl_bench_bytes=1048576'",
+        )
+        self.assertEqual(
+            console.commands[4],
+            "bootefi 90000000:1234 ${fdtcontroladdr}",
+        )
+
+    def test_atomic_result_preserves_old_success_on_write_failure(self):
+        runtime = self.runtime()
+        atomic_write_result = self.require_api("atomic_write_result")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary) / "type3-shm-result.json"
+            output.write_text('{"old": true}\n', encoding="utf-8")
+            with mock.patch.object(
+                runtime.json,
+                "dump",
+                side_effect=RuntimeError("encode failed"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    atomic_write_result(output, {"new": True})
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                {"old": True},
+            )
+            self.assertFalse(
+                pathlib.Path(str(output) + ".tmp").exists(),
+            )
+            atomic_write_result(output, {"new": True})
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                {"new": True},
+            )
+
+    def test_console_streams_commands_and_persists_output(self):
+        runtime = self.runtime()
+        console_class = self.require_api("Console")
+        program = (
+            "import sys\n"
+            "print('READY', flush=True)\n"
+            "line = sys.stdin.readline().strip()\n"
+            "print('DONE ' + line, flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "console.log"
+            console = console_class(
+                [sys.executable, "-u", "-c", program],
+                timeout=2,
+                environment=None,
+                log_path=log,
+            )
+            try:
+                console.wait("READY")
+                start = len(console.output)
+                console.send("hello")
+                console.wait("DONE hello", start=start)
+                self.assertEqual(console.wait_for_exit(timeout=2), 0)
+            finally:
+                console.close()
+            self.assertTrue(console.process.stdin.closed)
+            self.assertTrue(console.process.stdout.closed)
+            persisted = log.read_text(encoding="utf-8")
+        self.assertIn("READY", persisted)
+        self.assertIn("DONE hello", persisted)
+
+    def test_result_schema_records_all_proof_boundaries(self):
+        runtime = self.runtime()
+        build_result = self.require_api("build_result")
+        manifest = {
+            "superproject_commit": "a" * 40,
+            "submodules": {"components/qemu": "b" * 40},
+            "artifacts": {"qemu": {"sha256": "c" * 64, "size": 1}},
+        }
+        header = {
+            "magic": 0x43584C53484D454D,
+            "version": 1,
+            "num_slots": 64,
+            "server_ready": 1,
+            "memory_size": 268435456,
+        }
+        guest = {
+            "status": "pass",
+            "verified": True,
+            "bytes": 1048576,
+        }
+        result = build_result(
+            command=["qemu-system-riscv64", "-M", "sifive_u"],
+            environment={
+                "CXL_TRANSPORT_MODE": "shm",
+                "CXL_PGAS_SHM": "/cxlmemsim_pgas",
+                "CXL_LATENCY_INJECT": "0",
+            },
+            manifest=manifest,
+            header=header,
+            guest=guest,
+            read_count=123,
+            write_count=45,
+        )
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(result["topology"]["machine"], "sifive_u")
+        self.assertEqual(result["server"]["total_reads"], 123)
+        self.assertEqual(result["server"]["total_writes"], 45)
+        self.assertTrue(result["guest"]["verified"])
+        self.assertFalse(result["latency_injection"])
+        self.assertIn("not real CXL hardware", result["interpretation"])
+
+    def test_workflow_cleans_children_and_publishes_only_after_counts(self):
+        runtime = self.runtime()
+        execute_workflow = self.require_api("execute_workflow")
+        guest = {
+            "status": "pass",
+            "bytes": 1048576,
+            "write_seconds": [1, 1, 1],
+            "read_seconds": [1, 1, 1],
+            "write_mib_s_median": 1,
+            "read_mib_s_median": 1,
+            "random_ns_per_load": 1,
+            "verified": True,
+        }
+        manifest = {
+            "superproject_commit": "a" * 40,
+            "submodules": {},
+            "artifacts": {},
+        }
+        header = {
+            "magic": 0x43584C53484D454D,
+            "version": 1,
+            "num_slots": 64,
+            "server_ready": 1,
+            "memory_size": 268435456,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = pathlib.Path(temporary)
+            paths = dataclasses.replace(
+                self.paths(),
+                logs=temporary_path / "logs",
+                results=temporary_path / "results",
+            )
+            paths.logs.mkdir()
+            (paths.logs / "cxlmemsim-server.log").write_text(
+                "Server Statistics:\n"
+                "Total Reads: 123\n"
+                "Total Writes: 45\n",
+                encoding="utf-8",
+            )
+            process = mock.Mock()
+            console = mock.Mock()
+            console.wait_for_exit.return_value = 0
+            with mock.patch.object(
+                runtime,
+                "load_verified_manifest",
+                return_value=manifest,
+            ), mock.patch.object(
+                runtime,
+                "start_server",
+                return_value=(process, header),
+            ), mock.patch.object(
+                runtime,
+                "Console",
+                return_value=console,
+            ), mock.patch.object(
+                runtime,
+                "run_uboot_guest",
+                return_value=guest,
+            ), mock.patch.object(
+                runtime,
+                "stop_owned_process",
+            ) as stop, mock.patch.object(
+                runtime,
+                "wait_for_shm_removed",
+            ):
+                result = execute_workflow(
+                    paths,
+                    benchmark_bytes=1048576,
+                    timeout=2,
+                    shm_path=temporary_path / "cxlmemsim_pgas",
+                )
+            published = json.loads(
+                (paths.results / "type3-shm-result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        self.assertEqual(result["server"]["total_reads"], 123)
+        self.assertEqual(published["server"]["total_writes"], 45)
+        console.close.assert_called_once_with()
+        stop.assert_called_once_with(process)
 
 
 if __name__ == "__main__":
