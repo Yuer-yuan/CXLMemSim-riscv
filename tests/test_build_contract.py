@@ -57,6 +57,7 @@ class BuildContractTest(unittest.TestCase):
             "sifive_unleashed_qemu_cxl_defconfig",
             "prepare_uboot_pylibfdt.py",
             'OPENSBI="${BUILD}/opensbi/platform/generic/firmware/fw_dynamic.bin"',
+            "platform-cflags-y=-std=gnu11",
             "PLATFORM=generic",
             "-march=rv64imafdc",
             "-mabi=lp64d",

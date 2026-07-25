@@ -59,7 +59,8 @@ ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
 
 printf '%s\n' "[build] OpenSBI generic fw_dynamic"
 make -C "${ROOT}/components/opensbi" O="${BUILD}/opensbi" \
-	CROSS_COMPILE="${CROSS_COMPILE}" PLATFORM=generic -j "${JOBS}"
+	CROSS_COMPILE="${CROSS_COMPILE}" PLATFORM=generic \
+	'platform-cflags-y=-std=gnu11' -j "${JOBS}"
 
 printf '%s\n' "[build] U-Boot sifive_unleashed_qemu_cxl_defconfig"
 make -C "${ROOT}/components/u-boot" O="${BUILD}/u-boot" \
