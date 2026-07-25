@@ -83,8 +83,8 @@ done
 ((BENCHMARK_BYTES <= 268435456)) ||
 	die "benchmark bytes must not exceed 268435456"
 
-if git -C "${ROOT}" submodule status --recursive | grep -q '^-'; then
-	git -C "${ROOT}" submodule update --init --recursive
+if git -C "${ROOT}" submodule status | grep -q '^-'; then
+	git -C "${ROOT}" submodule update --init
 fi
 
 while read -r _key submodule_path; do

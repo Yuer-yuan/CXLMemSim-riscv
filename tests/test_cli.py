@@ -58,6 +58,12 @@ class CliTest(unittest.TestCase):
         self.assertIn("definitely_missing_one", run.stderr)
         self.assertIn("definitely_missing_two", run.stderr)
 
+    def test_submodule_initialization_is_limited_to_top_level_components(self):
+        self.assertTrue(RUN.is_file(), "run.sh is missing")
+        source = RUN.read_text(encoding="utf-8")
+        self.assertNotIn("submodule status --recursive", source)
+        self.assertNotIn("submodule update --init --recursive", source)
+
 
 if __name__ == "__main__":
     unittest.main()
