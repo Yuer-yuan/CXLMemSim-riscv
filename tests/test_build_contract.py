@@ -53,6 +53,8 @@ class BuildContractTest(unittest.TestCase):
             "--target-list=riscv64-softmmu",
             "--disable-werror",
             "sifive_unleashed_qemu_cxl_defconfig",
+            'PYTHON3="${UBOOT_PYTHON}"',
+            "sys.version_info < (3, 13)",
             "PLATFORM=generic",
             "-march=rv64imafdc",
             "-mabi=lp64d",

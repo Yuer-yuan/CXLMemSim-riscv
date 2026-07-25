@@ -37,11 +37,12 @@ the 256 MiB Type 3 capacity.
 
 The scripts require a native Linux build environment, the
 `riscv64-linux-gnu-` cross toolchain, QEMU build dependencies, device-tree
-compiler, and ext2 tools. On Ubuntu or Debian, the starting package set is:
+compiler, ext2 tools, and Python 3.12 or older for the pinned U-Boot pylibfdt
+generator. On Ubuntu or Debian, the starting package set is:
 
 ```bash
 sudo apt install \
-  build-essential cmake ninja-build meson pkg-config python3 \
+  build-essential cmake ninja-build meson pkg-config python3 python3.12 \
   gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
   device-tree-compiler e2fsprogs
 ```
@@ -49,6 +50,10 @@ sudo apt install \
 QEMU may require additional distribution development packages reported by
 its pinned `configure` script. `scripts/check-deps.sh` only reports missing
 commands; it never invokes `sudo` or a package manager.
+
+The build selects `python3.12` when available and rejects Python 3.13, whose
+SWIG API is incompatible with this pinned U-Boot release. Set
+`UBOOT_PYTHON=/path/to/python3.12` to select another compatible interpreter.
 
 ## Pinned components
 
