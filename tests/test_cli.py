@@ -1,5 +1,6 @@
 import os
 import pathlib
+import re
 import subprocess
 import unittest
 
@@ -10,6 +11,17 @@ DEPS = ROOT / "scripts" / "check-deps.sh"
 
 
 class CliTest(unittest.TestCase):
+    def test_readme_clone_avoids_nested_submodule_recursion(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "git clone https://github.com/SlugLab/CXLMemSim-riscv.git",
+            readme,
+        )
+        self.assertNotRegex(
+            readme,
+            re.compile(r"^git clone --recurse-submodules", re.MULTILINE),
+        )
+
     def run_cli(self, *args):
         if not RUN.exists():
             self.fail("run.sh is missing")

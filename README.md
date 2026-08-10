@@ -11,14 +11,15 @@ through PGAS shared memory.
 On a native Linux host:
 
 ```bash
-git clone --recurse-submodules \
-  https://github.com/SlugLab/CXLMemSim-riscv.git
+git clone https://github.com/SlugLab/CXLMemSim-riscv.git
 cd CXLMemSim-riscv
 ./run.sh
 ```
 
-`run.sh` also initializes missing top-level submodules at the recorded
-gitlinks. It refuses to reset a populated submodule with a different revision
+`run.sh` initializes only the required top-level submodules at the recorded
+gitlinks. Avoid `git clone --recurse-submodules`: CXLMemSim contains optional
+nested workload and firmware repositories that this workflow does not need.
+The script refuses to reset a populated submodule with a different revision
 or local changes.
 
 Useful modes:
