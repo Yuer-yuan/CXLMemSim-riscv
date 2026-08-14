@@ -550,6 +550,21 @@ static int scan_prefix(const char *directory, const char *prefix, char *only_nam
 	return count;
 }
 
+static int wait_for_prefix(const char *directory, const char *prefix,
+			   int expected_count)
+{
+	int attempt;
+	int count = -1;
+
+	for (attempt = 0; attempt < 120; attempt++) {
+		count = scan_prefix(directory, prefix, 0, 0);
+		if (count >= expected_count)
+			return count;
+		sleep_milliseconds(250);
+	}
+	return count;
+}
+
 static uint64_t linux_device_number(uint32_t major, uint32_t minor)
 {
 	return ((uint64_t)(major & 0xfff) << 8) | (minor & 0xff) |
@@ -1013,12 +1028,17 @@ void _start(void)
 		fail("payload-binaries", 2);
 
 	configure_network();
+	for (valid = 0; valid < 120 &&
+	     !path_exists("/sys/bus/cxl/devices/mem0", 1); valid++)
+		sleep_milliseconds(250);
 	if (!path_exists("/sys/bus/cxl/devices/mem0", 1))
 		fail("missing-cxl-mem0", 19);
-	if (scan_prefix("/sys/bus/cxl/devices", "region", 0, 0) < 1)
+	if (wait_for_prefix("/sys/bus/cxl/devices", "region", 1) < 1)
 		fail("missing-cxl-region", 19);
-	if (scan_prefix("/sys/bus/cxl/devices", "decoder", 0, 0) < 1)
+	if (wait_for_prefix("/sys/bus/cxl/devices", "decoder", 1) < 1)
 		fail("missing-cxl-decoder", 19);
+	if (wait_for_prefix("/sys/class/dax", "dax", 1) < 1)
+		fail("missing-dax", 19);
 	discover_dax(&dax);
 	append_text(device_entry, sizeof(device_entry), dax.path);
 

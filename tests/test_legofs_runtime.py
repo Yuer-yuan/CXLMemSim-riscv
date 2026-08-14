@@ -114,6 +114,12 @@ class LegofsRuntimeTest(unittest.TestCase):
         self.assertIn("if (cxl_pmem_as_dax)", region_source)
         self.assertIn("return devm_cxl_add_dax_region(cxlr);", region_source)
 
+    def test_guest_waits_for_asynchronous_cxl_region_and_dax_probe(self):
+        source = (ROOT / "guest" / "legofs_node_init.c").read_text(encoding="utf-8")
+        self.assertIn('wait_for_prefix("/sys/bus/cxl/devices", "region", 1)', source)
+        self.assertIn('wait_for_prefix("/sys/bus/cxl/devices", "decoder", 1)', source)
+        self.assertIn('wait_for_prefix("/sys/class/dax", "dax", 1)', source)
+
     def test_console_waiting_uses_chunks_but_sidecars_use_complete_lines(self):
         source = RUNNER.read_text(encoding="utf-8")
         append = source.index("self.output += decoded")
