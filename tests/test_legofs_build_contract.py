@@ -36,9 +36,15 @@ class LegofsBuildContractTest(unittest.TestCase):
             "BADFS_LIFECYCLE_DIRECT_REQUIRED=1",
             "BADFS_LIFECYCLE_DIRECT_READ_REQUIRED=1",
             "BADFS_CXL_MAP_ALIGNMENT=2097152",
+            'char block_entry[64] = "BADFS_BENCH_BLOCK_SIZE="',
         ):
             self.assertIn(marker, source)
         self.assertNotIn("BADFS_CXL_MAP_ALIGNMENT=4096", source)
+        self.assertNotIn("BADFS_BENCH_BLOCK_SIZE=4096", source)
+        self.assertIn('set_ifreq_name(&request, "lo")', source)
+        self.assertIn("set_sockaddr(&request.value.address, ipv4(127, 0, 0, 1))", source)
+        self.assertIn("connect_tcp(ipv4(127, 0, 0, 1), 3345)", source)
+        self.assertIn("LEG_OFS_SERVER_PROBE errno=", source)
 
     def test_cxl_devdax_exposes_real_persistence_flush(self):
         device = (ROOT / "components/linux/drivers/dax/device.c").read_text()

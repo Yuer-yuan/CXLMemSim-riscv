@@ -36,9 +36,13 @@ class LegofsRuntimeTest(unittest.TestCase):
             self.assertEqual(sum("cxl-type3" in argument for argument in command), 1)
             self.assertIn("coherence-v2=on", joined)
             self.assertIn(f"coherence-v2-host-id={node}", joined)
-            self.assertIn("coherence-v2-cache-capacity=262144", joined)
+            self.assertIn("coherence-v2-cache-capacity=8388608", joined)
             self.assertIn("coherence-v2-cache-ways=4", joined)
             self.assertIn("coherence-v2-write-through=off", joined)
+            self.assertIn(
+                f"coherence-v2-read-exclusive={'on' if node == 0 else 'off'}",
+                joined,
+            )
             self.assertNotIn("-M virt", joined)
             self.assertNotIn("volatile-memdev", joined)
             self.assertIn("memory-backend-file", joined)

@@ -675,10 +675,10 @@ static uint16_t network_u16(uint16_t value)
 	return (uint16_t)((value << 8) | (value >> 8));
 }
 
-static void set_ifreq_name(struct ifreq *request)
+static void set_ifreq_name(struct ifreq *request, const char *name)
 {
 	memory_zero(request, sizeof(*request));
-	text_copy(request->name, sizeof(request->name), "eth0");
+	text_copy(request->name, sizeof(request->name), name);
 }
 
 static void set_sockaddr(struct sockaddr *address, uint32_t ipv4_address)
@@ -699,17 +699,36 @@ static void configure_network(void)
 
 	if (socket < 0)
 		fail("network-socket", socket);
-	set_ifreq_name(&request);
+	set_ifreq_name(&request, "lo");
+	set_sockaddr(&request.value.address, ipv4(127, 0, 0, 1));
+	result = syscall3(SYS_IOCTL, socket, SIOCSIFADDR, (long)&request);
+	if (result < 0)
+		fail("loopback-address", result);
+	set_ifreq_name(&request, "lo");
+	set_sockaddr(&request.value.address, ipv4(255, 0, 0, 0));
+	result = syscall3(SYS_IOCTL, socket, SIOCSIFNETMASK, (long)&request);
+	if (result < 0)
+		fail("loopback-netmask", result);
+	set_ifreq_name(&request, "lo");
+	result = syscall3(SYS_IOCTL, socket, SIOCGIFFLAGS, (long)&request);
+	if (result < 0)
+		fail("loopback-get-flags", result);
+	request.value.flags |= IFF_UP;
+	result = syscall3(SYS_IOCTL, socket, SIOCSIFFLAGS, (long)&request);
+	if (result < 0)
+		fail("loopback-set-flags", result);
+
+	set_ifreq_name(&request, "eth0");
 	set_sockaddr(&request.value.address, ipv4(10, 0, 2, 15));
 	result = syscall3(SYS_IOCTL, socket, SIOCSIFADDR, (long)&request);
 	if (result < 0)
 		fail("network-address", result);
-	set_ifreq_name(&request);
+	set_ifreq_name(&request, "eth0");
 	set_sockaddr(&request.value.address, ipv4(255, 255, 255, 0));
 	result = syscall3(SYS_IOCTL, socket, SIOCSIFNETMASK, (long)&request);
 	if (result < 0)
 		fail("network-netmask", result);
-	set_ifreq_name(&request);
+	set_ifreq_name(&request, "eth0");
 	result = syscall3(SYS_IOCTL, socket, SIOCGIFFLAGS, (long)&request);
 	if (result < 0)
 		fail("network-get-flags", result);
@@ -730,21 +749,21 @@ static void configure_network(void)
 	syscall1(SYS_CLOSE, socket);
 }
 
-static int connect_tcp(uint32_t address, uint16_t port)
+static long connect_tcp(uint32_t address, uint16_t port)
 {
 	struct sockaddr_in peer;
 	long socket = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
 	long result;
 
 	if (socket < 0)
-		return 0;
+		return socket;
 	memory_zero(&peer, sizeof(peer));
 	peer.family = AF_INET;
 	peer.port = network_u16(port);
 	peer.address = address;
 	result = syscall3(SYS_CONNECT, socket, (long)&peer, sizeof(peer));
 	syscall1(SYS_CLOSE, socket);
-	return result == 0;
+	return result;
 }
 
 static const char *cmdline_value(char *cmdline, const char *key)
@@ -889,6 +908,7 @@ static void run_node0(char *device_entry)
 	char *environment[MAX_ENV] = {0};
 	size_t count = common_environment(environment, device_entry);
 	long server;
+	long probe = -111;
 	unsigned int attempt;
 
 	count = add_environment(environment, count, (char *)"BADFS_SERVER_ADDR=0.0.0.0:3345");
@@ -897,11 +917,17 @@ static void run_node0(char *device_entry)
 	if (server < 0)
 		fail("spawn-server", server);
 	for (attempt = 0; attempt < 240; attempt++) {
-		if (connect_tcp(ipv4(127, 0, 0, 1), 3345)) {
+		probe = connect_tcp(ipv4(127, 0, 0, 1), 3345);
+		if (probe == 0) {
 			write_text("LEG_OFS_SERVER_READY addr=0.0.0.0:3345\n");
 			if (wait_child(server) != 0)
 				fail("server-exit", 5);
 			fail("server-stopped", 5);
+		}
+		if (attempt && attempt % 40 == 0) {
+			write_text("LEG_OFS_SERVER_PROBE errno=");
+			write_unsigned((uint64_t)(probe < 0 ? -probe : probe));
+			write_text("\n");
 		}
 		sleep_milliseconds(250);
 	}
@@ -915,6 +941,9 @@ static void run_node1(char *device_entry, uint16_t server_port, uint64_t bytes)
 	char port_text[16];
 	char bytes_entry[64] = "BADFS_BENCH_FILE_SIZE=";
 	char bytes_text[24];
+	char block_entry[64] = "BADFS_BENCH_BLOCK_SIZE=";
+	char block_text[24];
+	uint64_t block_size = bytes < 1048576 ? bytes : 1048576;
 	char mode_workload[] = "BADFS_BENCH_MODE=workload";
 	char mode_inspect[] = "BADFS_BENCH_MODE=inspect";
 	size_t count = common_environment(environment, device_entry);
@@ -925,11 +954,13 @@ static void run_node1(char *device_entry, uint16_t server_port, uint64_t bytes)
 	append_text(server_entry, sizeof(server_entry), port_text);
 	unsigned_to_text(bytes, bytes_text, sizeof(bytes_text));
 	append_text(bytes_entry, sizeof(bytes_entry), bytes_text);
+	unsigned_to_text(block_size, block_text, sizeof(block_text));
+	append_text(block_entry, sizeof(block_entry), block_text);
 	count = add_environment(environment, count, server_entry);
 	count = add_environment(environment, count, (char *)"BADFS_BASE_PATH=/badfs");
 	count = add_environment(environment, count, mode_workload);
 	count = add_environment(environment, count, bytes_entry);
-	count = add_environment(environment, count, (char *)"BADFS_BENCH_BLOCK_SIZE=4096");
+	count = add_environment(environment, count, block_entry);
 	(void)add_environment(environment, count, (char *)"BADFS_BENCH_ITERATIONS=1");
 
 	write_text("LEG_OFS_CLIENT_READY\n");

@@ -132,9 +132,10 @@ def build_qemu_command(paths, node, coherence_port, legofs_port):
             f"cxl-type3,bus=rp-t3-{prefix},persistent-memdev=t3ssd-{prefix},"
             f"lsa=t3lsa-{prefix},id=t3-{prefix},coherence-v2=on,"
             f"cxlmemsim-addr=127.0.0.1,cxlmemsim-port={coherence_port},"
-            f"coherence-v2-host-id={node},coherence-v2-cache-capacity=262144,"
+            f"coherence-v2-host-id={node},coherence-v2-cache-capacity=8388608,"
             "coherence-v2-cache-ways=4,coherence-v2-timeout-ms=5000,"
-            "coherence-v2-write-through=off"
+            "coherence-v2-write-through=off,"
+            f"coherence-v2-read-exclusive={'on' if node == 0 else 'off'}"
         ),
         "-drive",
         f"file={paths.legofs_disk},if=none,format=raw,readonly=on,id=payload-{prefix}",
@@ -325,10 +326,22 @@ def correlate_dirty_backinvalidations(direct_records, lifecycle_records, coheren
             or ack.get("status") != "OK"
             or ack.get("dirty_data") is not True
             or _required_integer(ack, "payload_len") != 64
-            or completion.get("opcode") != "SNP_DATA_INV"
+            or ack.get("opcode") != "SNOOP_ACK"
+            or _required_integer(ack, "src_host") != 1
+            or _required_integer(ack, "dst_host") != 0xFFFF
+            or completion.get("opcode") != "SNOOP_ACK"
+            or completion.get("ack_strength") != "MODEL"
+            or completion.get("status") != "OK"
             or completion.get("dirty_data") is not True
+            or _required_integer(completion, "payload_len") != 64
+            or _required_integer(completion, "src_host") != 1
+            or _required_integer(completion, "dst_host") != 0xFFFF
             or _required_integer(ack, "line_address") != line
             or _required_integer(completion, "line_address") != line
+            or _required_integer(ack, "session_id") != _required_integer(snoop, "session_id")
+            or _required_integer(completion, "session_id") != _required_integer(snoop, "session_id")
+            or _required_integer(ack, "epoch") != _required_integer(snoop, "epoch")
+            or _required_integer(completion, "epoch") != _required_integer(snoop, "epoch")
             or _required_integer(snoop, "monotonic_ns") > _required_integer(ack, "monotonic_ns")
             or _required_integer(ack, "monotonic_ns") > _required_integer(completion, "monotonic_ns")
         ):
@@ -395,13 +408,16 @@ def validate_legofs_output(output, benchmark_bytes):
         benchmark = {name: int(raw[name], 10) for name in integer_names}
     except (KeyError, ValueError) as error:
         raise ValueError("badfs benchmark integer fields are invalid") from error
+    expected_block_size = min(benchmark_bytes, 1024 * 1024)
     if (
         benchmark["file_size"] != benchmark_bytes
-        or benchmark["block_size"] != 4096
+        or benchmark["block_size"] != expected_block_size
         or benchmark["iterations"] != 1
         or benchmark["written_bytes"] != benchmark_bytes
         or benchmark["read_bytes"] != benchmark_bytes
-        or benchmark["checksum"] != expected_benchmark_checksum(benchmark_bytes, 4096, 1)
+        or benchmark["checksum"] != expected_benchmark_checksum(
+            benchmark_bytes, expected_block_size, 1
+        )
     ):
         raise ValueError("badfs benchmark bytes or checksum mismatch")
     inspections = parse_prefixed_records(
@@ -418,7 +434,7 @@ def validate_legofs_output(output, benchmark_bytes):
         "quarantine_events", "active_leases", "quarantined_slots",
     )
     zero_audit = (
-        "pending_operations", "quarantined_extents", "active_read_leases", "direct_mapped_extents",
+        "pending_operations", "quarantined_extents", "active_read_leases",
     )
     direct_totals = {
         "trusted_direct_read_ops": 0,
@@ -437,6 +453,8 @@ def validate_legofs_output(output, benchmark_bytes):
         for name in zero_audit:
             if _required_integer(audit, name) != 0:
                 raise ValueError(f"badfs lifecycle audit is not clean: {name}")
+        if _required_integer(audit, "direct_mapped_extents") != 1:
+            raise ValueError("badfs lifecycle audit must retain exactly one published direct extent")
         for name in direct_totals:
             direct_totals[name] += _required_integer(fabric, name)
     if any(value <= 0 for value in direct_totals.values()):
@@ -485,13 +503,24 @@ def validate_host_capture_order(paths, correlations):
                 record = strict_json_loads(line.split(" ", 1)[1])
                 if record.get("op_id") == op_id and record.get("event") == "store_direct_success":
                     success_times.append(event["host_capture_ns"])
-        if direct_times and success_times and min(direct_times) < max(success_times):
-            return {
-                "op_id": op_id,
-                "direct_unmap_capture_ns": min(direct_times),
-                "store_success_capture_ns": max(success_times),
-            }
-    raise ValueError("host capture does not order direct unmap before store_direct_success")
+        snoop_ns = _required_integer(correlation["snoop"], "monotonic_ns")
+        ack_ns = _required_integer(correlation["ack"], "monotonic_ns")
+        completion_ns = _required_integer(correlation["completion"], "monotonic_ns")
+        for direct_ns in direct_times:
+            for success_ns in success_times:
+                if direct_ns < snoop_ns <= ack_ns <= completion_ns < success_ns:
+                    return {
+                        "op_id": op_id,
+                        "direct_unmap_capture_ns": direct_ns,
+                        "snoop_send_ns": snoop_ns,
+                        "snoop_ack_ns": ack_ns,
+                        "dirty_completion_ns": completion_ns,
+                        "store_success_capture_ns": success_ns,
+                    }
+    raise ValueError(
+        "host capture does not order direct unmap < snoop < ACK < "
+        "dirty completion < store_direct_success"
+    )
 
 
 def parse_server_stats(output):

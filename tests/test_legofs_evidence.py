@@ -43,22 +43,25 @@ class LegofsEvidenceTest(unittest.TestCase):
             {
                 "schema_version": 1, "event": "snoop_send",
                 "opcode": "SNP_DATA_INV", "src_host": 0xFFFF, "dst_host": 1,
-                "snoop_id": 91, "line_address": 0x4080, "monotonic_ns": 20,
+                "session_id": 2, "epoch": 7, "snoop_id": 91,
+                "line_address": 0x4080, "monotonic_ns": 20,
                 "payload_len": 0, "status": "OK", "ack_strength": "NONE",
                 "dirty_data": False,
             },
             {
                 "schema_version": 1, "event": "snoop_ack",
                 "opcode": "SNOOP_ACK", "src_host": 1, "dst_host": 0xFFFF,
-                "snoop_id": 91, "line_address": 0x4080, "monotonic_ns": 21,
+                "session_id": 2, "epoch": 7, "snoop_id": 91,
+                "line_address": 0x4080, "monotonic_ns": 21,
                 "payload_len": 64, "status": "OK", "ack_strength": "MODEL",
                 "dirty_data": True,
             },
             {
                 "schema_version": 1, "event": "dirty_completion",
-                "opcode": "SNP_DATA_INV", "src_host": 0xFFFF, "dst_host": 1,
-                "snoop_id": 91, "line_address": 0x4080, "monotonic_ns": 22,
-                "payload_len": 0, "status": "OK", "ack_strength": "NONE",
+                "opcode": "SNOOP_ACK", "src_host": 1, "dst_host": 0xFFFF,
+                "session_id": 2, "epoch": 7, "snoop_id": 91,
+                "line_address": 0x4080, "monotonic_ns": 22,
+                "payload_len": 64, "status": "OK", "ack_strength": "MODEL",
                 "dirty_data": True,
             },
         ]
@@ -79,6 +82,9 @@ class LegofsEvidenceTest(unittest.TestCase):
             "native ACK": lambda d, l, c: c[1].update(ack_strength="NATIVE"),
             "short ACK": lambda d, l, c: c[1].update(payload_len=0),
             "wrong snoop": lambda d, l, c: c[1].update(snoop_id=92),
+            "wrong completion opcode": lambda d, l, c: c[2].update(opcode="SNP_DATA_INV"),
+            "wrong completion host": lambda d, l, c: c[2].update(src_host=0),
+            "wrong completion session": lambda d, l, c: c[2].update(session_id=3),
             "outside grant": lambda d, l, c: c[0].update(line_address=0x5000),
             "wrong host": lambda d, l, c: c[0].update(dst_host=0),
             "not invalidation": lambda d, l, c: c[0].update(opcode="SNP_DATA_DOWNGRADE"),
@@ -113,9 +119,39 @@ class LegofsEvidenceTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
                 self.runner.read_coherence_trace(path)
 
+    def test_host_capture_orders_unmap_through_dirty_completion(self):
+        direct, lifecycle, coherence = self.records()
+        correlations = self.runner.correlate_dirty_backinvalidations(
+            direct, lifecycle, coherence
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.runner.RuntimePaths(temporary, temporary)
+            paths.event_log(1).write_text(
+                json.dumps({
+                    "host_capture_ns": 10,
+                    "line": "BADFS_DIRECT_MAP_TRACE_JSON " + json.dumps(direct[0]),
+                }) + "\n",
+                encoding="utf-8",
+            )
+            paths.event_log(0).write_text(
+                json.dumps({
+                    "host_capture_ns": 50,
+                    "line": "BADFS_LIFECYCLE_TRACE_JSON " + json.dumps(lifecycle[1]),
+                }) + "\n",
+                encoding="utf-8",
+            )
+            ordered = self.runner.validate_host_capture_order(paths, correlations)
+            self.assertEqual(ordered["snoop_send_ns"], 20)
+            self.assertEqual(ordered["dirty_completion_ns"], 22)
+
+            correlations[0]["completion"]["monotonic_ns"] = 60
+            with self.assertRaisesRegex(ValueError, "unmap.*snoop.*completion.*success"):
+                self.runner.validate_host_capture_order(paths, correlations)
+
     def test_benchmark_and_fallback_gate(self):
         bytes_count = 65536
-        checksum = self.runner.expected_benchmark_checksum(bytes_count, 4096, 1)
+        block_size = min(bytes_count, 1024 * 1024)
+        checksum = self.runner.expected_benchmark_checksum(bytes_count, block_size, 1)
         fabric = {
             "trusted_direct_read_ops": 1, "trusted_direct_read_bytes": bytes_count,
             "trusted_direct_write_ops": 1, "trusted_direct_write_bytes": bytes_count,
@@ -131,10 +167,10 @@ class LegofsEvidenceTest(unittest.TestCase):
         }
         audit = {
             "pending_operations": 0, "quarantined_extents": 0,
-            "active_read_leases": 0, "direct_mapped_extents": 0,
+            "active_read_leases": 0, "direct_mapped_extents": 1,
         }
         output = (
-            f"badfs_bench file_size={bytes_count} block_size=4096 iterations=1 "
+            f"badfs_bench file_size={bytes_count} block_size={block_size} iterations=1 "
             f"written_bytes={bytes_count} read_bytes={bytes_count} write_secs=1.0 "
             f"read_secs=1.0 write_mib_s=1.0 read_mib_s=1.0 checksum={checksum}\n"
             "badfs_lifecycle_inspection "
