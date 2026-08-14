@@ -770,6 +770,8 @@ def wait_for_log(path, marker, process, timeout):
 
 
 def run_uboot(console, paths, node, legofs_port, benchmark_bytes, timeout):
+    console.wait("Hit any key to stop autoboot", timeout)
+    console.send("")
     console.wait("=> ", timeout)
     if HOST_DECODER not in console.output or TYPE3_DECODER not in console.output:
         raise ValueError(f"node{node} preboot CXL decoder proof is missing")

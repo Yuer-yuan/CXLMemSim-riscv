@@ -219,7 +219,7 @@ python3 "${ROOT}/scripts/write_manifest.py" \
 	--compiler "rustc=rustc --version" \
 	--compiler "cargo=cargo --version" \
 	--compiler "riscv_musl_gcc=${MUSL_CC} --version" \
-	--compiler "qemu_configure=${ROOT}/components/qemu/configure --version" \
+	--compiler "qemu=${qemu} --version" \
 	--artifact "qemu=${qemu}" \
 	--artifact "opensbi=${opensbi}" \
 	--artifact "u_boot=${u_boot}" \

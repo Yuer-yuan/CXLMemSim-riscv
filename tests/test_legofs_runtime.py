@@ -86,6 +86,14 @@ class LegofsRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "did not overlap"):
             self.runner.overlap_ns((10, 20), (20, 30))
 
+    def test_uboot_sequence_interrupts_autoboot_before_cxl_commands(self):
+        source = RUNNER.read_text(encoding="utf-8")
+        interrupt = source.index('console.wait("Hit any key to stop autoboot"')
+        prompt = source.index('console.wait("=> ", timeout)', interrupt)
+        listing = source.index('console.command_until_prompt("cxl list"', prompt)
+        self.assertLess(interrupt, prompt)
+        self.assertLess(prompt, listing)
+
 
 if __name__ == "__main__":
     unittest.main()
