@@ -14,6 +14,7 @@ class LegofsBuildContractTest(unittest.TestCase):
         config = (ROOT / "configs/linux-cxl.config").read_text().splitlines()
         required = {
             "CONFIG_DAX=y",
+            "CONFIG_FS_DAX=y",
             "CONFIG_DEV_DAX=y",
             "CONFIG_DEV_DAX_CXL=y",
             "CONFIG_NET=y",
