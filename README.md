@@ -65,6 +65,7 @@ The superproject records exact gitlinks for:
 - `components/u-boot`: CXL discovery and HDM decoder programming;
 - `components/linux`: matching RISC-V CXL firmware handoff support;
 - `components/cxlmemsim`: PGAS SHM server;
+- `components/legofs`: Badfs lifecycle-direct client, server, and benchmark;
 - `components/opensbi`: OpenSBI v1.5.1;
 - `components/hifive-premier-tools`: pinned board-tool reference;
 - `components/meta-sifive`: pinned Yocto-layer reference.
@@ -84,6 +85,60 @@ It adds a synthetic `pxb-cxl` bridge with
 `hdm_for_passthrough=on`, one CXL root port, and one 256 MiB Type 3 endpoint.
 U-Boot programs HPA `0x1000000000` with host decoder control `0x600` and
 endpoint decoder control `0x1600`.
+
+## Two-node Legofs Type 3 back-invalidation proof
+
+The second workflow builds the complete stack and runs the Zettai-US Legofs
+Badfs lifecycle-direct workload across two concurrent RISC-V guests:
+
+```bash
+./run-legofs-type3.sh --bytes 65536 --timeout 1200
+```
+
+Both recorded commands begin exactly with:
+
+```text
+qemu-system-riscv64 -M sifive_u
+```
+
+Each guest has one 256 MiB Type 3 endpoint attached through the synthetic
+SiFive U PCIe/CXL host bridge. Each endpoint uses its own file-backed
+`persistent-memdev`; CXLMemSim uses a separate file-backed `ssd-stream`
+backend. U-Boot enumerates `41.00.0`, reports it as Type 3, and programs the
+host and endpoint HDM decoders before Linux boots. Linux exposes the Type 3
+capacity as `/dev/dax0.0`, which Legofs maps for strict lifecycle-direct
+writes and reads. The external ext2 image is only the read-only delivery
+disk for the static RISC-V binaries.
+
+The node1 endpoint retains dirty modified lines. The node0 endpoint enables
+the opt-in `coherence-v2-read-exclusive` QEMU policy so its server-side
+checksum reads issue GETM requests. Those requests exercise QEMU's Type 3
+back-invalidation handler against node1. A run passes only if the benchmark
+trace contains the same operation ID and mapping range as a node1-directed
+`SNP_DATA_INV`, a model ACK carrying the complete dirty 64-byte line, and a
+dirty completion. Host monotonic timestamps must additionally prove:
+
+```text
+node1 direct unmap < snoop send < model ACK < dirty completion < store success
+```
+
+The result is written to:
+
+```text
+out/legofs-type3/runs/<run-id>/result.json
+```
+
+The result also records both QEMU argv arrays, overlapping process lifetimes,
+artifact hashes, the two CXL SSD backing files, all address correlations,
+Legofs direct-path and fallback counters, and final coherence error counters.
+`status: "passed"` requires zero timeouts, protocol errors, delivery failures,
+server-copy failures, fallback I/O, pending operations, quarantined extents,
+and active leases.
+
+This is functional QEMU/TCG and CXLMemSim model evidence. The CXL SSDs are
+file-backed simulated persistent-memory devices; this does not claim a
+physical CXL link, CPU-cache or CXL.cache coherence, media durability across a
+host crash, or hardware performance.
 
 The guest benchmark is a libc-free static `rv64imafdc` executable delivered
 through a read-only external ext2 image on
