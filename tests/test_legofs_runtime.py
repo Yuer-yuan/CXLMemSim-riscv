@@ -119,6 +119,8 @@ class LegofsRuntimeTest(unittest.TestCase):
         self.assertIn('wait_for_prefix("/sys/bus/cxl/devices", "region", 1)', source)
         self.assertIn('wait_for_prefix("/sys/bus/cxl/devices", "decoder", 1)', source)
         self.assertIn('wait_for_prefix("/sys/class/dax", "dax", 1)', source)
+        self.assertIn("__builtin_offsetof(struct linux_dirent64, d_name) + 1", source)
+        self.assertNotIn("sizeof(*entry) + 1", source)
 
     def test_console_waiting_uses_chunks_but_sidecars_use_complete_lines(self):
         source = RUNNER.read_text(encoding="utf-8")

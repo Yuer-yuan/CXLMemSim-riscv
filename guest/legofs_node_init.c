@@ -534,7 +534,9 @@ static int scan_prefix(const char *directory, const char *prefix, char *only_nam
 		while (offset < bytes) {
 			struct linux_dirent64 *entry = (struct linux_dirent64 *)(buffer + offset);
 
-			if (entry->d_reclen < sizeof(*entry) + 1 || offset + entry->d_reclen > bytes) {
+			if (entry->d_reclen <
+			    __builtin_offsetof(struct linux_dirent64, d_name) + 1 ||
+			    offset + entry->d_reclen > bytes) {
 				syscall1(SYS_CLOSE, file);
 				return -1;
 			}

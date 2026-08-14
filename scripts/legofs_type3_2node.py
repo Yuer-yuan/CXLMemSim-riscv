@@ -784,7 +784,7 @@ def run_uboot(console, paths, node, legofs_port, benchmark_bytes, timeout):
     if HOST_DECODER not in initialization or TYPE3_DECODER not in initialization:
         raise ValueError(f"node{node} cxl init did not reproduce decoder state")
     console.command_until_prompt(
-        "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=5 "
+        "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=6 "
         "cxl_core.pmem_as_dax=1 "
         f"legofs.role=node{node} legofs.server_port={legofs_port} "
         f"legofs.bytes={benchmark_bytes}'",
