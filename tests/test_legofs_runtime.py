@@ -104,6 +104,7 @@ class LegofsRuntimeTest(unittest.TestCase):
             "CONFIG_MEMORY_HOTREMOVE=y",
             "CONFIG_SPARSEMEM_VMEMMAP=y",
             "CONFIG_ZONE_DEVICE=y",
+            "# CONFIG_DEV_DAX_KMEM is not set",
         ):
             self.assertIn(option, config)
 

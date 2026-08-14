@@ -200,6 +200,8 @@ for option in "${required_kernel_options[@]}"; do
 	grep -qx "${option}=y" "${BUILD}/linux/.config" ||
 		die "required kernel option is not built in: ${option}"
 done
+grep -Fqx '# CONFIG_DEV_DAX_KMEM is not set' "${BUILD}/linux/.config" ||
+	die 'CONFIG_DEV_DAX_KMEM must be disabled so CXL DAX binds device_dax'
 grep -Fqx "CONFIG_INITRAMFS_SOURCE=\"${INITRAMFS}\"" "${BUILD}/linux/.config" ||
 	die 'CONFIG_INITRAMFS_SOURCE does not match the Legofs PID 1 directory'
 make -C "${ROOT}/components/linux" O="${BUILD}/linux" \
