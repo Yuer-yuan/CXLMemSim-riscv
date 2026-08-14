@@ -127,7 +127,8 @@ class LegofsRuntimeTest(unittest.TestCase):
         source = (ROOT / "guest" / "legofs_node_init.c").read_text(encoding="utf-8")
         self.assertIn('wait_for_prefix("/sys/bus/cxl/devices", "region", 1)', source)
         self.assertIn('wait_for_prefix("/sys/bus/cxl/devices", "decoder", 1)', source)
-        self.assertIn('wait_for_prefix("/sys/class/dax", "dax", 1)', source)
+        self.assertIn('wait_for_prefix("/sys/bus/dax/devices", "dax", 1)', source)
+        self.assertNotIn("/sys/class/dax", source)
         self.assertIn("__builtin_offsetof(struct linux_dirent64, d_name) + 1", source)
         self.assertNotIn("sizeof(*entry) + 1", source)
 

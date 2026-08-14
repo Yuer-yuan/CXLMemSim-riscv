@@ -620,12 +620,12 @@ static void discover_dax(struct dax_device *device)
 	size_t index;
 
 	memory_zero(device, sizeof(*device));
-	if (scan_prefix("/sys/class/dax", "dax", device->name,
+	if (scan_prefix("/sys/bus/dax/devices", "dax", device->name,
 			sizeof(device->name)) != 1)
 		fail("dax-device-count", 19);
 	text_copy(device->path, sizeof(device->path), "/dev/");
 	append_text(device->path, sizeof(device->path), device->name);
-	text_copy(sysfs, sizeof(sysfs), "/sys/class/dax/");
+	text_copy(sysfs, sizeof(sysfs), "/sys/bus/dax/devices/");
 	append_text(sysfs, sizeof(sysfs), device->name);
 	append_text(sysfs, sizeof(sysfs), "/dev");
 	length = read_file(sysfs, contents, sizeof(contents));
@@ -649,7 +649,7 @@ static void discover_dax(struct dax_device *device)
 		fail("parse-dax-minor", 22);
 	device->minor = (uint32_t)value;
 
-	text_copy(sysfs, sizeof(sysfs), "/sys/class/dax/");
+	text_copy(sysfs, sizeof(sysfs), "/sys/bus/dax/devices/");
 	append_text(sysfs, sizeof(sysfs), device->name);
 	append_text(sysfs, sizeof(sysfs), "/size");
 	if (!read_unsigned_file(sysfs, &device->size) || !device->size)
@@ -1039,7 +1039,7 @@ void _start(void)
 		fail("missing-cxl-region", 19);
 	if (wait_for_prefix("/sys/bus/cxl/devices", "decoder", 1) < 1)
 		fail("missing-cxl-decoder", 19);
-	if (wait_for_prefix("/sys/class/dax", "dax", 1) < 1)
+	if (wait_for_prefix("/sys/bus/dax/devices", "dax", 1) < 1)
 		fail("missing-dax", 19);
 	discover_dax(&dax);
 	append_text(device_entry, sizeof(device_entry), dax.path);
