@@ -98,6 +98,15 @@ class LegofsRuntimeTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn("cxl_core.pmem_as_dax=1", source)
 
+        config = (ROOT / "configs" / "linux-cxl.config").read_text(encoding="utf-8")
+        for option in (
+            "CONFIG_MEMORY_HOTPLUG=y",
+            "CONFIG_MEMORY_HOTREMOVE=y",
+            "CONFIG_SPARSEMEM_VMEMMAP=y",
+            "CONFIG_ZONE_DEVICE=y",
+        ):
+            self.assertIn(option, config)
+
         region_source = (
             ROOT / "components" / "linux" / "drivers" / "cxl" / "core" / "region.c"
         ).read_text(encoding="utf-8")
