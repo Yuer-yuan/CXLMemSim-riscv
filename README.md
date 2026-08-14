@@ -48,14 +48,26 @@ set is:
 
 ```bash
 sudo apt install \
-  build-essential cmake ninja-build meson pkg-config python3 \
-  gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
-  device-tree-compiler e2fsprogs
+  build-essential cmake ninja-build meson pkg-config \
+  python3 python3-venv python3-packaging python3-dev \
+  gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+  device-tree-compiler e2fsprogs librdmacm-dev libibverbs-dev \
+  libpmem-dev libslirp-dev \
+  libglib2.0-dev libpixman-1-dev libspdlog-dev libbpf-dev libelf-dev \
+  zlib1g-dev libzstd-dev flex bison libssl-dev bc swig cpio
 ```
 
-QEMU may require additional distribution development packages reported by
-its pinned `configure` script. `scripts/check-deps.sh` only reports missing
-commands; it never invokes `sudo` or a package manager.
+The pinned QEMU requires Meson 1.5 or newer. When the distribution package is
+older, the top-level LegoFS checkout supplies a uv environment at
+`.cxl-bi-tools/uv`; `run-legofs-type3.sh` discovers it automatically. Generic
+libraries and cross tools still come from the distribution rather than a
+repository-local sysroot. `scripts/check-deps.sh` only reports missing commands;
+it never invokes `sudo` or a package manager.
+
+The Type-3 build explicitly enables libpmem and libslirp. They are runtime
+requirements for `pmem=on` file-backed memory and the guest TCP forwarding
+used by the two-node proof, so configuration fails immediately if either
+development package is absent.
 
 The pinned U-Boot contains legacy pylibfdt typemaps. The build creates an
 output-tree-only compatibility copy for current SWIG/Python releases; the
@@ -150,11 +162,18 @@ out/legofs-type3/runs/<run-id>/result.json
 ```
 
 The result also records both QEMU argv arrays, overlapping process lifetimes,
-artifact hashes, the two CXL SSD backing files, all address correlations,
+runtime artifact paths, the two CXL SSD backing files, all address correlations,
 Legofs direct-path and fallback counters, and final coherence error counters.
 `status: "passed"` requires zero timeouts, protocol errors, delivery failures,
 server-copy failures, fallback I/O, pending operations, quarantined extents,
 and active leases.
+
+The Legofs Type-3 path deliberately does not bind `--run-only` to artifact
+content hashes or a clean/source-HEAD snapshot. It checks that the current
+runtime artifacts exist, are non-empty, and are executable where required;
+the build manifest records paths and sizes. This keeps local component and
+parent-LegoFS iteration incremental. Independent output directories, rather
+than hash gates, separate baseline and candidate experiments.
 
 This is functional QEMU/TCG and CXLMemSim model evidence. The CXL SSDs are
 file-backed simulated persistent-memory devices; this does not claim a

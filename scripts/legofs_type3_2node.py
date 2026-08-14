@@ -3,7 +3,6 @@
 
 import argparse
 import datetime
-import hashlib
 import json
 import os
 import pathlib
@@ -756,15 +755,7 @@ def create_sparse_file(path, size):
         output.truncate(size)
 
 
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with pathlib.Path(path).open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def verified_manifest(paths):
+def load_runtime_manifest(paths):
     manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != 2:
         raise ValueError("unsupported build manifest schema")
@@ -778,36 +769,19 @@ def verified_manifest(paths):
     expected_source = paths.root.parent.parent.resolve()
     if source_path != expected_source:
         raise ValueError("build manifest LegoFS source is not the parent repository")
-    current_source_commit = subprocess.run(
-        ["git", "-C", str(source_path), "rev-parse", "HEAD"],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.strip()
-    if source.get("commit") != current_source_commit:
-        raise ValueError("parent LegoFS commit changed after the build manifest")
     expected = {
-        "qemu": paths.qemu,
-        "opensbi": paths.opensbi,
-        "u_boot": paths.u_boot,
-        "linux_legofs": paths.linux,
-        "legofs_disk": paths.legofs_disk,
-        "cxlmemsim_server": paths.cxlmemsim_server,
+        "qemu": (paths.qemu, True),
+        "opensbi": (paths.opensbi, False),
+        "u_boot": (paths.u_boot, False),
+        "linux_legofs": (paths.linux, False),
+        "legofs_disk": (paths.legofs_disk, False),
+        "cxlmemsim_server": (paths.cxlmemsim_server, True),
     }
-    for name, path in expected.items():
-        entry = manifest.get("artifacts", {}).get(name)
-        if not path.is_file() or not isinstance(entry, dict):
-            raise FileNotFoundError(f"missing verified runtime artifact: {name}")
-        if entry.get("size") != path.stat().st_size or entry.get("sha256") != sha256_file(path):
-            raise ValueError(f"runtime artifact changed after build: {name}")
-    current = subprocess.run(
-        ["git", "-C", str(paths.root), "rev-parse", "HEAD"],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.strip()
-    if manifest.get("superproject_commit") != current:
-        raise ValueError("superproject changed after the build manifest")
+    for name, (path, executable) in expected.items():
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"missing runtime artifact: {name}")
+        if executable and not os.access(path, os.X_OK):
+            raise PermissionError(f"runtime artifact is not executable: {name}")
     return manifest
 
 
@@ -862,7 +836,7 @@ def atomic_write_json(path, value):
 
 
 def execute(paths, benchmark_bytes, timeout):
-    manifest = verified_manifest(paths)
+    manifest = load_runtime_manifest(paths)
     coherence_reservation = PortReservation()
     legofs_reservation = PortReservation()
     owner_token = str(uuid.uuid4())
@@ -877,8 +851,8 @@ def execute(paths, benchmark_bytes, timeout):
         "run_id": paths.run_dir.name,
         "owner_token": owner_token,
         "component_commits": manifest["submodules"],
-        "artifact_sha256": {
-            name: entry["sha256"] for name, entry in manifest["artifacts"].items()
+        "runtime_artifacts": {
+            name: entry["path"] for name, entry in manifest["artifacts"].items()
         },
         "qemu_commands": [],
         "process_lifetimes": {},

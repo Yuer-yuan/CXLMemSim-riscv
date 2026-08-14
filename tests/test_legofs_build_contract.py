@@ -99,6 +99,9 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertIn('LEGOFS_SOURCE_ROOT="$(cd -- "${ROOT}/../.."', source)
         self.assertIn('OUT="${LEGOFS_TYPE3_OUT:-', source)
         self.assertIn('--source "legofs=${LEGOFS_SOURCE_ROOT}"', source)
+        self.assertIn("--enable-libpmem", source)
+        self.assertIn("--enable-slirp", source)
+        self.assertIn("--no-artifact-hashes", source)
         self.assertNotIn("components/legofs/Cargo.toml", source)
         self.assertIn('--compiler "qemu=${qemu} --version"', source)
         for artifact in (

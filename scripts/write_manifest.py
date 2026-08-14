@@ -31,6 +31,11 @@ def parse_args(argv=None):
         default=[],
         metavar="NAME=PATH",
     )
+    parser.add_argument(
+        "--no-artifact-hashes",
+        action="store_true",
+        help="record artifact paths and sizes without content hashes",
+    )
     return parser.parse_args(argv)
 
 
@@ -79,7 +84,7 @@ def display_path(root, path):
         return str(path)
 
 
-def parse_artifacts(root, specifications):
+def parse_artifacts(root, specifications, include_hashes=True):
     artifacts = {}
     for specification in specifications:
         name, separator, raw_path = specification.partition("=")
@@ -92,11 +97,13 @@ def parse_artifacts(root, specifications):
         path = pathlib.Path(raw_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"artifact is not a file: {path}")
-        artifacts[name] = {
+        entry = {
             "path": display_path(root, path),
             "size": path.stat().st_size,
-            "sha256": sha256(path),
         }
+        if include_hashes:
+            entry["sha256"] = sha256(path)
+        artifacts[name] = entry
     return dict(sorted(artifacts.items()))
 
 
@@ -193,7 +200,11 @@ def main(argv=None):
         "submodules": read_submodules(root),
         "sources": parse_sources(root, args.source),
         "compilers": parse_compilers(args.compiler),
-        "artifacts": parse_artifacts(root, args.artifact),
+        "artifacts": parse_artifacts(
+            root,
+            args.artifact,
+            include_hashes=not args.no_artifact_hashes,
+        ),
     }
     atomic_write_json(output, manifest)
     return 0

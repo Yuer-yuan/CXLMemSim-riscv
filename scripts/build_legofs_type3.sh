@@ -154,16 +154,24 @@ cmp "${badfs_server}" "${verify_server}" || die 'badfs-server ext2 payload is in
 cmp "${badfs_bench}" "${verify_bench}" || die 'badfs-bench ext2 payload is incomplete'
 
 printf '%s\n' '[legofs-build] QEMU riscv64-softmmu with Type-3 MESI v2 BI'
+qemu_configure_args=(
+	--target-list=riscv64-softmmu
+	--disable-docs
+	--disable-werror
+	--enable-libpmem
+	--enable-slirp
+	--prefix="${BUILD}/qemu-install"
+	--extra-cflags=-Wno-error
+)
 (
 	cd "${BUILD}/qemu"
-	"${ROOT}/components/qemu/configure" --target-list=riscv64-softmmu \
-		--disable-docs --disable-werror --extra-cflags=-Wno-error \
-		--prefix="${BUILD}/qemu-install"
+	"${ROOT}/components/qemu/configure" "${qemu_configure_args[@]}"
 )
 ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
 
 printf '%s\n' '[legofs-build] CXLMemSim MESI-v2 server'
-cmake -S "${ROOT}/components/cxlmemsim" -B "${BUILD}/cxlmemsim" \
+cmake -U RDMACM_LIB -U IBVERBS_LIB \
+	-S "${ROOT}/components/cxlmemsim" -B "${BUILD}/cxlmemsim" \
 	-DCMAKE_BUILD_TYPE=Release
 cmake --build "${BUILD}/cxlmemsim" --target cxlmemsim_server \
 	--parallel "${JOBS}"
@@ -228,6 +236,7 @@ done
 
 python3 "${ROOT}/scripts/write_manifest.py" \
 	--root "${ROOT}" --output "${RESULTS}/build-manifest.json" \
+	--no-artifact-hashes \
 	--source "legofs=${LEGOFS_SOURCE_ROOT}" \
 	--compiler "rustc=rustc --version" \
 	--compiler "cargo=cargo --version" \

@@ -2,6 +2,17 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LEGOFS_PARENT_ROOT="$(cd -- "${ROOT}/../.." && pwd -P)"
+LOCAL_TOOL_ROOT="${LEGOFS_TYPE3_TOOL_ROOT:-${LEGOFS_PARENT_ROOT}/.cxl-bi-tools}"
+
+if [[ -d "${LOCAL_TOOL_ROOT}" ]]; then
+	local_python_sites=("${LOCAL_TOOL_ROOT}"/uv/lib/python*/site-packages)
+	export PATH="${LOCAL_TOOL_ROOT}/uv/bin:${PATH}"
+	if [[ -d "${local_python_sites[0]}" ]]; then
+		export PYTHONPATH="${local_python_sites[0]}${PYTHONPATH:+:${PYTHONPATH}}"
+	fi
+fi
+
 BUILD_ONLY=0
 RUN_ONLY=0
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
@@ -24,6 +35,8 @@ Usage: ./run-legofs-type3.sh [OPTIONS]
 
 Environment:
   LEGOFS_TYPE3_OUT   absolute, separate build/result root for this variant
+  LEGOFS_TYPE3_TOOL_ROOT
+                      optional uv tool root; defaults to parent LegoFS/.cxl-bi-tools
 EOF
 }
 
