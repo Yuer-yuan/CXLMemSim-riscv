@@ -21,6 +21,9 @@ Usage: ./run-legofs-type3.sh [OPTIONS]
   --bytes N          benchmark bytes, 4096-aligned and <= 16777216
   --timeout N        end-to-end timeout in seconds
   --help              show this help
+
+Environment:
+  LEGOFS_TYPE3_OUT   absolute, separate build/result root for this variant
 EOF
 }
 
@@ -78,7 +81,7 @@ submodule_status="$(git -C "${ROOT}" submodule status)" ||
 while IFS= read -r line; do
 	[[ -z "${line}" ]] && continue
 	case "${line:0:1}" in
-	-|+|U)
+-|U)
 		die "submodule is not at its recorded gitlink: ${line}"
 		;;
 	esac

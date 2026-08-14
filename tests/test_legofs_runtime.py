@@ -1,7 +1,9 @@
 import importlib.util
+import os
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -89,6 +91,13 @@ class LegofsRuntimeTest(unittest.TestCase):
         self.assertEqual(self.runner.overlap_ns((10, 50), (20, 60)), 30)
         with self.assertRaisesRegex(ValueError, "did not overlap"):
             self.runner.overlap_ns((10, 20), (20, 30))
+
+    def test_output_root_can_isolate_baseline_and_candidate(self):
+        output = pathlib.Path(self.temporary.name) / "candidate-output"
+        with mock.patch.dict(os.environ, {"LEGOFS_TYPE3_OUT": str(output)}):
+            paths = self.runner.RuntimePaths.create(self.temporary.name)
+        self.assertEqual(paths.output, output.resolve())
+        self.assertEqual(paths.run_dir.parent, output.resolve() / "runs")
 
     def test_uboot_sequence_interrupts_autoboot_before_cxl_commands(self):
         source = RUNNER.read_text(encoding="utf-8")

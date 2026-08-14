@@ -35,7 +35,12 @@ LEGACY_TRANSPORT_ENV = (
 class RuntimePaths:
     def __init__(self, root, run_dir):
         self.root = pathlib.Path(root).resolve()
-        self.output = self.root / "out" / "legofs-type3"
+        configured_output = os.environ.get("LEGOFS_TYPE3_OUT")
+        if configured_output and not pathlib.Path(configured_output).is_absolute():
+            raise ValueError("LEGOFS_TYPE3_OUT must be an absolute path")
+        self.output = pathlib.Path(
+            configured_output or self.root / "out" / "legofs-type3"
+        ).resolve()
         self.build = self.output / "build"
         self.images = self.output / "images"
         self.results = self.output / "results"
@@ -59,7 +64,12 @@ class RuntimePaths:
         timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y%m%dT%H%M%S.%fZ"
         )
-        run_dir = root / "out/legofs-type3/runs" / f"{timestamp}-{os.getpid()}"
+        output = pathlib.Path(
+            os.environ.get("LEGOFS_TYPE3_OUT") or root / "out/legofs-type3"
+        )
+        if not output.is_absolute():
+            raise ValueError("LEGOFS_TYPE3_OUT must be an absolute path")
+        run_dir = output / "runs" / f"{timestamp}-{os.getpid()}"
         run_dir.mkdir(parents=True, mode=0o700)
         os.chmod(run_dir, 0o700)
         return cls(root, run_dir)
@@ -758,6 +768,24 @@ def verified_manifest(paths):
     manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != 2:
         raise ValueError("unsupported build manifest schema")
+    source = manifest.get("sources", {}).get("legofs")
+    if not isinstance(source, dict):
+        raise ValueError("build manifest lacks the parent LegoFS source")
+    source_path = pathlib.Path(source.get("path", ""))
+    if not source_path.is_absolute():
+        source_path = paths.root / source_path
+    source_path = source_path.resolve()
+    expected_source = paths.root.parent.parent.resolve()
+    if source_path != expected_source:
+        raise ValueError("build manifest LegoFS source is not the parent repository")
+    current_source_commit = subprocess.run(
+        ["git", "-C", str(source_path), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    if source.get("commit") != current_source_commit:
+        raise ValueError("parent LegoFS commit changed after the build manifest")
     expected = {
         "qemu": paths.qemu,
         "opensbi": paths.opensbi,

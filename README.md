@@ -1,10 +1,15 @@
 # CXLMemSim-riscv
 
-`CXLMemSim-riscv` is a reproducible integration superproject for the
+`CXLMemSim-riscv` is a reproducible integration platform for the
 synthetic SiFive U CXL stack. It builds QEMU, U-Boot, OpenSBI, Linux,
 freestanding RISC-V guest programs, an external ext2 benchmark image, and the
 CXLMemSim server, then proves a Type 3 endpoint issuing reads and writes
 through PGAS shared memory.
+
+When checked out as `LegoFS/platform/CXLMemSim-riscv`, the Legofs Type-3
+workflow always builds the parent LegoFS repository. LegoFS is intentionally
+not a nested component: this prevents experiments from modifying a second
+checkout while leaving the real candidate unchanged.
 
 ## Clone, build, and run
 
@@ -65,13 +70,19 @@ The superproject records exact gitlinks for:
 - `components/u-boot`: CXL discovery and HDM decoder programming;
 - `components/linux`: matching RISC-V CXL firmware handoff support;
 - `components/cxlmemsim`: PGAS SHM server;
-- `components/legofs`: Badfs lifecycle-direct client, server, and benchmark;
 - `components/opensbi`: OpenSBI v1.5.1;
 - `components/hifive-premier-tools`: pinned board-tool reference;
 - `components/meta-sifive`: pinned Yocto-layer reference.
 
 HiFive Premier tools and `meta-sifive` are reference components and are not
 built by the default SiFive U QEMU target.
+
+The Legofs Type-3 build resolves LegoFS at `../..` relative to this platform.
+It accepts committed or uncommitted development trees and records the parent
+path, commit, tree, and clean state in the build manifest without blocking a
+fast edit/build/run cycle. A standalone platform checkout can run the
+non-LegoFS workflow, but the Legofs workflow must be placed at that documented
+submodule path.
 
 ## Runtime topology
 
@@ -99,6 +110,16 @@ Both recorded commands begin exactly with:
 
 ```text
 qemu-system-riscv64 -M sifive_u
+```
+
+Use a different absolute output root for each baseline/candidate build so the
+two binaries and results can coexist during interleaved comparison:
+
+```bash
+LEGOFS_TYPE3_OUT=/approved/scratch/cxl-bi/B-P0 \
+  ./run-legofs-type3.sh --build-only
+LEGOFS_TYPE3_OUT=/approved/scratch/cxl-bi/B-P0 \
+  ./run-legofs-type3.sh --run-only --bytes 65536 --timeout 1200
 ```
 
 Each guest has one 256 MiB Type 3 endpoint attached through the synthetic

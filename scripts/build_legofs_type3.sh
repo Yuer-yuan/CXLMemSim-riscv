@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="${ROOT}/out/legofs-type3"
+LEGOFS_SOURCE_ROOT="$(cd -- "${ROOT}/../.." && pwd -P)"
+OUT="${LEGOFS_TYPE3_OUT:-${ROOT}/out/legofs-type3}"
 BUILD="${OUT}/build"
 IMAGES="${OUT}/images"
 RESULTS="${OUT}/results"
@@ -41,6 +42,14 @@ while (($#)); do
 	esac
 done
 [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || die "jobs must be a positive integer"
+[[ "${OUT}" == /* ]] || die "LEGOFS_TYPE3_OUT must be an absolute path"
+
+[[ -f "${LEGOFS_SOURCE_ROOT}/Cargo.toml" ]] ||
+	die "parent LegoFS source is missing Cargo.toml: ${LEGOFS_SOURCE_ROOT}"
+legofs_git_root="$(git -C "${LEGOFS_SOURCE_ROOT}" rev-parse --show-toplevel 2>/dev/null)" ||
+	die "parent LegoFS source is not a Git checkout: ${LEGOFS_SOURCE_ROOT}"
+[[ "$(cd -- "${legofs_git_root}" && pwd -P)" == "${LEGOFS_SOURCE_ROOT}" ]] ||
+	die "parent LegoFS path is not its Git worktree root: ${LEGOFS_SOURCE_ROOT}"
 
 for command in cargo rustc rustup "${CROSS_COMPILE}gcc" \
 	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" cmake ninja make mke2fs \
@@ -88,9 +97,9 @@ export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER="${MUSL_CC}"
 export RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-march=rv64gc -C link-arg=-mabi=lp64d'
 
 printf '%s\n' '[legofs-build] static RISC-V server and benchmark'
-cargo build --manifest-path "${ROOT}/components/legofs/Cargo.toml" --release \
+cargo build --manifest-path "${LEGOFS_SOURCE_ROOT}/Cargo.toml" --release \
 	--target "${RUST_TARGET}" -p badfs-server -p badfs-bench
-RUSTFLAGS= cargo test --manifest-path "${ROOT}/components/legofs/Cargo.toml" -p badfs-bench \
+RUSTFLAGS= cargo test --manifest-path "${LEGOFS_SOURCE_ROOT}/Cargo.toml" -p badfs-bench \
 	benchmark_mode_uses_semantic_values_and_rejects_unknown_input
 
 badfs_server_unstripped="${CARGO_TARGET}/${RUST_TARGET}/release/badfs-server"
@@ -219,6 +228,7 @@ done
 
 python3 "${ROOT}/scripts/write_manifest.py" \
 	--root "${ROOT}" --output "${RESULTS}/build-manifest.json" \
+	--source "legofs=${LEGOFS_SOURCE_ROOT}" \
 	--compiler "rustc=rustc --version" \
 	--compiler "cargo=cargo --version" \
 	--compiler "riscv_musl_gcc=${MUSL_CC} --version" \

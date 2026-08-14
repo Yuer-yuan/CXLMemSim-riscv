@@ -1,5 +1,10 @@
 # Legofs Two-RISC-V Type-3 MESI Back-Invalidation Implementation Plan
 
+> **Historical note (2026-08-14):** This completed plan describes the original
+> proof build and its former `components/legofs` gitlink. The maintained
+> platform now builds only the parent LegoFS repository at `../..`; do not use
+> the nested-LegoFS setup commands below for new experiments.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build and run one reproducible proof in which two overlapping `qemu-system-riscv64 -M sifive_u` guests run Legofs over separate CXL Type-3 endpoints and a real lifecycle-direct write causes a dirty MESI-v2 back-invalidation before Legofs commits the data.
