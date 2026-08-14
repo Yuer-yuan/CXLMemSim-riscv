@@ -114,6 +114,15 @@ class LegofsRuntimeTest(unittest.TestCase):
         self.assertIn("if (cxl_pmem_as_dax)", region_source)
         self.assertIn("return devm_cxl_add_dax_region(cxlr);", region_source)
 
+        cxl_dax_source = (
+            ROOT / "components" / "linux" / "drivers" / "dax" / "cxl.c"
+        ).read_text(encoding="utf-8")
+        self.assertIn("failed to create device-dax for CXL region", cxl_dax_source)
+        dax_device_source = (
+            ROOT / "components" / "linux" / "drivers" / "dax" / "device.c"
+        ).read_text(encoding="utf-8")
+        self.assertIn("failed to map device-dax pages", dax_device_source)
+
     def test_guest_waits_for_asynchronous_cxl_region_and_dax_probe(self):
         source = (ROOT / "guest" / "legofs_node_init.c").read_text(encoding="utf-8")
         self.assertIn('wait_for_prefix("/sys/bus/cxl/devices", "region", 1)', source)
