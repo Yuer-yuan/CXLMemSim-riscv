@@ -158,7 +158,19 @@ enum node_role {
 	ROLE_INVALID = 0,
 	ROLE_NODE0,
 	ROLE_NODE1,
+	ROLE_NODE2,
 };
+
+static const char *role_name(enum node_role role)
+{
+	if (role == ROLE_NODE0)
+		return "node0";
+	if (role == ROLE_NODE1)
+		return "node1";
+	if (role == ROLE_NODE2)
+		return "node2";
+	return "invalid";
+}
 
 #if defined(__riscv)
 static long syscall6(long number, long arg0, long arg1, long arg2,
@@ -591,7 +603,6 @@ static uint64_t stable_region_mix(uint64_t value)
 static void derive_region_id(struct dax_device *device)
 {
 	struct statx_record status;
-	uint64_t dev;
 	uint64_t rdev;
 	long result;
 
@@ -600,13 +611,12 @@ static void derive_region_id(struct dax_device *device)
 			  AT_SYMLINK_NOFOLLOW, 0x7ff, (long)&status);
 	if (result < 0)
 		fail("statx-dax", result);
-	dev = linux_device_number(status.dev_major, status.dev_minor);
 	rdev = linux_device_number(status.rdev_major, status.rdev_minor);
-	device->region_hi = stable_region_mix(dev ^ rotate_left(rdev, 17) ^
-					      rotate_left(status.size, 31) ^
+	/* Match FabricRegionId::derive_from_local_path for device nodes. */
+	device->region_hi = stable_region_mix(rdev ^ rotate_left(status.size, 31) ^
 					      rotate_left(2, 7));
-	device->region_lo = stable_region_mix(status.inode ^ rotate_left(dev, 29) ^
-					      rotate_left(rdev, 11) ^ status.size);
+	device->region_lo = stable_region_mix(rotate_left(rdev, 11) ^ status.size ^
+					      rotate_left(2, 43));
 }
 
 static void discover_dax(struct dax_device *device)
@@ -898,7 +908,11 @@ static size_t common_environment(char **environment, char *device_entry)
 	count = add_environment(environment, count, (char *)"BADFS_CXL_DIRECT_TRACE_STDOUT=1");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_POOL_SIZE=268435456");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_MAX_EXTENTS=127");
-	count = add_environment(environment, count, (char *)"RUST_LOG=info");
+	/* Keep explicit lifecycle/direct JSON proof, but do not serialize every
+	 * tarpc span through the emulated UART. Server audit/session records remain
+	 * visible through the badfs_server::rpc target. */
+	count = add_environment(environment, count,
+				(char *)"RUST_LOG=warn,badfs_server::rpc=info");
 	count = add_environment(environment, count, device_entry);
 	return count;
 }
@@ -991,19 +1005,123 @@ static void run_node1(char *device_entry, uint16_t server_port, uint64_t bytes)
 	power_off();
 }
 
+static void run_two_client(char *device_entry, uint16_t server_port,
+			   uint16_t barrier_port, uint64_t bytes,
+			   unsigned int client_id)
+{
+	static const char *cases[] = {
+		"disjoint-write",
+		"same-range",
+		"writer-reader-handoff",
+		"shared-read",
+		"client-crash",
+	};
+	char server_entry[64] = "BADFS_SERVERS=10.0.2.2:";
+	char barrier_entry[64] = "BADFS_BENCH_BARRIER_ADDR=10.0.2.2:";
+	char port_text[16];
+	char barrier_port_text[16];
+	char bytes_entry[64] = "BADFS_BENCH_FILE_SIZE=";
+	char bytes_text[24];
+	char client_entry[48] = "BADFS_BENCH_CLIENT_ID=";
+	char client_text[8];
+	char case_entry[96];
+	char *environment[MAX_ENV] = {0};
+	char mode_two_client[] = "BADFS_BENCH_MODE=2c1s";
+	char mode_inspect[] = "BADFS_BENCH_MODE=inspect";
+	size_t index;
+	size_t count;
+	long child;
+	int status;
+
+	unsigned_to_text(server_port, port_text, sizeof(port_text));
+	append_text(server_entry, sizeof(server_entry), port_text);
+	unsigned_to_text(barrier_port, barrier_port_text,
+			 sizeof(barrier_port_text));
+	append_text(barrier_entry, sizeof(barrier_entry), barrier_port_text);
+	unsigned_to_text(bytes, bytes_text, sizeof(bytes_text));
+	append_text(bytes_entry, sizeof(bytes_entry), bytes_text);
+	unsigned_to_text(client_id, client_text, sizeof(client_text));
+	append_text(client_entry, sizeof(client_entry), client_text);
+
+	for (index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+		for (count = 0; count < MAX_ENV; count++)
+			environment[count] = 0;
+		text_copy(case_entry, sizeof(case_entry), "BADFS_BENCH_CASE=");
+		append_text(case_entry, sizeof(case_entry), cases[index]);
+		count = common_environment(environment, device_entry);
+		count = add_environment(environment, count, server_entry);
+		count = add_environment(environment, count, barrier_entry);
+		count = add_environment(environment, count, (char *)"BADFS_BASE_PATH=/badfs");
+		count = add_environment(environment, count, mode_two_client);
+		count = add_environment(environment, count, bytes_entry);
+		count = add_environment(environment, count, client_entry);
+		(void)add_environment(environment, count, case_entry);
+
+		write_text("LEG_OFS_CASE_READY case=");
+		write_text(cases[index]);
+		write_text(" client=");
+		write_unsigned(client_id);
+		write_text("\n");
+		wait_for_run_gate();
+		write_text("LEG_OFS_CASE_BEGIN case=");
+		write_text(cases[index]);
+		write_text(" client=");
+		write_unsigned(client_id);
+		write_text("\n");
+		child = spawn("/mnt/badfs-bench", environment);
+		if (child < 0)
+			fail("spawn-2c1s", child);
+		status = wait_child(child);
+		if (text_equal(cases[index], "client-crash") && client_id == 0) {
+			if (status != 86)
+				fail("expected-client-crash", status < 0 ? 5 : status);
+		} else if (status != 0) {
+			fail("2c1s-case", status < 0 ? 5 : status);
+		}
+		write_text("LEG_OFS_CASE_PASS case=");
+		write_text(cases[index]);
+		write_text(" client=");
+		write_unsigned(client_id);
+		write_text("\n");
+	}
+
+	for (count = 0; count < MAX_ENV; count++)
+		environment[count] = 0;
+	count = common_environment(environment, device_entry);
+	count = add_environment(environment, count, server_entry);
+	count = add_environment(environment, count, (char *)"BADFS_BASE_PATH=/badfs");
+	(void)add_environment(environment, count, mode_inspect);
+	child = spawn("/mnt/badfs-bench", environment);
+	if (child < 0)
+		fail("spawn-2c1s-inspect", child);
+	status = wait_child(child);
+	if (status != 0)
+		fail("2c1s-inspect", status < 0 ? 5 : status);
+	write_text("LEG_OFS_2C1S_COMPLETE client=");
+	write_unsigned(client_id);
+	write_text("\n");
+	power_off();
+}
+
 void _start(void)
 {
 	char cmdline[MAX_CMDLINE];
 	char role_copy[16];
 	char port_copy[16];
 	char bytes_copy[32];
+	char clients_copy[16];
+	char barrier_port_copy[16];
 	char device_entry[MAX_PATH + 32] = "BADFS_LIFECYCLE_DEVICE=";
 	const char *role_value;
 	const char *port_value;
 	const char *bytes_value;
+	const char *clients_value;
+	const char *barrier_port_value;
 	enum node_role role = ROLE_INVALID;
 	uint64_t port;
 	uint64_t bytes;
+	uint64_t clients = 1;
+	uint64_t barrier_port = 0;
 	int valid;
 	struct dax_device dax;
 
@@ -1028,6 +1146,8 @@ void _start(void)
 		role = ROLE_NODE0;
 	else if (text_equal(role_copy, "node1"))
 		role = ROLE_NODE1;
+	else if (text_equal(role_copy, "node2"))
+		role = ROLE_NODE2;
 	else
 		fail("invalid-role", 22);
 
@@ -1051,6 +1171,32 @@ void _start(void)
 	bytes = parse_unsigned(bytes_copy, &valid);
 	if (!valid || !bytes || bytes > 16777216 || bytes % 4096)
 		fail("invalid-bytes", 22);
+
+	if (read_file("/proc/cmdline", cmdline, sizeof(cmdline)) <= 0)
+		fail("reread-cmdline-clients", 5);
+	clients_value = cmdline_value(cmdline, "legofs.clients=");
+	if (clients_value) {
+		text_copy(clients_copy, sizeof(clients_copy), clients_value);
+		clients = parse_unsigned(clients_copy, &valid);
+		if (!valid || (clients != 1 && clients != 2))
+			fail("invalid-clients", 22);
+	}
+	if ((role == ROLE_NODE2 && clients != 2) ||
+	    (role == ROLE_NODE0 && clients != 1 && clients != 2))
+		fail("role-clients-mismatch", 22);
+	if (clients == 2) {
+		if (read_file("/proc/cmdline", cmdline, sizeof(cmdline)) <= 0)
+			fail("reread-cmdline-barrier-port", 5);
+		barrier_port_value = cmdline_value(cmdline,
+						   "legofs.barrier_port=");
+		if (!barrier_port_value)
+			fail("missing-barrier-port", 22);
+		text_copy(barrier_port_copy, sizeof(barrier_port_copy),
+			  barrier_port_value);
+		barrier_port = parse_unsigned(barrier_port_copy, &valid);
+		if (!valid || !barrier_port || barrier_port > 65535)
+			fail("invalid-barrier-port", 22);
+	}
 
 	for (valid = 0; valid < 120 && !path_exists("/dev/vda", 0); valid++)
 		sleep_milliseconds(250);
@@ -1076,7 +1222,7 @@ void _start(void)
 	append_text(device_entry, sizeof(device_entry), dax.path);
 
 	write_text("LEG_OFS_CXL_READY role=");
-	write_text(role == ROLE_NODE0 ? "node0" : "node1");
+	write_text(role_name(role));
 	write_text(" dax=");
 	write_text(dax.path);
 	write_text(" size=");
@@ -1091,5 +1237,11 @@ void _start(void)
 
 	if (role == ROLE_NODE0)
 		run_node0(device_entry);
+	if (clients == 2)
+		run_two_client(device_entry, (uint16_t)port,
+			       (uint16_t)barrier_port, bytes,
+			       role == ROLE_NODE1 ? 0 : 1);
+	if (role != ROLE_NODE1)
+		fail("single-client-role", 22);
 	run_node1(device_entry, (uint16_t)port, bytes);
 }

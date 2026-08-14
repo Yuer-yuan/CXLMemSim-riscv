@@ -92,9 +92,11 @@ class RuntimePaths:
         return self.run_dir / f"node{node}-events.jsonl"
 
 
-def build_qemu_command(paths, node, coherence_port, legofs_port):
-    if node not in (0, 1):
-        raise ValueError("node must be 0 or 1")
+def build_qemu_command(
+    paths, node, coherence_port, legofs_port, guest_memory="2G"
+):
+    if node not in (0, 1, 2):
+        raise ValueError("node must be 0, 1, or 2")
     prefix = f"node{node}"
     command = [
         "qemu-system-riscv64",
@@ -108,7 +110,7 @@ def build_qemu_command(paths, node, coherence_port, legofs_port):
         "-smp",
         "5",
         "-m",
-        "2G",
+        guest_memory,
         "-display",
         "none",
         "-serial",
@@ -714,6 +716,12 @@ class Console:
         deadline = time.monotonic() + timeout
         with self.condition:
             while text not in self.output[start:]:
+                failure = self.output.find("LEG_OFS_FAIL", start)
+                if failure >= 0:
+                    line = self.output[failure:].splitlines()[0]
+                    raise RuntimeError(
+                        f"guest reported {line!r} while waiting for {text!r}"
+                    )
                 if self.process.poll() is not None:
                     raise RuntimeError(
                         f"QEMU exited with {self.process.returncode} while waiting for {text!r}"
@@ -799,7 +807,22 @@ def wait_for_log(path, marker, process, timeout):
     raise TimeoutError(f"timed out waiting for CXLMemSim marker {marker!r}")
 
 
-def run_uboot(console, paths, node, legofs_port, benchmark_bytes, timeout):
+def run_uboot(
+    console,
+    paths,
+    node,
+    legofs_port,
+    benchmark_bytes,
+    timeout,
+    client_count=1,
+    barrier_port=None,
+):
+    if client_count == 2:
+        if not isinstance(barrier_port, int) or not 0 < barrier_port <= 65535:
+            raise ValueError("two-client boot requires a valid barrier port")
+        barrier_argument = f" legofs.barrier_port={barrier_port}"
+    else:
+        barrier_argument = ""
     console.wait("Hit any key to stop autoboot", timeout)
     console.send("")
     console.wait("=> ", timeout)
@@ -818,7 +841,8 @@ def run_uboot(console, paths, node, legofs_port, benchmark_bytes, timeout):
         "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=6 "
         "cxl_core.pmem_as_dax=1 "
         f"legofs.role=node{node} legofs.server_port={legofs_port} "
-        f"legofs.bytes={benchmark_bytes}'",
+        f"legofs.bytes={benchmark_bytes} legofs.clients={client_count}"
+        f"{barrier_argument}'",
         timeout,
     )
     console.send(f"bootefi 90000000:{paths.linux.stat().st_size:x} ${{fdtcontroladdr}}")

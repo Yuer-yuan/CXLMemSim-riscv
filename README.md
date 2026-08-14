@@ -161,6 +161,21 @@ The result is written to:
 out/legofs-type3/runs/<run-id>/result.json
 ```
 
+The three-endpoint 2-client/1-server calibration uses the same build output:
+
+```bash
+./run-legofs-type3-2c1s.sh --build-only --jobs 8
+./run-legofs-type3-2c1s.sh --run-only --bytes 65536 --timeout 1200
+```
+
+Its results are kept under `out/legofs-type3/runs-2c1s/<run-id>`. Client
+phase coordination uses a host-side TCP barrier through the QEMU user-network
+gateway; it never creates marker files in Legofs and therefore does not enter
+the measured namespace, lifecycle, persistence, or coherence paths. The five
+cases are disjoint write, same-range write, writer/reader handoff, shared read,
+and client crash. A workload failure is a valid rejected baseline, and the
+runner preserves its result and cleans up only the processes it owns.
+
 The result also records both QEMU argv arrays, overlapping process lifetimes,
 runtime artifact paths, the two CXL SSD backing files, all address correlations,
 Legofs direct-path and fallback counters, and final coherence error counters.
