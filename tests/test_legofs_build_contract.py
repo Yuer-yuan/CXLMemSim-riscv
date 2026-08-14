@@ -75,6 +75,9 @@ class LegofsBuildContractTest(unittest.TestCase):
             "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
             source,
         )
+        self.assertIn('"${CROSS_COMPILE}strip" --strip-debug', source)
+        self.assertIn('cmp "${badfs_server}" "${verify_server}"', source)
+        self.assertNotIn("./config.status", source)
         for artifact in (
             "qemu",
             "opensbi",

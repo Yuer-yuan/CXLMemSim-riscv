@@ -9,6 +9,7 @@ RESULTS="${OUT}/results"
 LOGS="${OUT}/logs"
 INITRAMFS="${IMAGES}/initramfs"
 CARGO_TARGET="${BUILD}/cargo"
+LEGOFS_BIN="${BUILD}/legofs-bin"
 CROSS_COMPILE="${CROSS_COMPILE:-riscv64-linux-gnu-}"
 RUST_TARGET="riscv64gc-unknown-linux-musl"
 MUSL_VERSION=1.2.5
@@ -42,8 +43,8 @@ done
 [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || die "jobs must be a positive integer"
 
 for command in cargo rustc rustup "${CROSS_COMPILE}gcc" \
-	"${CROSS_COMPILE}readelf" cmake ninja make mke2fs debugfs truncate python3 \
-	wget sha256sum tar; do
+	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" cmake ninja make mke2fs \
+	debugfs truncate python3 wget sha256sum tar install stat cmp; do
 	command -v "${command}" >/dev/null || die "required command is missing: ${command}"
 done
 if ! rustup target list --installed | grep -qx "${RUST_TARGET}"; then
@@ -55,6 +56,7 @@ fi
 mkdir -p \
 	"${BUILD}/qemu" "${BUILD}/opensbi" "${BUILD}/u-boot" \
 	"${BUILD}/linux" "${BUILD}/cxlmemsim" "${CARGO_TARGET}" \
+	"${LEGOFS_BIN}" \
 	"${MUSL_SOURCE_ROOT}" "${MUSL_BUILD}" "${MUSL_PREFIX}" \
 	"${INITRAMFS}" "${IMAGES}" "${RESULTS}" "${LOGS}"
 exec > >(tee -a "${LOGS}/build.log") 2>&1
@@ -91,8 +93,13 @@ cargo build --manifest-path "${ROOT}/components/legofs/Cargo.toml" --release \
 RUSTFLAGS= cargo test --manifest-path "${ROOT}/components/legofs/Cargo.toml" -p badfs-bench \
 	benchmark_mode_uses_semantic_values_and_rejects_unknown_input
 
-badfs_server="${CARGO_TARGET}/${RUST_TARGET}/release/badfs-server"
-badfs_bench="${CARGO_TARGET}/${RUST_TARGET}/release/badfs-bench"
+badfs_server_unstripped="${CARGO_TARGET}/${RUST_TARGET}/release/badfs-server"
+badfs_bench_unstripped="${CARGO_TARGET}/${RUST_TARGET}/release/badfs-bench"
+badfs_server="${LEGOFS_BIN}/badfs-server"
+badfs_bench="${LEGOFS_BIN}/badfs-bench"
+install -m 0755 "${badfs_server_unstripped}" "${badfs_server}"
+install -m 0755 "${badfs_bench_unstripped}" "${badfs_bench}"
+"${CROSS_COMPILE}strip" --strip-debug "${badfs_server}" "${badfs_bench}"
 for binary in "${badfs_server}" "${badfs_bench}"; do
 	[[ -s "${binary}" ]] || die "missing Legofs binary: ${binary}"
 	if "${CROSS_COMPILE}readelf" -l "${binary}" | grep -q INTERP; then
@@ -120,7 +127,9 @@ fi
 
 printf '%s\n' '[legofs-build] read-only ext2 payload image'
 legofs_disk="${IMAGES}/legofs-type3.ext2"
-truncate -s 64M "${legofs_disk}"
+payload_bytes=$(($(stat -c %s "${badfs_server}") + $(stat -c %s "${badfs_bench}")))
+image_mib=$(((payload_bytes + 32 * 1024 * 1024 + 1024 * 1024 - 1) / (1024 * 1024)))
+truncate -s "${image_mib}M" "${legofs_disk}"
 mke2fs -q -t ext2 -F "${legofs_disk}"
 debugfs -w -R "write ${badfs_server} /badfs-server" "${legofs_disk}"
 debugfs -w -R "set_inode_field /badfs-server mode 0100755" "${legofs_disk}"
@@ -128,13 +137,19 @@ debugfs -w -R "write ${badfs_bench} /badfs-bench" "${legofs_disk}"
 debugfs -w -R "set_inode_field /badfs-bench mode 0100755" "${legofs_disk}"
 debugfs -R 'stat /badfs-server' "${legofs_disk}" | grep -q 'Mode:.*0755'
 debugfs -R 'stat /badfs-bench' "${legofs_disk}" | grep -q 'Mode:.*0755'
+verify_server="${BUILD}/verify-badfs-server"
+verify_bench="${BUILD}/verify-badfs-bench"
+debugfs -R "dump /badfs-server ${verify_server}" "${legofs_disk}"
+debugfs -R "dump /badfs-bench ${verify_bench}" "${legofs_disk}"
+cmp "${badfs_server}" "${verify_server}" || die 'badfs-server ext2 payload is incomplete'
+cmp "${badfs_bench}" "${verify_bench}" || die 'badfs-bench ext2 payload is incomplete'
 
 printf '%s\n' '[legofs-build] QEMU riscv64-softmmu with Type-3 MESI v2 BI'
 (
 	cd "${BUILD}/qemu"
 	"${ROOT}/components/qemu/configure" --target-list=riscv64-softmmu \
-		--disable-docs --disable-werror --prefix="${BUILD}/qemu-install"
-	./config.status --extra-cflags=-Wno-error
+		--disable-docs --disable-werror --extra-cflags=-Wno-error \
+		--prefix="${BUILD}/qemu-install"
 )
 ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
 
