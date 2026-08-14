@@ -872,13 +872,13 @@ static size_t common_environment(char **environment, char *device_entry)
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_DIRECT_READ=1");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_DIRECT_READ_REQUIRED=1");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_DEVICE_REQUIRED=1");
-	count = add_environment(environment, count, (char *)"BADFS_CXL_MAP_ALIGNMENT=4096");
+	count = add_environment(environment, count, (char *)"BADFS_CXL_MAP_ALIGNMENT=2097152");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_TRACE=/tmp/lifecycle.jsonl");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_TRACE_STDOUT=1");
 	count = add_environment(environment, count, (char *)"BADFS_CXL_DIRECT_TRACE=/tmp/direct.jsonl");
 	count = add_environment(environment, count, (char *)"BADFS_CXL_DIRECT_TRACE_STDOUT=1");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_POOL_SIZE=268435456");
-	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_MAX_EXTENTS=128");
+	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_MAX_EXTENTS=127");
 	count = add_environment(environment, count, (char *)"RUST_LOG=info");
 	count = add_environment(environment, count, device_entry);
 	return count;

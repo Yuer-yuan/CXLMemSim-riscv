@@ -34,8 +34,10 @@ class LegofsBuildContractTest(unittest.TestCase):
             "LEG_OFS_BENCHMARK_PASS",
             "BADFS_LIFECYCLE_DIRECT_REQUIRED=1",
             "BADFS_LIFECYCLE_DIRECT_READ_REQUIRED=1",
+            "BADFS_CXL_MAP_ALIGNMENT=2097152",
         ):
             self.assertIn(marker, source)
+        self.assertNotIn("BADFS_CXL_MAP_ALIGNMENT=4096", source)
 
     def run_cli(self, *arguments, environment=None):
         return subprocess.run(
