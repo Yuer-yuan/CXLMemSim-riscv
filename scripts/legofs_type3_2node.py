@@ -644,34 +644,33 @@ class Console:
             chunk = os.read(self.process.stdout.fileno(), 4096)
             if not chunk:
                 break
+            decoded = chunk.decode(errors="replace")
+            with self.condition:
+                self.output += decoded
+                self.log.write(decoded)
+                self.log.flush()
+                self.condition.notify_all()
+            sys.stdout.write(decoded)
+            sys.stdout.flush()
             pending += chunk
             while b"\n" in pending:
                 raw_line, pending = pending.split(b"\n", 1)
-                self._capture(raw_line + b"\n", complete=True)
-        if pending:
-            self._capture(pending, complete=False)
+                self._capture_event(raw_line)
         self.owned.record_exit()
         with self.condition:
             self.condition.notify_all()
 
-    def _capture(self, raw, complete):
-        decoded = raw.decode(errors="replace")
+    def _capture_event(self, raw_line):
+        decoded = raw_line.decode(errors="replace").rstrip("\r")
         capture_ns = time.monotonic_ns()
         with self.condition:
-            self.output += decoded
-            self.log.write(decoded)
-            self.log.flush()
-            if complete:
-                json.dump(
-                    {"host_capture_ns": capture_ns, "line": decoded.rstrip("\r\n")},
-                    self.events,
-                    sort_keys=True,
-                )
-                self.events.write("\n")
-                self.events.flush()
-            self.condition.notify_all()
-        sys.stdout.write(decoded)
-        sys.stdout.flush()
+            json.dump(
+                {"host_capture_ns": capture_ns, "line": decoded},
+                self.events,
+                sort_keys=True,
+            )
+            self.events.write("\n")
+            self.events.flush()
 
     def wait(self, text, timeout, start=0):
         deadline = time.monotonic() + timeout
@@ -786,6 +785,7 @@ def run_uboot(console, paths, node, legofs_port, benchmark_bytes, timeout):
         raise ValueError(f"node{node} cxl init did not reproduce decoder state")
     console.command_until_prompt(
         "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=5 "
+        "cxl_core.pmem_as_dax=1 "
         f"legofs.role=node{node} legofs.server_port={legofs_port} "
         f"legofs.bytes={benchmark_bytes}'",
         timeout,

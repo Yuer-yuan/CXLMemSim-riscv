@@ -94,6 +94,25 @@ class LegofsRuntimeTest(unittest.TestCase):
         self.assertLess(interrupt, prompt)
         self.assertLess(prompt, listing)
 
+    def test_linux_explicitly_routes_persistent_cxl_region_to_devdax(self):
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("cxl_core.pmem_as_dax=1", source)
+
+        region_source = (
+            ROOT / "components" / "linux" / "drivers" / "cxl" / "core" / "region.c"
+        ).read_text(encoding="utf-8")
+        self.assertIn("module_param_named(pmem_as_dax", region_source)
+        self.assertIn("if (cxl_pmem_as_dax)", region_source)
+        self.assertIn("return devm_cxl_add_dax_region(cxlr);", region_source)
+
+    def test_console_waiting_uses_chunks_but_sidecars_use_complete_lines(self):
+        source = RUNNER.read_text(encoding="utf-8")
+        append = source.index("self.output += decoded")
+        split = source.index('while b"\\n" in pending:', append)
+        event = source.index("self._capture_event(raw_line)", split)
+        self.assertLess(append, split)
+        self.assertLess(split, event)
+
 
 if __name__ == "__main__":
     unittest.main()
