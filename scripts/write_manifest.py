@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 
@@ -17,6 +18,12 @@ def parse_args(argv=None):
         action="append",
         default=[],
         metavar="NAME=PATH",
+    )
+    parser.add_argument(
+        "--compiler",
+        action="append",
+        default=[],
+        metavar="NAME=COMMAND",
     )
     return parser.parse_args(argv)
 
@@ -85,6 +92,32 @@ def parse_artifacts(root, specifications):
     return dict(sorted(artifacts.items()))
 
 
+def parse_compilers(specifications):
+    compilers = {}
+    for specification in specifications:
+        name, separator, raw_command = specification.partition("=")
+        if not separator or not name or not raw_command:
+            raise ValueError(
+                f"compiler must use non-empty NAME=COMMAND: {specification}"
+            )
+        if name in compilers:
+            raise ValueError(f"duplicate compiler name: {name}")
+        command = shlex.split(raw_command)
+        if not command:
+            raise ValueError(f"compiler command is empty: {specification}")
+        run = subprocess.run(
+            command,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        version = (run.stdout or run.stderr).strip()
+        if not version:
+            raise ValueError(f"compiler produced no version output: {name}")
+        compilers[name] = {"command": command, "version": version}
+    return dict(sorted(compilers.items()))
+
+
 def atomic_write_json(output, value):
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp")
@@ -110,9 +143,10 @@ def main(argv=None):
     if not (root / ".git").exists():
         raise ValueError(f"root is not a Git checkout: {root}")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "superproject_commit": git_output(root, "rev-parse", "HEAD").strip(),
         "submodules": read_submodules(root),
+        "compilers": parse_compilers(args.compiler),
         "artifacts": parse_artifacts(root, args.artifact),
     }
     atomic_write_json(output, manifest)

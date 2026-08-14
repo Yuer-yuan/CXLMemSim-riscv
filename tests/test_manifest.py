@@ -11,7 +11,7 @@ SCRIPT = ROOT / "scripts" / "write_manifest.py"
 
 
 class ManifestTest(unittest.TestCase):
-    def invoke(self, output, *artifacts):
+    def invoke(self, output, *artifacts, compilers=()):
         self.assertTrue(SCRIPT.is_file(), "scripts/write_manifest.py is missing")
         command = [
             "python3",
@@ -23,6 +23,8 @@ class ManifestTest(unittest.TestCase):
         ]
         for name, path in artifacts:
             command.extend(["--artifact", f"{name}={path}"])
+        for name, compiler in compilers:
+            command.extend(["--compiler", f"{name}={compiler}"])
         return subprocess.run(command, text=True, capture_output=True)
 
     def test_manifest_hashes_artifacts_and_records_gitlinks(self):
@@ -37,10 +39,11 @@ class ManifestTest(unittest.TestCase):
                 output,
                 ("first", first),
                 ("second", second),
+                compilers=(("python", "python3 --version"),),
             )
             self.assertEqual(run.returncode, 0, run.stderr)
             manifest = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(
             manifest["superproject_commit"],
             subprocess.run(
@@ -50,10 +53,14 @@ class ManifestTest(unittest.TestCase):
                 capture_output=True,
             ).stdout.strip(),
         )
-        self.assertEqual(
-            manifest["submodules"]["components/qemu"],
-            "81cd7ad9a5e14470427c8ebafeccff4f52e555b4",
-        )
+        expected_qemu = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD:components/qemu"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        self.assertEqual(manifest["submodules"]["components/qemu"], expected_qemu)
+        self.assertIn("Python", manifest["compilers"]["python"]["version"])
         self.assertEqual(manifest["artifacts"]["first"]["size"], 3)
         self.assertEqual(
             manifest["artifacts"]["first"]["sha256"],

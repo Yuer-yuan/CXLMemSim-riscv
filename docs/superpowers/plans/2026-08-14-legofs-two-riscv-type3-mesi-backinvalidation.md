@@ -897,14 +897,20 @@ Run `git submodule status --recursive` and reject lines beginning with `-`,
 
 ```bash
 cargo build --manifest-path components/legofs/Cargo.toml --release \
-  --target riscv64gc-unknown-linux-gnu -p badfs-server -p badfs-bench
+  --target riscv64gc-unknown-linux-musl -p badfs-server -p badfs-bench
 riscv64-linux-gnu-readelf -l <each-binary> | grep -qv INTERP
 ```
 
-Set `CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc` and
-`RUSTFLAGS='-C target-feature=+crt-static'`. If the requested Rust target is
-not installed, print the exact `rustup target add riscv64gc-unknown-linux-gnu`
-remediation and exit without invoking `rustup`.
+Build a pinned musl 1.2.5 sysroot under `out/legofs-type3` with
+`-march=rv64gc -mabi=lp64d`, verifying the official release tarball SHA-256
+`a9a118bb...fc7c75e4`. Use its wrapper for
+`CC_riscv64gc_unknown_linux_musl` and
+`CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER`; this avoids the host
+distribution's RVV-enabled static glibc/crt. Set
+`RUSTFLAGS='-C target-feature=+crt-static -C link-arg=-march=rv64gc -C link-arg=-mabi=lp64d'`.
+If the requested Rust target is not installed, print the exact
+`rustup target add riscv64gc-unknown-linux-musl` remediation and exit without
+invoking `rustup`.
 
 Build `guest/legofs_node_init.c` with the same static freestanding RV64 flags
 as `scripts/build.sh`. Create a 64 MiB ext2 image using `truncate`, `mke2fs`,
@@ -972,6 +978,10 @@ Assert node0 alone has one `hostfwd=tcp:127.0.0.1:<port>-:3345`, every QEMU
 object/device ID is node-qualified, and both commands point to the same
 coherence port but different host IDs.
 
+Assert each node uses one file-backed `memory-backend-file` with `pmem=on`
+and attaches it through `persistent-memdev`. Reject `volatile-memdev`: the
+benchmark endpoint is a QEMU CXL SSD, not anonymous volatile CXL memory.
+
 - [ ] **Step 2: Run the tests and verify RED**
 
 Run:
@@ -991,16 +1001,22 @@ Each returned list begins exactly:
 ```
 
 It then includes the existing SiFive U CXL firmware/FMW settings, one
-256 MiB volatile Type-3 backend, one 2 MiB LSA, one `pxb-cxl`, one `cxl-rp`,
-one `cxl-type3`, the read-only Legofs ext2 disk, and one `virtio-net-pci` user
-network. The Type-3 argument contains:
+256 MiB node-private file-backed persistent Type-3 CXL SSD (`pmem=on`), one
+2 MiB LSA, one `pxb-cxl`, one `cxl-rp`, one `cxl-type3`, the read-only Legofs
+ext2 disk, and one `virtio-net-pci` user network. The Type-3 argument contains:
 
 ```text
 coherence-v2=on,cxlmemsim-addr=127.0.0.1,cxlmemsim-port=<port>,
-coherence-v2-host-id=<0-or-1>,coherence-v2-cache-capacity=1024,
-coherence-v2-cache-ways=8,coherence-v2-timeout-ms=5000,
+coherence-v2-host-id=<0-or-1>,coherence-v2-cache-capacity=262144,
+coherence-v2-cache-ways=4,coherence-v2-timeout-ms=5000,
 coherence-v2-write-through=off
 ```
+
+This is also the QEMU back-invalidation implementation under test: a guest
+write leaves the Type-3 endpoint-cache line dirty in M, and the competing
+guest access must make QEMU answer `SNP_DATA_INV` with a 64-byte dirty model
+ACK before invalidating the local line. The Type-2 BAR back-invalidation queue
+is not a substitute for this Type-3 path.
 
 Do not set legacy `CXL_TRANSPORT_MODE`, `CXL_PGAS_SHM`, or
 `CXL_MEMSIM_SERVER` environment variables.
