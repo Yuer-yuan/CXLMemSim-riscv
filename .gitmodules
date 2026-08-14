@@ -19,3 +19,6 @@
 [submodule "components/meta-sifive"]
 	path = components/meta-sifive
 	url = https://github.com/SlugLab/meta-sifive.git
+[submodule "components/legofs"]
+	path = components/legofs
+	url = https://github.com/Zettai-US/legofs.git
