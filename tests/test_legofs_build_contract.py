@@ -40,6 +40,14 @@ class LegofsBuildContractTest(unittest.TestCase):
             self.assertIn(marker, source)
         self.assertNotIn("BADFS_CXL_MAP_ALIGNMENT=4096", source)
 
+    def test_cxl_devdax_exposes_real_persistence_flush(self):
+        device = (ROOT / "components/linux/drivers/dax/device.c").read_text()
+        cxl = (ROOT / "components/linux/drivers/dax/cxl.c").read_text()
+        self.assertIn("static int dax_fsync", device)
+        self.assertIn("dax_flush(dev_dax->dax_dev", device)
+        self.assertIn(".fsync = dax_fsync", device)
+        self.assertIn(".persistent = true", cxl)
+
     def run_cli(self, *arguments, environment=None):
         return subprocess.run(
             [str(RUN), *arguments],
