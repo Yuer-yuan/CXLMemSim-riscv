@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import socket
 import subprocess
@@ -192,6 +193,360 @@ def overlap_ns(first, second):
     if overlap <= 0:
         raise ValueError("the two QEMU lifetimes did not overlap")
     return overlap
+
+
+def _reject_duplicate_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def strict_json_loads(text):
+    try:
+        value = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON evidence: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("JSON evidence must be an object")
+    return value
+
+
+def _required_integer(record, name):
+    value = record.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"evidence field {name} must be an integer")
+    return value
+
+
+def parse_prefixed_records(output, prefix, schema):
+    marker = prefix + " "
+    records = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith(marker):
+            continue
+        record = strict_json_loads(line[len(marker):])
+        if record.get("schema_version") != schema:
+            raise ValueError(f"unsupported {prefix} schema")
+        records.append(record)
+    return records
+
+
+def read_coherence_trace(path, start_offset=0):
+    path = pathlib.Path(path)
+    with path.open("rb") as source:
+        source.seek(start_offset)
+        raw = source.read()
+    if raw and not raw.endswith(b"\n"):
+        raise ValueError("truncated final coherence JSONL record")
+    records = []
+    previous = None
+    for number, raw_line in enumerate(raw.splitlines(), 1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"invalid UTF-8 in coherence record {number}") from error
+        record = strict_json_loads(line)
+        if record.get("schema_version") != 1:
+            raise ValueError("unsupported coherence trace schema")
+        now = _required_integer(record, "monotonic_ns")
+        if previous is not None and now < previous:
+            raise ValueError("coherence timestamps went backwards")
+        previous = now
+        records.append(record)
+    return records
+
+
+def validate_registrations(records):
+    registrations = [
+        record for record in records
+        if record.get("event") == "registration" and record.get("status") == "OK"
+    ]
+    if len(registrations) != 2:
+        raise ValueError(f"expected exactly two successful host registrations, got {len(registrations)}")
+    by_host = {}
+    sessions = set()
+    for record in registrations:
+        host = _required_integer(record, "src_host")
+        session = _required_integer(record, "session_id")
+        if host in by_host:
+            raise ValueError(f"duplicate coherence host ID: {host}")
+        if host not in (0, 1) or session == 0 or session in sessions:
+            raise ValueError("coherence registrations have invalid host/session identity")
+        by_host[host] = record
+        sessions.add(session)
+    if set(by_host) != {0, 1}:
+        raise ValueError("coherence registrations must contain host IDs 0 and 1")
+    return [by_host[0], by_host[1]]
+
+
+def correlate_dirty_backinvalidations(direct_records, lifecycle_records, coherence_records):
+    direct_by_op = {}
+    for record in direct_records:
+        if (
+            record.get("event") in ("drop", "unmap")
+            and record.get("access") in ("write", "read_write")
+            and record.get("rc") == 0
+        ):
+            direct_by_op[_required_integer(record, "op_id")] = record
+    begin_by_op = {
+        _required_integer(record, "op_id"): record
+        for record in lifecycle_records if record.get("event") == "store_direct_begin"
+    }
+    success_by_op = {
+        _required_integer(record, "op_id"): record
+        for record in lifecycle_records if record.get("event") == "store_direct_success"
+    }
+    acks = {
+        _required_integer(record, "snoop_id"): record
+        for record in coherence_records if record.get("event") == "snoop_ack"
+    }
+    completions = {
+        _required_integer(record, "snoop_id"): record
+        for record in coherence_records if record.get("event") == "dirty_completion"
+    }
+    matches = []
+    for snoop in coherence_records:
+        if snoop.get("event") != "snoop_send" or snoop.get("opcode") != "SNP_DATA_INV":
+            continue
+        snoop_id = _required_integer(snoop, "snoop_id")
+        line = _required_integer(snoop, "line_address")
+        if _required_integer(snoop, "dst_host") != 1:
+            continue
+        ack = acks.get(snoop_id)
+        completion = completions.get(snoop_id)
+        if not ack or not completion:
+            continue
+        if (
+            ack.get("ack_strength") != "MODEL"
+            or ack.get("status") != "OK"
+            or ack.get("dirty_data") is not True
+            or _required_integer(ack, "payload_len") != 64
+            or completion.get("opcode") != "SNP_DATA_INV"
+            or completion.get("dirty_data") is not True
+            or _required_integer(ack, "line_address") != line
+            or _required_integer(completion, "line_address") != line
+            or _required_integer(snoop, "monotonic_ns") > _required_integer(ack, "monotonic_ns")
+            or _required_integer(ack, "monotonic_ns") > _required_integer(completion, "monotonic_ns")
+        ):
+            continue
+        for op_id, direct in direct_by_op.items():
+            begin = begin_by_op.get(op_id)
+            success = success_by_op.get(op_id)
+            if not begin or not success:
+                continue
+            start = _required_integer(begin, "mapping_offset")
+            length = _required_integer(begin, "mapping_length")
+            if (
+                _required_integer(success, "mapping_offset") != start
+                or _required_integer(success, "mapping_length") != length
+                or _required_integer(direct, "offset") != start
+                or _required_integer(direct, "length") != length
+                or not (start <= line and line + 64 <= start + length)
+            ):
+                continue
+            matches.append({
+                "op_id": op_id,
+                "mapping_offset": start,
+                "mapping_length": length,
+                "direct_unmap": direct,
+                "lifecycle_begin": begin,
+                "snoop": snoop,
+                "ack": ack,
+                "completion": completion,
+                "lifecycle_success": success,
+            })
+    if not matches:
+        raise ValueError("no address-correlated dirty SNP_DATA_INV MODEL completion")
+    return matches
+
+
+def expected_benchmark_checksum(file_size, block_size, iterations):
+    total = 0
+    offset = 0
+    while offset < file_size:
+        length = min(block_size, file_size - offset)
+        total += sum(index % 251 for index in range(length))
+        offset += length
+    return total * iterations
+
+
+def _parse_scalar_fields(line):
+    fields = {}
+    for name, value in re.findall(r"([a-zA-Z0-9_]+)=([^\s]+)", line):
+        if name in fields:
+            raise ValueError(f"duplicate scalar field: {name}")
+        fields[name] = value
+    return fields
+
+
+def validate_legofs_output(output, benchmark_bytes):
+    bench_lines = [line for line in output.splitlines() if line.startswith("badfs_bench ")]
+    if len(bench_lines) != 1:
+        raise ValueError(f"expected exactly one badfs benchmark line, got {len(bench_lines)}")
+    raw = _parse_scalar_fields(bench_lines[0])
+    integer_names = (
+        "file_size", "block_size", "iterations", "written_bytes", "read_bytes", "checksum"
+    )
+    try:
+        benchmark = {name: int(raw[name], 10) for name in integer_names}
+    except (KeyError, ValueError) as error:
+        raise ValueError("badfs benchmark integer fields are invalid") from error
+    if (
+        benchmark["file_size"] != benchmark_bytes
+        or benchmark["block_size"] != 4096
+        or benchmark["iterations"] != 1
+        or benchmark["written_bytes"] != benchmark_bytes
+        or benchmark["read_bytes"] != benchmark_bytes
+        or benchmark["checksum"] != expected_benchmark_checksum(benchmark_bytes, 4096, 1)
+    ):
+        raise ValueError("badfs benchmark bytes or checksum mismatch")
+    inspections = parse_prefixed_records(
+        output, "badfs_lifecycle_inspection", "badfs.lifecycle.inspection.v1"
+    )
+    if not inspections:
+        raise ValueError("missing badfs lifecycle inspection")
+    zero_fabric = (
+        "staged_read_ops", "staged_read_bytes", "staged_write_ops", "staged_write_bytes",
+        "blob_read_ops", "blob_read_bytes", "blob_write_ops", "blob_write_bytes",
+        "legacy_read_file_block_ops", "legacy_write_file_block_ops",
+        "legacy_read_fabric_block_ops", "legacy_write_fabric_block_ops",
+        "stale_ref_rejections", "epoch_rejections", "checksum_failures", "lease_rejections",
+        "quarantine_events", "active_leases", "quarantined_slots",
+    )
+    zero_audit = (
+        "pending_operations", "quarantined_extents", "active_read_leases", "direct_mapped_extents",
+    )
+    direct_totals = {
+        "trusted_direct_read_ops": 0,
+        "trusted_direct_read_bytes": 0,
+        "trusted_direct_write_ops": 0,
+        "trusted_direct_write_bytes": 0,
+    }
+    for inspection in inspections:
+        fabric = inspection.get("fabric")
+        audit = inspection.get("audit")
+        if not isinstance(fabric, dict) or not isinstance(audit, dict):
+            raise ValueError("badfs lifecycle inspection lacks fabric/audit objects")
+        for name in zero_fabric:
+            if _required_integer(fabric, name) != 0:
+                raise ValueError(f"badfs fallback counter is nonzero: {name}")
+        for name in zero_audit:
+            if _required_integer(audit, name) != 0:
+                raise ValueError(f"badfs lifecycle audit is not clean: {name}")
+        for name in direct_totals:
+            direct_totals[name] += _required_integer(fabric, name)
+    if any(value <= 0 for value in direct_totals.values()):
+        raise ValueError("badfs strict direct read/write counters must be positive")
+    return {
+        "benchmark": benchmark,
+        "direct_totals": direct_totals,
+        "inspections": inspections,
+    }
+
+
+def read_event_sidecar(path):
+    records = []
+    previous = None
+    raw = pathlib.Path(path).read_bytes()
+    if raw and not raw.endswith(b"\n"):
+        raise ValueError("truncated console event sidecar")
+    for line in raw.splitlines():
+        record = strict_json_loads(line.decode("utf-8"))
+        capture = _required_integer(record, "host_capture_ns")
+        if previous is not None and capture < previous:
+            raise ValueError("console capture timestamps went backwards")
+        if not isinstance(record.get("line"), str):
+            raise ValueError("console event line must be text")
+        previous = capture
+        records.append(record)
+    return records
+
+
+def validate_host_capture_order(paths, correlations):
+    node0 = read_event_sidecar(paths.event_log(0))
+    node1 = read_event_sidecar(paths.event_log(1))
+    for correlation in correlations:
+        op_id = correlation["op_id"]
+        direct_times = []
+        success_times = []
+        for event in node1:
+            line = event["line"]
+            if line.startswith("BADFS_DIRECT_MAP_TRACE_JSON "):
+                record = strict_json_loads(line.split(" ", 1)[1])
+                if record.get("op_id") == op_id and record.get("event") in ("drop", "unmap"):
+                    direct_times.append(event["host_capture_ns"])
+        for event in node0:
+            line = event["line"]
+            if line.startswith("BADFS_LIFECYCLE_TRACE_JSON "):
+                record = strict_json_loads(line.split(" ", 1)[1])
+                if record.get("op_id") == op_id and record.get("event") == "store_direct_success":
+                    success_times.append(event["host_capture_ns"])
+        if direct_times and success_times and min(direct_times) < max(success_times):
+            return {
+                "op_id": op_id,
+                "direct_unmap_capture_ns": min(direct_times),
+                "store_success_capture_ns": max(success_times),
+            }
+    raise ValueError("host capture does not order direct unmap before store_direct_success")
+
+
+def parse_server_stats(output):
+    marker = "COHERENCE_V2_STATS_JSON "
+    records = [
+        strict_json_loads(line.strip()[len(marker):])
+        for line in output.splitlines() if line.strip().startswith(marker)
+    ]
+    if len(records) != 1:
+        raise ValueError(f"expected one final coherence stats object, got {len(records)}")
+    stats = records[0]
+    for name in ("timeouts", "protocol_errors", "delivery_failures", "server_copy_failures", "active_bindings"):
+        if _required_integer(stats, name) != 0:
+            raise ValueError(f"coherence final error counter is nonzero: {name}")
+    return stats
+
+
+def validate_runtime_evidence(paths, node0_output, node1_output, pre_benchmark_offset, benchmark_bytes):
+    all_coherence = read_coherence_trace(paths.coherence_trace)
+    registrations = validate_registrations(all_coherence)
+    benchmark_coherence = read_coherence_trace(paths.coherence_trace, pre_benchmark_offset)
+    for event in benchmark_coherence:
+        if event.get("event") in ("timeout", "protocol_error", "delivery_failure", "server_copy_failure"):
+            raise ValueError(f"benchmark coherence error event: {event.get('event')}")
+    direct = parse_prefixed_records(
+        node1_output, "BADFS_DIRECT_MAP_TRACE_JSON", "badfs.direct-map-trace.v1"
+    )
+    lifecycle = parse_prefixed_records(
+        node0_output, "BADFS_LIFECYCLE_TRACE_JSON", "badfs.lifecycle.v1"
+    )
+    correlations = correlate_dirty_backinvalidations(direct, lifecycle, benchmark_coherence)
+    host_order = validate_host_capture_order(paths, correlations)
+    legofs = validate_legofs_output(node1_output, benchmark_bytes)
+    server_stats = parse_server_stats(paths.server_log.read_text(encoding="utf-8", errors="replace"))
+    coherence_delta = {
+        "snp_data_inv": sum(
+            event.get("event") == "snoop_send" and event.get("opcode") == "SNP_DATA_INV"
+            for event in benchmark_coherence
+        ),
+        "model_acks": sum(
+            event.get("event") == "snoop_ack" and event.get("ack_strength") == "MODEL"
+            for event in benchmark_coherence
+        ),
+        "dirty_data_completions": sum(event.get("event") == "dirty_completion" for event in benchmark_coherence),
+    }
+    return {
+        "registrations": registrations,
+        "coherence_delta": coherence_delta,
+        "legofs_counters": legofs["direct_totals"],
+        "benchmark": legofs["benchmark"],
+        "inspections": legofs["inspections"],
+        "correlations": correlations,
+        "host_capture_order": host_order,
+        "coherence_final_stats": server_stats,
+    }
 
 
 class PortReservation:
@@ -532,6 +887,10 @@ def execute(paths, benchmark_bytes, timeout):
         node1.wait("LEG_OFS_CLIENT_READY", timeout)
         if node0.process.poll() is not None or node1.process.poll() is not None:
             raise RuntimeError("both QEMU processes must be live before benchmark release")
+        registrations = validate_registrations(read_coherence_trace(paths.coherence_trace))
+        pre_benchmark_offset = paths.coherence_trace.stat().st_size
+        result["registrations"] = registrations
+        result["pre_benchmark_trace_offset"] = pre_benchmark_offset
         node1.send("LEG_OFS_RUN")
         node1.wait("LEG_OFS_BENCHMARK_PASS", timeout)
         if node0.process.poll() is not None:
@@ -557,10 +916,29 @@ def execute(paths, benchmark_bytes, timeout):
         node1_interval = (node1.owned.start_ns, node1.owned.end_ns)
         overlap = overlap_ns(node0_interval, node1_interval)
         result["overlap_ns"] = overlap
-        result["status"] = "runtime_complete"
         result["process_lifetimes"] = dict(
             zip(owned_names, (item.as_json() for item in owned))
         )
+        evidence = validate_runtime_evidence(
+            paths,
+            node0.output,
+            node1.output,
+            pre_benchmark_offset,
+            benchmark_bytes,
+        )
+        result.update(evidence)
+        result["topology"] = {
+            "machine": "sifive_u",
+            "nodes": 2,
+            "type3_endpoints": 2,
+            "type3_per_node": 1,
+            "cxl_ssd_bytes_per_node": 256 * 1024 * 1024,
+            "persistent_memdev": True,
+            "server_backing": "ssd-stream",
+            "coherence_transport": "tcp-mesi-v2",
+            "qemu_type3_backinvalidation": True,
+        }
+        result["status"] = "passed"
         return result
     except BaseException as error:
         result["first_failure"] = str(error)
