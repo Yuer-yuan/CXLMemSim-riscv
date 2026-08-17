@@ -348,10 +348,8 @@ def server_command(
         "--ssd-io-uring=false",
         "--ssd-odirect=false",
     ]
-    if full_trace:
+    if full_trace or trace:
         command.append(f"--coherence-v2-trace={paths.coherence}")
-    elif trace:
-        command.append(f"--coherence-v2-proof-trace={paths.coherence}")
     # The audited author baseline always prints aggregate MESI counters during
     # shutdown.  It has no counter-enable CLI switch, so the normal score path
     # deliberately adds no non-standard simulator control here.

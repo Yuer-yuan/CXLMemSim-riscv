@@ -180,12 +180,11 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("--capacity=65536", text)
         self.assertIn("--backing-mode=ssd-stream", text)
         self.assertIn("--coherence-v2=true", text)
-        self.assertIn("--coherence-v2-proof-trace=", text)
+        self.assertIn("--coherence-v2-trace=", text)
 
         counter_text = " ".join(self.runner.server_command(self.paths, 19000, False))
         self.assertNotIn("--coherence-v2-counters", counter_text)
         self.assertNotIn("--coherence-v2-trace=", counter_text)
-        self.assertNotIn("--coherence-v2-proof-trace=", counter_text)
 
         full_text = " ".join(
             self.runner.server_command(self.paths, 19000, False, full_trace=True)
