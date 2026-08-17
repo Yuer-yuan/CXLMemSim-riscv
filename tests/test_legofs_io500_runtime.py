@@ -616,6 +616,87 @@ class Io500RuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(FileExistsError, "already exists"):
             self.runner.prepare_paths(self.paths)
 
+    def test_io500_result_parser_preserves_phase_and_aggregate_scores(self):
+        metrics = self.runner.parse_io500_metrics(
+            """
+[ior-easy-write]
+score = 1.250000
+t_delta = 300.5000
+[mdtest-hard-stat]
+score = 42.000000
+t_delta = 2.5000
+[SCORE]
+MD = 3.000000
+BW = 2.000000
+SCORE = 2.449490
+hash = ABCD1234
+[SCOREX]
+MD = 4.000000
+BW = 1.000000
+SCORE = 2.000000
+hash = DCBA4321
+"""
+        )
+        self.assertEqual(metrics["official"]["score"], 2.44949)
+        self.assertEqual(metrics["extended"]["hash"], "DCBA4321")
+        self.assertEqual(metrics["phases"][0]["unit"], "GiB/s")
+        self.assertEqual(metrics["phases"][1]["unit"], "kIOPS")
+
+    def test_host_process_cost_is_explicitly_inclusive(self):
+        before = {
+            "client0_qemu": {
+                "pid": 10, "user_ns": 10, "system_ns": 20, "cpu_ns": 30,
+                "read_bytes": 100, "write_bytes": 200,
+            },
+            "cxlmemsim": {
+                "pid": 11, "user_ns": 5, "system_ns": 5, "cpu_ns": 10,
+                "read_bytes": 0, "write_bytes": 0,
+            },
+        }
+        after = {
+            "client0_qemu": {
+                "pid": 10, "user_ns": 70, "system_ns": 40, "cpu_ns": 110,
+                "read_bytes": 400, "write_bytes": 700,
+            },
+            "cxlmemsim": {
+                "pid": 11, "user_ns": 15, "system_ns": 15, "cpu_ns": 30,
+                "read_bytes": 1000, "write_bytes": 2000,
+            },
+        }
+        cost = self.runner.host_process_cost_window(before, after, 100, 200)
+        self.assertEqual(cost["groups"]["qemu_inclusive"]["cpu_ns"], 80)
+        self.assertEqual(cost["groups"]["cxlmemsim"]["cpu_ns"], 20)
+        self.assertEqual(cost["groups"]["qemu_inclusive"]["sampled_cpu_share"], 0.8)
+        self.assertIn("inclusive", cost["interpretation"])
+
+    def test_legofs_timing_ratios_use_rank_wall_budget(self):
+        summaries = [
+            {
+                "stats": {
+                    "direct_read_acquire_ns": 10,
+                    "lifecycle_metadata_lookup_ns": 20,
+                    "lifecycle_write_arena_commit_ns": 30,
+                }
+            },
+            {
+                "stats": {
+                    "direct_read_acquire_ns": 10,
+                    "lifecycle_metadata_lookup_ns": 20,
+                    "lifecycle_write_arena_commit_ns": 30,
+                }
+            },
+        ]
+        timing = self.runner.legofs_timing_breakdown(
+            summaries,
+            {"audit": {"direct_write_total_ns": 25}},
+            wall_ns=100,
+            client_count=2,
+        )
+        self.assertEqual(timing["client_timed_intervals_ns"], 120)
+        self.assertEqual(timing["client_timed_share_of_rank_wall"], 0.6)
+        self.assertEqual(timing["server_direct_write_commit_ns"], 25)
+        self.assertIn("nested", timing["interpretation"])
+
     def test_strict_bi_proof_correlates_owner_range_and_host_order(self):
         self.paths.bundle.mkdir(parents=True)
         direct = {

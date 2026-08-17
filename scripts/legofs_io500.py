@@ -62,6 +62,31 @@ SEMANTIC_SMOKE_STAGES = (
     "rnd4k",
 )
 
+CLIENT_TIMING_GROUPS = {
+    "read_control_rpc_wait_ns": (
+        "direct_read_acquire_ns",
+        "direct_read_release_ns",
+        "direct_read_snapshot_acquire_ns",
+        "direct_read_snapshot_release_ns",
+    ),
+    "metadata_rpc_wait_ns": (
+        "lifecycle_metadata_lookup_ns",
+        "lifecycle_metadata_update_ns",
+        "lifecycle_metadata_readback_ns",
+        "lifecycle_file_info_ns",
+        "lifecycle_operation_id_grant_ns",
+    ),
+    "write_control_rpc_wait_ns": (
+        "lifecycle_blob_read_ns",
+        "lifecycle_blob_write_ns",
+        "lifecycle_direct_write_prepare_ns",
+        "lifecycle_direct_write_finish_ns",
+        "lifecycle_write_arena_acquire_ns",
+        "lifecycle_write_arena_commit_ns",
+        "lifecycle_write_arena_release_ns",
+    ),
+}
+
 
 class Paths:
     def __init__(self, root: pathlib.Path, stage: str, result_label: str | None = None):
@@ -130,6 +155,129 @@ def atomic_json(path: pathlib.Path, value) -> None:
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
+
+
+def process_resource_sample(process: subprocess.Popen) -> dict | None:
+    """Read host-side CPU and I/O counters without changing the measured process."""
+    pid = process.pid
+    try:
+        stat_text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat_text[stat_text.rfind(")") + 2:].split()
+        ticks = os.sysconf("SC_CLK_TCK")
+        user_ns = int(fields[11]) * 1_000_000_000 // ticks
+        system_ns = int(fields[12]) * 1_000_000_000 // ticks
+        io_fields = {}
+        for line in pathlib.Path(f"/proc/{pid}/io").read_text(encoding="utf-8").splitlines():
+            name, value = line.split(":", 1)
+            if name in ("read_bytes", "write_bytes"):
+                io_fields[name] = int(value)
+    except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
+        return None
+    return {
+        "pid": pid,
+        "user_ns": user_ns,
+        "system_ns": system_ns,
+        "cpu_ns": user_ns + system_ns,
+        "read_bytes": io_fields.get("read_bytes", 0),
+        "write_bytes": io_fields.get("write_bytes", 0),
+    }
+
+
+def sample_named_processes(processes: dict[str, subprocess.Popen]) -> dict[str, dict]:
+    return {
+        name: sample
+        for name, process in processes.items()
+        if (sample := process_resource_sample(process)) is not None
+    }
+
+
+def host_process_cost_window(
+    before: dict[str, dict],
+    after: dict[str, dict],
+    started_ns: int,
+    completed_ns: int,
+) -> dict:
+    wall_ns = max(0, completed_ns - started_ns)
+    deltas = {}
+    for name in sorted(before.keys() & after.keys()):
+        if before[name]["pid"] != after[name]["pid"]:
+            continue
+        deltas[name] = {
+            "pid": after[name]["pid"],
+            **{
+                field: max(0, after[name][field] - before[name][field])
+                for field in (
+                    "user_ns", "system_ns", "cpu_ns", "read_bytes", "write_bytes"
+                )
+            },
+        }
+
+    def aggregate(names: list[str]) -> dict:
+        return {
+            field: sum(deltas[name][field] for name in names)
+            for field in ("user_ns", "system_ns", "cpu_ns", "read_bytes", "write_bytes")
+        }
+
+    qemu_names = [name for name in deltas if name.endswith("_qemu")]
+    groups = {
+        "qemu_inclusive": aggregate(qemu_names),
+        "cxlmemsim": aggregate(["cxlmemsim"] if "cxlmemsim" in deltas else []),
+    }
+    sampled_cpu_ns = sum(group["cpu_ns"] for group in groups.values())
+    for group in groups.values():
+        group["sampled_cpu_share"] = (
+            group["cpu_ns"] / sampled_cpu_ns if sampled_cpu_ns else 0.0
+        )
+        group["cpu_equivalents"] = group["cpu_ns"] / wall_ns if wall_ns else 0.0
+    return {
+        "schema_version": "legofs.host-process-cost.v1",
+        "started_monotonic_ns": started_ns,
+        "completed_monotonic_ns": completed_ns,
+        "wall_ns": wall_ns,
+        "processes": deltas,
+        "groups": groups,
+        "sampled_cpu_ns": sampled_cpu_ns,
+        "missing_after": sorted(before.keys() - after.keys()),
+        "interpretation": (
+            "QEMU is inclusive of guest IO500, LegoFS, Linux and emulation; "
+            "sampled CPU shares are not exclusive wall-time shares"
+        ),
+    }
+
+
+def legofs_timing_breakdown(
+    summaries: list[dict], inspection: dict, wall_ns: int, client_count: int
+) -> dict:
+    groups = {
+        group: sum(
+            int(record.get("stats", {}).get(field, 0))
+            for record in summaries
+            for field in fields
+        )
+        for group, fields in CLIENT_TIMING_GROUPS.items()
+    }
+    client_wait_ns = sum(groups.values())
+    rank_wall_ns = wall_ns * client_count
+    server_commit_ns = int(
+        inspection.get("audit", {}).get("direct_write_total_ns", 0)
+    )
+    return {
+        "schema_version": "legofs.timing-breakdown.v1",
+        "client_timed_intervals": groups,
+        "client_timed_intervals_ns": client_wait_ns,
+        "aggregate_rank_wall_ns": rank_wall_ns,
+        "client_timed_share_of_rank_wall": (
+            client_wait_ns / rank_wall_ns if rank_wall_ns else 0.0
+        ),
+        "server_direct_write_commit_ns": server_commit_ns,
+        "server_commit_share_of_rank_wall": (
+            server_commit_ns / rank_wall_ns if rank_wall_ns else 0.0
+        ),
+        "interpretation": (
+            "client values are summed elapsed RPC/control intervals across ranks; "
+            "server commit is nested inside some client intervals and neither is CPU time"
+        ),
+    }
 
 
 def prepare_paths(paths: Paths) -> None:
@@ -984,6 +1132,58 @@ def verify_io500(console: Console, stage: str) -> dict:
     return io500_verifier_record(stage, rc, output)
 
 
+def parse_io500_metrics(text: str) -> dict:
+    sections = {}
+    current = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        header = re.fullmatch(r"\[([^]]+)\]", line)
+        if header:
+            current = header.group(1)
+            sections.setdefault(current, {})
+            continue
+        if current is None or "=" not in line:
+            continue
+        name, value = (part.strip() for part in line.split("=", 1))
+        sections[current][name] = value
+
+    phases = []
+    for name, values in sections.items():
+        if name in ("SCORE", "SCOREX") or "score" not in values:
+            continue
+        try:
+            score = float(values["score"])
+            seconds = float(values["t_delta"])
+        except (KeyError, ValueError):
+            continue
+        phases.append({
+            "name": name,
+            "score": score,
+            "unit": "GiB/s" if name.startswith("ior-") else "kIOPS",
+            "seconds": seconds,
+        })
+
+    def score(name: str) -> dict | None:
+        values = sections.get(name)
+        if not values:
+            return None
+        try:
+            return {
+                "md_kiops": float(values["MD"]),
+                "bw_gib_s": float(values["BW"]),
+                "score": float(values["SCORE"]),
+                "hash": values["hash"],
+            }
+        except (KeyError, ValueError):
+            return None
+
+    return {
+        "phases": phases,
+        "official": score("SCORE"),
+        "extended": score("SCOREX"),
+    }
+
+
 def extract_results(paths: Paths) -> dict:
     extracted = paths.bundle / "result-disk"
     extracted.mkdir()
@@ -1008,6 +1208,7 @@ def extract_results(paths: Paths) -> dict:
         "config_path": str(paths.bundle / "config.ini"),
         "invalid": bool(invalid_lines),
         "invalid_lines": invalid_lines,
+        "metrics": parse_io500_metrics(text),
     }
 
 
@@ -1229,6 +1430,17 @@ def execute(
             registrations(trace_records, host_count) if use_proof_trace else None
         )
         result["coherence_registrations"] = registration_records
+        metered_processes = {"cxlmemsim": server_process}
+        metered_processes.update({
+            f"server{index}_qemu": console.process
+            for index, console in enumerate(server_consoles)
+        })
+        metered_processes.update({
+            f"client{index}_qemu": console.process
+            for index, console in enumerate(client_consoles)
+        })
+        cost_started_ns = time.monotonic_ns()
+        cost_before = sample_named_processes(metered_processes)
         try:
             result["commands"]["mpi"] = launch_mpi(
                 client_consoles, paths.stage, timeout, client_count
@@ -1255,6 +1467,11 @@ def execute(
                 diagnostics["lifecycle_inspection_error"] = str(error)
             result["failed_mpi_diagnostics"] = diagnostics
             raise
+        finally:
+            cost_after = sample_named_processes(metered_processes)
+            result["host_process_cost"] = host_process_cost_window(
+                cost_before, cost_after, cost_started_ns, time.monotonic_ns()
+            )
 
         if paths.stage == "hello":
             hello = parse_hello(client_consoles, client_count)
@@ -1283,6 +1500,12 @@ def execute(
             result["posix_path_summaries"] = summaries
             result["lifecycle_inspection"] = inspection
             result["verifier"] = verifier
+            result["legofs_timing"] = legofs_timing_breakdown(
+                summaries,
+                inspection,
+                result["host_process_cost"]["wall_ns"],
+                client_count,
+            )
             if paths.stage == "tiny":
                 result["strict_persistency_proof"] = strict_persistency_proof(
                     paths, summaries, server_count
