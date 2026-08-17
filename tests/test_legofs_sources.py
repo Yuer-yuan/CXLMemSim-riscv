@@ -22,19 +22,20 @@ class LegofsSourceTest(unittest.TestCase):
         component = ROOT / "components" / "cxlmemsim"
         self.assertEqual(git("merge-base", "HEAD", CXL_BASE, cwd=component), CXL_BASE)
 
-    def test_legofs_is_not_a_nested_component(self):
+    def test_legofs_is_a_pinned_component(self):
         modules = (ROOT / ".gitmodules").read_text(encoding="utf-8")
-        self.assertNotIn("path = components/legofs", modules)
-        self.assertFalse((ROOT / "components" / "legofs").exists())
+        self.assertIn("path = components/legofs", modules)
+        self.assertIn("url = https://github.com/Zettai-US/legofs.git", modules)
+        self.assertTrue((ROOT / "components" / "legofs" / "Cargo.toml").is_file())
 
-    def test_build_uses_only_the_parent_legofs_repository(self):
+    def test_build_uses_only_the_legofs_component(self):
         build = (ROOT / "scripts" / "build_legofs_type3.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn('LEGOFS_SOURCE_ROOT="$(cd -- "${ROOT}/../.."', build)
+        self.assertIn('LEGOFS_SOURCE_ROOT="${ROOT}/components/legofs"', build)
         self.assertIn('${LEGOFS_SOURCE_ROOT}/Cargo.toml', build)
         self.assertIn('--source "legofs=${LEGOFS_SOURCE_ROOT}"', build)
-        self.assertNotIn("components/legofs/Cargo.toml", build)
+        self.assertNotIn('${ROOT}/../..', build)
 
 
 if __name__ == "__main__":

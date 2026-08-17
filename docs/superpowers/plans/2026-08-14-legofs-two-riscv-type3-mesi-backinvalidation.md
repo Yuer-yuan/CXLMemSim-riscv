@@ -1,9 +1,7 @@
 # Legofs Two-RISC-V Type-3 MESI Back-Invalidation Implementation Plan
 
-> **Historical note (2026-08-14):** This completed plan describes the original
-> proof build and its former `components/legofs` gitlink. The maintained
-> platform now builds only the parent LegoFS repository at `../..`; do not use
-> the nested-LegoFS setup commands below for new experiments.
+> **Layout note (2026-08-17):** The maintained standalone platform again pins
+> LegoFS at `components/legofs`, matching the original superproject direction.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

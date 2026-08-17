@@ -1,8 +1,7 @@
 # Legofs on Two RISC-V Type-3 Endpoints with MESI Back-Invalidation
 
-> **Historical note (2026-08-14):** This design records the original proof,
-> including its former `components/legofs` gitlink. The maintained platform now
-> consumes the parent LegoFS checkout at `../..` as its sole LegoFS source.
+> **Layout note (2026-08-17):** The maintained standalone platform pins LegoFS
+> at `components/legofs`, matching the original superproject direction.
 
 ## Objective
 

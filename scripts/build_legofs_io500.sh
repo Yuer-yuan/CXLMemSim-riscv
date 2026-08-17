@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-LEGOFS_ROOT="$(cd -- "$ROOT/../.." && pwd -P)"
-LEGOFS_TOOL_ROOT="${LEGOFS_ROOT}/.cxl-bi-tools"
+LEGOFS_ROOT="${ROOT}/components/legofs"
+LEGOFS_TOOL_ROOT="${ROOT}/.cxl-bi-tools"
 TARGET_ROOT="${ROOT}/target/build/riscv-io500"
 SOURCES="${ROOT}/target/build/sources"
 PLATFORM="${TARGET_ROOT}/platform"

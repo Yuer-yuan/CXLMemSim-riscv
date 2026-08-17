@@ -88,7 +88,7 @@ class LegofsTwoClientTest(unittest.TestCase):
         source = (ROOT / "guest/legofs_node_init.c").read_text(encoding="utf-8")
         for case in self.runner.CASES:
             self.assertIn(f'"{case}"', source)
-        bench = (ROOT.parent.parent / "badfs-bench/src/main.rs").read_text(
+        bench = (ROOT / "components/legofs/badfs-bench/src/main.rs").read_text(
             encoding="utf-8"
         )
         self.assertIn("libc::_exit(CRASH_EXIT_CODE)", bench)

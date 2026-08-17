@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-LEGOFS_SOURCE_ROOT="$(cd -- "${ROOT}/../.." && pwd -P)"
+LEGOFS_SOURCE_ROOT="${ROOT}/components/legofs"
 OUT="${LEGOFS_TYPE3_OUT:-${ROOT}/out/legofs-type3}"
 BUILD="${OUT}/build"
 IMAGES="${OUT}/images"
@@ -45,11 +45,11 @@ done
 [[ "${OUT}" == /* ]] || die "LEGOFS_TYPE3_OUT must be an absolute path"
 
 [[ -f "${LEGOFS_SOURCE_ROOT}/Cargo.toml" ]] ||
-	die "parent LegoFS source is missing Cargo.toml: ${LEGOFS_SOURCE_ROOT}"
+	die "LegoFS component is missing Cargo.toml: ${LEGOFS_SOURCE_ROOT}"
 legofs_git_root="$(git -C "${LEGOFS_SOURCE_ROOT}" rev-parse --show-toplevel 2>/dev/null)" ||
-	die "parent LegoFS source is not a Git checkout: ${LEGOFS_SOURCE_ROOT}"
+	die "LegoFS component is not a Git checkout: ${LEGOFS_SOURCE_ROOT}"
 [[ "$(cd -- "${legofs_git_root}" && pwd -P)" == "${LEGOFS_SOURCE_ROOT}" ]] ||
-	die "parent LegoFS path is not its Git worktree root: ${LEGOFS_SOURCE_ROOT}"
+	die "LegoFS component path is not its Git worktree root: ${LEGOFS_SOURCE_ROOT}"
 
 for command in cargo rustc rustup "${CROSS_COMPILE}gcc" \
 	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" cmake ninja make mke2fs \

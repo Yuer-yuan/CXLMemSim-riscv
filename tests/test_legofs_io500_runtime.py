@@ -527,7 +527,8 @@ class Io500RuntimeTest(unittest.TestCase):
     def test_hard_smoke_is_measurement_only_and_runs_both_shared_file_phases(self):
         config = (ROOT / "configs" / "io500-hard-smoke.ini").read_text()
         self.assertIn("[ior-hard]\n", config)
-        self.assertIn("segmentCount = 16\n", config)
+        self.assertIn("stonewall-time = 300\n", config)
+        self.assertIn("segmentCount = 10000000\n", config)
         self.assertIn("[ior-hard-write]\nAPI = POSIX\nrun = TRUE\n", config)
         self.assertIn("[ior-hard-read]\nAPI = POSIX\nrun = TRUE\n", config)
         self.assertIn("[ior-easy]\nrun = FALSE\n", config)

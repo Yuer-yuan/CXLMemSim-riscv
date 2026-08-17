@@ -6,17 +6,16 @@ freestanding RISC-V guest programs, an external ext2 benchmark image, and the
 CXLMemSim server, then proves a Type 3 endpoint issuing reads and writes
 through PGAS shared memory.
 
-When checked out as `LegoFS/platform/CXLMemSim-riscv`, the Legofs Type-3
-workflow always builds the parent LegoFS repository. LegoFS is intentionally
-not a nested component: this prevents experiments from modifying a second
-checkout while leaving the real candidate unchanged.
+LegoFS is pinned as `components/legofs`. The platform is the top-level owner of
+the complete experiment, matching the original superproject layout and avoiding
+a reverse `LegoFS -> platform -> LegoFS` dependency.
 
 ## Clone, build, and run
 
 On a native Linux host:
 
 ```bash
-git clone https://github.com/SlugLab/CXLMemSim-riscv.git
+git clone https://github.com/Yuer-yuan/CXLMemSim-riscv.git
 cd CXLMemSim-riscv
 ./run.sh
 ```
@@ -58,7 +57,7 @@ sudo apt install \
 ```
 
 The pinned QEMU requires Meson 1.5 or newer. When the distribution package is
-older, the top-level LegoFS checkout supplies a uv environment at
+older, the top-level CXLMemSim-riscv checkout supplies a uv environment at
 `.cxl-bi-tools/uv`; `run-legofs-type3.sh` discovers it automatically. Generic
 libraries and cross tools still come from the distribution rather than a
 repository-local sysroot. `scripts/check-deps.sh` only reports missing commands;
@@ -82,6 +81,7 @@ The superproject records exact gitlinks for:
 - `components/u-boot`: CXL discovery and HDM decoder programming;
 - `components/linux`: matching RISC-V CXL firmware handoff support;
 - `components/cxlmemsim`: PGAS SHM server;
+- `components/legofs`: BadFS lifecycle, server, client, and IO500 integration;
 - `components/opensbi`: OpenSBI v1.5.1;
 - `components/hifive-premier-tools`: pinned board-tool reference;
 - `components/meta-sifive`: pinned Yocto-layer reference.
@@ -89,12 +89,9 @@ The superproject records exact gitlinks for:
 HiFive Premier tools and `meta-sifive` are reference components and are not
 built by the default SiFive U QEMU target.
 
-The Legofs Type-3 build resolves LegoFS at `../..` relative to this platform.
-It accepts committed or uncommitted development trees and records the parent
-path, commit, tree, and clean state in the build manifest without blocking a
-fast edit/build/run cycle. A standalone platform checkout can run the
-non-LegoFS workflow, but the Legofs workflow must be placed at that documented
-submodule path.
+The Legofs Type-3 and IO500 builds resolve LegoFS only at
+`components/legofs`. The build manifest records its path, commit, tree, and
+clean state without blocking a fast edit/build/run cycle.
 
 ## Runtime topology
 
@@ -202,7 +199,7 @@ The Legofs Type-3 path deliberately does not bind `--run-only` to artifact
 content hashes or a clean/source-HEAD snapshot. It checks that the current
 runtime artifacts exist, are non-empty, and are executable where required;
 the build manifest records paths and sizes. This keeps local component and
-parent-LegoFS iteration incremental. Independent output directories, rather
+LegoFS iteration incremental. Independent output directories, rather
 than hash gates, separate baseline and candidate experiments.
 
 This is functional QEMU/TCG and CXLMemSim model evidence. The CXL SSDs are

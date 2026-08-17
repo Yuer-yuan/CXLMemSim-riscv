@@ -798,14 +798,14 @@ def load_runtime_manifest(paths):
         raise ValueError("unsupported build manifest schema")
     source = manifest.get("sources", {}).get("legofs")
     if not isinstance(source, dict):
-        raise ValueError("build manifest lacks the parent LegoFS source")
+        raise ValueError("build manifest lacks the LegoFS component source")
     source_path = pathlib.Path(source.get("path", ""))
     if not source_path.is_absolute():
         source_path = paths.root / source_path
     source_path = source_path.resolve()
-    expected_source = paths.root.parent.parent.resolve()
+    expected_source = (paths.root / "components" / "legofs").resolve()
     if source_path != expected_source:
-        raise ValueError("build manifest LegoFS source is not the parent repository")
+        raise ValueError("build manifest LegoFS source is not components/legofs")
     expected = {
         "qemu": (paths.qemu, True),
         "opensbi": (paths.opensbi, False),

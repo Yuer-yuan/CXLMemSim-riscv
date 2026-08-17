@@ -14,7 +14,7 @@ class CliTest(unittest.TestCase):
     def test_readme_clone_avoids_nested_submodule_recursion(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(
-            "git clone https://github.com/SlugLab/CXLMemSim-riscv.git",
+            "git clone https://github.com/Yuer-yuan/CXLMemSim-riscv.git",
             readme,
         )
         self.assertNotRegex(

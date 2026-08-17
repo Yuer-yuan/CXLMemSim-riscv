@@ -97,13 +97,13 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertIn('cmp "${badfs_server}" "${verify_server}"', source)
         self.assertNotIn("./config.status", source)
         self.assertNotIn("qemu_configure=", source)
-        self.assertIn('LEGOFS_SOURCE_ROOT="$(cd -- "${ROOT}/../.."', source)
+        self.assertIn('LEGOFS_SOURCE_ROOT="${ROOT}/components/legofs"', source)
         self.assertIn('OUT="${LEGOFS_TYPE3_OUT:-', source)
         self.assertIn('--source "legofs=${LEGOFS_SOURCE_ROOT}"', source)
         self.assertIn("--enable-libpmem", source)
         self.assertIn("--enable-slirp", source)
         self.assertIn("--no-artifact-hashes", source)
-        self.assertNotIn("components/legofs/Cargo.toml", source)
+        self.assertNotIn('${ROOT}/../..', source)
         self.assertIn('--compiler "qemu=${qemu} --version"', source)
         for artifact in (
             "qemu",

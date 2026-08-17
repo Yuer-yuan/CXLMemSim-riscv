@@ -1,6 +1,6 @@
 [submodule "components/qemu"]
 	path = components/qemu
-	url = https://github.com/Zettai-US/qemu-cxl-type2.git
+	url = https://github.com/Yuer-yuan/qemu-cxl-type2.git
 [submodule "components/u-boot"]
 	path = components/u-boot
 	url = https://github.com/SlugLab/u-boot.git
@@ -9,7 +9,7 @@
 	url = https://github.com/vickiegpt/linux-cxl-type2.git
 [submodule "components/cxlmemsim"]
 	path = components/cxlmemsim
-	url = https://github.com/SlugLab/CXLMemSim.git
+	url = https://github.com/Yuer-yuan/CXLMemSim.git
 [submodule "components/opensbi"]
 	path = components/opensbi
 	url = https://github.com/riscv-software-src/opensbi.git
@@ -19,3 +19,6 @@
 [submodule "components/meta-sifive"]
 	path = components/meta-sifive
 	url = https://github.com/SlugLab/meta-sifive.git
+[submodule "components/legofs"]
+	path = components/legofs
+	url = https://github.com/Zettai-US/legofs.git
