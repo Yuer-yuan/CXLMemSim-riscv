@@ -1,7 +1,9 @@
 import importlib.util
+import os
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -35,6 +37,7 @@ class LegofsRuntimeTest(unittest.TestCase):
             self.assertEqual(command[:3], ["qemu-system-riscv64", "-M", "sifive_u"])
             self.assertEqual(sum("cxl-type3" in argument for argument in command), 1)
             self.assertIn("coherence-v2=on", joined)
+            self.assertIn("cxl-fmw.0.restrictions=0x29", joined)
             self.assertIn(f"coherence-v2-host-id={node}", joined)
             self.assertIn("coherence-v2-cache-capacity=8388608", joined)
             self.assertIn("coherence-v2-cache-ways=4", joined)
@@ -89,6 +92,13 @@ class LegofsRuntimeTest(unittest.TestCase):
         self.assertEqual(self.runner.overlap_ns((10, 50), (20, 60)), 30)
         with self.assertRaisesRegex(ValueError, "did not overlap"):
             self.runner.overlap_ns((10, 20), (20, 30))
+
+    def test_output_root_can_isolate_baseline_and_candidate(self):
+        output = pathlib.Path(self.temporary.name) / "candidate-output"
+        with mock.patch.dict(os.environ, {"LEGOFS_TYPE3_OUT": str(output)}):
+            paths = self.runner.RuntimePaths.create(self.temporary.name)
+        self.assertEqual(paths.output, output.resolve())
+        self.assertEqual(paths.run_dir.parent, output.resolve() / "runs")
 
     def test_uboot_sequence_interrupts_autoboot_before_cxl_commands(self):
         source = RUNNER.read_text(encoding="utf-8")

@@ -167,7 +167,12 @@ class LegofsEvidenceTest(unittest.TestCase):
         }
         audit = {
             "pending_operations": 0, "quarantined_extents": 0,
-            "active_read_leases": 0, "direct_mapped_extents": 1,
+            "active_read_leases": 0, "direct_mapped_extents": 0,
+            "published_ranges": 1, "backend_live_extents": 1,
+            "extent_states": {"1": "published"},
+            "payload_checksum_bytes": 0, "payload_checksum_scans": 0,
+            "payload_persist_bytes": bytes_count,
+            "coherent_acquire_bytes": bytes_count,
         }
         output = (
             f"badfs_bench file_size={bytes_count} block_size={block_size} iterations=1 "

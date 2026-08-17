@@ -3,7 +3,6 @@
 
 import argparse
 import datetime
-import hashlib
 import json
 import os
 import pathlib
@@ -35,7 +34,12 @@ LEGACY_TRANSPORT_ENV = (
 class RuntimePaths:
     def __init__(self, root, run_dir):
         self.root = pathlib.Path(root).resolve()
-        self.output = self.root / "out" / "legofs-type3"
+        configured_output = os.environ.get("LEGOFS_TYPE3_OUT")
+        if configured_output and not pathlib.Path(configured_output).is_absolute():
+            raise ValueError("LEGOFS_TYPE3_OUT must be an absolute path")
+        self.output = pathlib.Path(
+            configured_output or self.root / "out" / "legofs-type3"
+        ).resolve()
         self.build = self.output / "build"
         self.images = self.output / "images"
         self.results = self.output / "results"
@@ -59,7 +63,12 @@ class RuntimePaths:
         timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y%m%dT%H%M%S.%fZ"
         )
-        run_dir = root / "out/legofs-type3/runs" / f"{timestamp}-{os.getpid()}"
+        output = pathlib.Path(
+            os.environ.get("LEGOFS_TYPE3_OUT") or root / "out/legofs-type3"
+        )
+        if not output.is_absolute():
+            raise ValueError("LEGOFS_TYPE3_OUT must be an absolute path")
+        run_dir = output / "runs" / f"{timestamp}-{os.getpid()}"
         run_dir.mkdir(parents=True, mode=0o700)
         os.chmod(run_dir, 0o700)
         return cls(root, run_dir)
@@ -83,23 +92,28 @@ class RuntimePaths:
         return self.run_dir / f"node{node}-events.jsonl"
 
 
-def build_qemu_command(paths, node, coherence_port, legofs_port):
-    if node not in (0, 1):
-        raise ValueError("node must be 0 or 1")
+def build_qemu_command(
+    paths, node, coherence_port, legofs_port, guest_memory="2G"
+):
+    if node not in (0, 1, 2):
+        raise ValueError("node must be 0, 1, or 2")
     prefix = f"node{node}"
     command = [
         "qemu-system-riscv64",
         "-M",
         "sifive_u",
+        "-cpu",
+        "rv64,h=false,sstc=false,svadu=false,zicboz=false,"
+        "zicbom=true,cbom_blocksize=64",
         "-machine",
         "cxl=on",
         "-machine",
         "cxl-fmw.0.targets.0=cxl-node%d,cxl-fmw.0.size=4G,"
-        "cxl-fmw.0.restrictions=0xe" % node,
+        "cxl-fmw.0.restrictions=0x29" % node,
         "-smp",
         "5",
         "-m",
-        "2G",
+        guest_memory,
         "-display",
         "none",
         "-serial",
@@ -126,11 +140,13 @@ def build_qemu_command(paths, node, coherence_port, legofs_port):
         "-device",
         f"pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl-{prefix},hdm_for_passthrough=on",
         "-device",
-        f"cxl-rp,bus=cxl-{prefix},port=0,id=rp-t3-{prefix},chassis=0,slot=0",
+        f"cxl-rp,bus=cxl-{prefix},port=0,id=rp-t3-{prefix},chassis=0,slot=0,"
+        "x-256b-flit=on",
         "-device",
         (
             f"cxl-type3,bus=rp-t3-{prefix},persistent-memdev=t3ssd-{prefix},"
             f"lsa=t3lsa-{prefix},id=t3-{prefix},coherence-v2=on,"
+            "x-256b-flit=on,hdm-db=on,"
             f"cxlmemsim-addr=127.0.0.1,cxlmemsim-port={coherence_port},"
             f"coherence-v2-host-id={node},coherence-v2-cache-capacity=8388608,"
             "coherence-v2-cache-ways=4,coherence-v2-timeout-ms=5000,"
@@ -453,12 +469,36 @@ def validate_legofs_output(output, benchmark_bytes):
         for name in zero_audit:
             if _required_integer(audit, name) != 0:
                 raise ValueError(f"badfs lifecycle audit is not clean: {name}")
-        if _required_integer(audit, "direct_mapped_extents") != 1:
-            raise ValueError("badfs lifecycle audit must retain exactly one published direct extent")
+        if _required_integer(audit, "direct_mapped_extents") != 0:
+            raise ValueError("badfs lifecycle audit retained a userspace direct mapping")
+        published_ranges = _required_integer(audit, "published_ranges")
+        if published_ranges <= 0:
+            raise ValueError("badfs lifecycle audit has no published range")
+        if _required_integer(audit, "backend_live_extents") != published_ranges:
+            raise ValueError("badfs published ranges and live extents disagree")
+        extent_states = audit.get("extent_states")
+        if (
+            not isinstance(extent_states, dict)
+            or len(extent_states) != published_ranges
+            or any(state != "published" for state in extent_states.values())
+        ):
+            raise ValueError("badfs lifecycle extent states are not fully published")
+        if _required_integer(audit, "payload_checksum_bytes") != 0 or \
+                _required_integer(audit, "payload_checksum_scans") != 0:
+            raise ValueError("badfs direct path performed a payload checksum scan")
+        if _required_integer(audit, "payload_persist_bytes") != benchmark_bytes:
+            raise ValueError("badfs persisted payload byte count is incorrect")
+        if _required_integer(audit, "coherent_acquire_bytes") != benchmark_bytes:
+            raise ValueError("badfs coherent ownership byte count is incorrect")
         for name in direct_totals:
             direct_totals[name] += _required_integer(fabric, name)
-    if any(value <= 0 for value in direct_totals.values()):
-        raise ValueError("badfs strict direct read/write counters must be positive")
+    if (
+        direct_totals["trusted_direct_read_ops"] <= 0
+        or direct_totals["trusted_direct_write_ops"] <= 0
+        or direct_totals["trusted_direct_read_bytes"] != benchmark_bytes
+        or direct_totals["trusted_direct_write_bytes"] != benchmark_bytes
+    ):
+        raise ValueError("badfs strict direct read/write counters are incorrect")
     return {
         "benchmark": benchmark,
         "direct_totals": direct_totals,
@@ -705,6 +745,12 @@ class Console:
         deadline = time.monotonic() + timeout
         with self.condition:
             while text not in self.output[start:]:
+                failure = self.output.find("LEG_OFS_FAIL", start)
+                if failure >= 0:
+                    line = self.output[failure:].splitlines()[0]
+                    raise RuntimeError(
+                        f"guest reported {line!r} while waiting for {text!r}"
+                    )
                 if self.process.poll() is not None:
                     raise RuntimeError(
                         f"QEMU exited with {self.process.returncode} while waiting for {text!r}"
@@ -746,40 +792,33 @@ def create_sparse_file(path, size):
         output.truncate(size)
 
 
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with pathlib.Path(path).open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def verified_manifest(paths):
+def load_runtime_manifest(paths):
     manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != 2:
         raise ValueError("unsupported build manifest schema")
+    source = manifest.get("sources", {}).get("legofs")
+    if not isinstance(source, dict):
+        raise ValueError("build manifest lacks the parent LegoFS source")
+    source_path = pathlib.Path(source.get("path", ""))
+    if not source_path.is_absolute():
+        source_path = paths.root / source_path
+    source_path = source_path.resolve()
+    expected_source = paths.root.parent.parent.resolve()
+    if source_path != expected_source:
+        raise ValueError("build manifest LegoFS source is not the parent repository")
     expected = {
-        "qemu": paths.qemu,
-        "opensbi": paths.opensbi,
-        "u_boot": paths.u_boot,
-        "linux_legofs": paths.linux,
-        "legofs_disk": paths.legofs_disk,
-        "cxlmemsim_server": paths.cxlmemsim_server,
+        "qemu": (paths.qemu, True),
+        "opensbi": (paths.opensbi, False),
+        "u_boot": (paths.u_boot, False),
+        "linux_legofs": (paths.linux, False),
+        "legofs_disk": (paths.legofs_disk, False),
+        "cxlmemsim_server": (paths.cxlmemsim_server, True),
     }
-    for name, path in expected.items():
-        entry = manifest.get("artifacts", {}).get(name)
-        if not path.is_file() or not isinstance(entry, dict):
-            raise FileNotFoundError(f"missing verified runtime artifact: {name}")
-        if entry.get("size") != path.stat().st_size or entry.get("sha256") != sha256_file(path):
-            raise ValueError(f"runtime artifact changed after build: {name}")
-    current = subprocess.run(
-        ["git", "-C", str(paths.root), "rev-parse", "HEAD"],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.strip()
-    if manifest.get("superproject_commit") != current:
-        raise ValueError("superproject changed after the build manifest")
+    for name, (path, executable) in expected.items():
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"missing runtime artifact: {name}")
+        if executable and not os.access(path, os.X_OK):
+            raise PermissionError(f"runtime artifact is not executable: {name}")
     return manifest
 
 
@@ -797,7 +836,22 @@ def wait_for_log(path, marker, process, timeout):
     raise TimeoutError(f"timed out waiting for CXLMemSim marker {marker!r}")
 
 
-def run_uboot(console, paths, node, legofs_port, benchmark_bytes, timeout):
+def run_uboot(
+    console,
+    paths,
+    node,
+    legofs_port,
+    benchmark_bytes,
+    timeout,
+    client_count=1,
+    barrier_port=None,
+):
+    if client_count == 2:
+        if not isinstance(barrier_port, int) or not 0 < barrier_port <= 65535:
+            raise ValueError("two-client boot requires a valid barrier port")
+        barrier_argument = f" legofs.barrier_port={barrier_port}"
+    else:
+        barrier_argument = ""
     console.wait("Hit any key to stop autoboot", timeout)
     console.send("")
     console.wait("=> ", timeout)
@@ -816,7 +870,8 @@ def run_uboot(console, paths, node, legofs_port, benchmark_bytes, timeout):
         "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=6 "
         "cxl_core.pmem_as_dax=1 "
         f"legofs.role=node{node} legofs.server_port={legofs_port} "
-        f"legofs.bytes={benchmark_bytes}'",
+        f"legofs.bytes={benchmark_bytes} legofs.clients={client_count}"
+        f"{barrier_argument}'",
         timeout,
     )
     console.send(f"bootefi 90000000:{paths.linux.stat().st_size:x} ${{fdtcontroladdr}}")
@@ -834,7 +889,7 @@ def atomic_write_json(path, value):
 
 
 def execute(paths, benchmark_bytes, timeout):
-    manifest = verified_manifest(paths)
+    manifest = load_runtime_manifest(paths)
     coherence_reservation = PortReservation()
     legofs_reservation = PortReservation()
     owner_token = str(uuid.uuid4())
@@ -849,8 +904,8 @@ def execute(paths, benchmark_bytes, timeout):
         "run_id": paths.run_dir.name,
         "owner_token": owner_token,
         "component_commits": manifest["submodules"],
-        "artifact_sha256": {
-            name: entry["sha256"] for name, entry in manifest["artifacts"].items()
+        "runtime_artifacts": {
+            name: entry["path"] for name, entry in manifest["artifacts"].items()
         },
         "qemu_commands": [],
         "process_lifetimes": {},

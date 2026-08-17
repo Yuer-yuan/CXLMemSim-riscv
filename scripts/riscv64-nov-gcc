@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+compiler="${RISCV64_GCC_REAL:-riscv64-linux-gnu-gcc}"
+exec "$compiler" -march=rv64imafdc -mabi=lp64d "$@"

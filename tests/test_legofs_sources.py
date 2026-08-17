@@ -5,7 +5,6 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CXL_BASE = "716c16c9efc7a733006d0772f8c6c4bb055f7b15"
-LEGOFS_BASE = "96f733940251d6484dad0ba2cfbe99dcf5259776"
 
 
 def git(*args, cwd=ROOT):
@@ -23,15 +22,19 @@ class LegofsSourceTest(unittest.TestCase):
         component = ROOT / "components" / "cxlmemsim"
         self.assertEqual(git("merge-base", "HEAD", CXL_BASE, cwd=component), CXL_BASE)
 
-    def test_legofs_descends_from_approved_commit(self):
-        component = ROOT / "components" / "legofs"
-        self.assertTrue(component.is_dir(), "components/legofs is missing")
-        self.assertEqual(git("merge-base", "HEAD", LEGOFS_BASE, cwd=component), LEGOFS_BASE)
-
-    def test_gitmodules_uses_approved_legofs_remote(self):
+    def test_legofs_is_not_a_nested_component(self):
         modules = (ROOT / ".gitmodules").read_text(encoding="utf-8")
-        self.assertIn("path = components/legofs", modules)
-        self.assertIn("url = https://github.com/Zettai-US/legofs.git", modules)
+        self.assertNotIn("path = components/legofs", modules)
+        self.assertFalse((ROOT / "components" / "legofs").exists())
+
+    def test_build_uses_only_the_parent_legofs_repository(self):
+        build = (ROOT / "scripts" / "build_legofs_type3.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('LEGOFS_SOURCE_ROOT="$(cd -- "${ROOT}/../.."', build)
+        self.assertIn('${LEGOFS_SOURCE_ROOT}/Cargo.toml', build)
+        self.assertIn('--source "legofs=${LEGOFS_SOURCE_ROOT}"', build)
+        self.assertNotIn("components/legofs/Cargo.toml", build)
 
 
 if __name__ == "__main__":

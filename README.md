@@ -1,10 +1,15 @@
 # CXLMemSim-riscv
 
-`CXLMemSim-riscv` is a reproducible integration superproject for the
+`CXLMemSim-riscv` is a reproducible integration platform for the
 synthetic SiFive U CXL stack. It builds QEMU, U-Boot, OpenSBI, Linux,
 freestanding RISC-V guest programs, an external ext2 benchmark image, and the
 CXLMemSim server, then proves a Type 3 endpoint issuing reads and writes
 through PGAS shared memory.
+
+When checked out as `LegoFS/platform/CXLMemSim-riscv`, the Legofs Type-3
+workflow always builds the parent LegoFS repository. LegoFS is intentionally
+not a nested component: this prevents experiments from modifying a second
+checkout while leaving the real candidate unchanged.
 
 ## Clone, build, and run
 
@@ -43,14 +48,26 @@ set is:
 
 ```bash
 sudo apt install \
-  build-essential cmake ninja-build meson pkg-config python3 \
-  gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
-  device-tree-compiler e2fsprogs
+  build-essential cmake ninja-build meson pkg-config \
+  python3 python3-venv python3-packaging python3-dev \
+  gcc-riscv64-linux-gnu g++-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+  device-tree-compiler e2fsprogs librdmacm-dev libibverbs-dev \
+  libpmem-dev libslirp-dev \
+  libglib2.0-dev libpixman-1-dev libspdlog-dev libbpf-dev libelf-dev \
+  zlib1g-dev libzstd-dev flex bison libssl-dev bc swig cpio
 ```
 
-QEMU may require additional distribution development packages reported by
-its pinned `configure` script. `scripts/check-deps.sh` only reports missing
-commands; it never invokes `sudo` or a package manager.
+The pinned QEMU requires Meson 1.5 or newer. When the distribution package is
+older, the top-level LegoFS checkout supplies a uv environment at
+`.cxl-bi-tools/uv`; `run-legofs-type3.sh` discovers it automatically. Generic
+libraries and cross tools still come from the distribution rather than a
+repository-local sysroot. `scripts/check-deps.sh` only reports missing commands;
+it never invokes `sudo` or a package manager.
+
+The Type-3 build explicitly enables libpmem and libslirp. They are runtime
+requirements for `pmem=on` file-backed memory and the guest TCP forwarding
+used by the two-node proof, so configuration fails immediately if either
+development package is absent.
 
 The pinned U-Boot contains legacy pylibfdt typemaps. The build creates an
 output-tree-only compatibility copy for current SWIG/Python releases; the
@@ -65,13 +82,19 @@ The superproject records exact gitlinks for:
 - `components/u-boot`: CXL discovery and HDM decoder programming;
 - `components/linux`: matching RISC-V CXL firmware handoff support;
 - `components/cxlmemsim`: PGAS SHM server;
-- `components/legofs`: Badfs lifecycle-direct client, server, and benchmark;
 - `components/opensbi`: OpenSBI v1.5.1;
 - `components/hifive-premier-tools`: pinned board-tool reference;
 - `components/meta-sifive`: pinned Yocto-layer reference.
 
 HiFive Premier tools and `meta-sifive` are reference components and are not
 built by the default SiFive U QEMU target.
+
+The Legofs Type-3 build resolves LegoFS at `../..` relative to this platform.
+It accepts committed or uncommitted development trees and records the parent
+path, commit, tree, and clean state in the build manifest without blocking a
+fast edit/build/run cycle. A standalone platform checkout can run the
+non-LegoFS workflow, but the Legofs workflow must be placed at that documented
+submodule path.
 
 ## Runtime topology
 
@@ -86,6 +109,13 @@ It adds a synthetic `pxb-cxl` bridge with
 U-Boot programs HPA `0x1000000000` with host decoder control `0x600` and
 endpoint decoder control `0x1600`.
 
+The Legofs runners now advertise the window as `DEVMEM | PMEM | BI`
+(`cxl-fmw.0.restrictions=0x29`), put both the root port and Type 3 endpoint in
+256-byte-flit mode, expose the endpoint HDM-DB BI Decoder, and publish a 64-byte
+Zicbom CMO node in ACPI RHCT. The Type 3 coherence-v2 path remains disabled
+after reset until Linux commits the standard BI Decoder control. Inconsistent
+`coherence-v2`, `hdm-db`, or flit-mode configuration fails device realization.
+
 ## Two-node Legofs Type 3 back-invalidation proof
 
 The second workflow builds the complete stack and runs the Zettai-US Legofs
@@ -99,6 +129,16 @@ Both recorded commands begin exactly with:
 
 ```text
 qemu-system-riscv64 -M sifive_u
+```
+
+Use a different absolute output root for each baseline/candidate build so the
+two binaries and results can coexist during interleaved comparison:
+
+```bash
+LEGOFS_TYPE3_OUT=/approved/scratch/cxl-bi/B-P0 \
+  ./run-legofs-type3.sh --build-only
+LEGOFS_TYPE3_OUT=/approved/scratch/cxl-bi/B-P0 \
+  ./run-legofs-type3.sh --run-only --bytes 65536 --timeout 1200
 ```
 
 Each guest has one 256 MiB Type 3 endpoint attached through the synthetic
@@ -119,8 +159,16 @@ trace contains the same operation ID and mapping range as a node1-directed
 dirty completion. Host monotonic timestamps must additionally prove:
 
 ```text
-node1 direct unmap < snoop send < model ACK < dirty completion < store success
+node1 direct unmap < snoop send < model ACK < dirty completion < store_direct_success
 ```
+
+Read-exclusive is a deterministic proof policy used only by this two-node
+harness; it is not enabled implicitly by the IO500 runner. The TCP MESI-v2
+messages are a private functional adapter, not CXL.mem wire packets. In
+particular, the adapter carries dirty 64-byte data in its model `SNOOP_ACK`,
+whereas real HDM-DB has separate CXL.mem dirty-data and BIRsp ordering. The
+proof therefore validates correlated state/data/order, not flit encoding,
+credits, link timing, or protocol compliance.
 
 The result is written to:
 
@@ -128,17 +176,46 @@ The result is written to:
 out/legofs-type3/runs/<run-id>/result.json
 ```
 
+The three-endpoint 2-client/1-server calibration uses the same build output:
+
+```bash
+./run-legofs-type3-2c1s.sh --build-only --jobs 8
+./run-legofs-type3-2c1s.sh --run-only --bytes 65536 --timeout 1200
+```
+
+Its results are kept under `out/legofs-type3/runs-2c1s/<run-id>`. Client
+phase coordination uses a host-side TCP barrier through the QEMU user-network
+gateway; it never creates marker files in Legofs and therefore does not enter
+the measured namespace, lifecycle, persistence, or coherence paths. The five
+cases are disjoint write, same-range write, writer/reader handoff, shared read,
+and client crash. A workload failure is a valid rejected baseline, and the
+runner preserves its result and cleans up only the processes it owns.
+
 The result also records both QEMU argv arrays, overlapping process lifetimes,
-artifact hashes, the two CXL SSD backing files, all address correlations,
+runtime artifact paths, the two CXL SSD backing files, all address correlations,
 Legofs direct-path and fallback counters, and final coherence error counters.
 `status: "passed"` requires zero timeouts, protocol errors, delivery failures,
 server-copy failures, fallback I/O, pending operations, quarantined extents,
 and active leases.
 
+The Legofs Type-3 path deliberately does not bind `--run-only` to artifact
+content hashes or a clean/source-HEAD snapshot. It checks that the current
+runtime artifacts exist, are non-empty, and are executable where required;
+the build manifest records paths and sizes. This keeps local component and
+parent-LegoFS iteration incremental. Independent output directories, rather
+than hash gates, separate baseline and candidate experiments.
+
 This is functional QEMU/TCG and CXLMemSim model evidence. The CXL SSDs are
 file-backed simulated persistent-memory devices; this does not claim a
 physical CXL link, CPU-cache or CXL.cache coherence, media durability across a
 host crash, or hardware performance.
+
+The persistence path is fail-closed: devdax `fsync` performs the advertised
+64-byte Zicbom range clean followed by `pmem_wmb`; QEMU hands the pending
+provider to CXLMemSim `Fence`; and a successful coherence-v2 Fence now requires
+the selected backing backend to flush successfully. For `ssd-stream` that ends
+in backing-file `fsync`. This proves the file-backed model boundary only; it is
+not evidence for physical NAND PLP or host-power-loss recovery.
 
 The guest benchmark is a libc-free static `rv64imafdc` executable delivered
 through a read-only external ext2 image on
