@@ -80,7 +80,9 @@ printf '%s  %s\n' "${MUSL_SHA256}" "${MUSL_TARBALL}" | sha256sum -c -
 if [[ ! -x "${MUSL_SOURCE}/configure" ]]; then
 	tar -xzf "${MUSL_TARBALL}" -C "${MUSL_SOURCE_ROOT}"
 fi
-if [[ ! -x "${MUSL_CC}" ]]; then
+if [[ ! -x "${MUSL_CC}" ]] ||
+	! grep -Fqx "prefix = ${MUSL_PREFIX}" "${MUSL_BUILD}/config.mak" 2>/dev/null ||
+	! grep -Fq -- "-specs \"${MUSL_PREFIX}/lib/musl-gcc.specs\"" "${MUSL_CC}" 2>/dev/null; then
 	(
 		cd "${MUSL_BUILD}"
 		"${MUSL_SOURCE}/configure" --prefix="${MUSL_PREFIX}" \
@@ -170,7 +172,7 @@ qemu_configure_args=(
 ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
 
 printf '%s\n' '[legofs-build] CXLMemSim MESI-v2 server'
-cmake -U RDMACM_LIB -U IBVERBS_LIB \
+cmake --fresh -U RDMACM_LIB -U IBVERBS_LIB \
 	-S "${ROOT}/components/cxlmemsim" -B "${BUILD}/cxlmemsim" \
 	-DCMAKE_BUILD_TYPE=Release
 cmake --build "${BUILD}/cxlmemsim" --target cxlmemsim_server \

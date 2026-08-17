@@ -35,11 +35,11 @@ class LegofsBuildContractTest(unittest.TestCase):
             "LEG_OFS_BENCHMARK_PASS",
             "BADFS_LIFECYCLE_DIRECT_REQUIRED=1",
             "BADFS_LIFECYCLE_DIRECT_READ_REQUIRED=1",
-            "BADFS_CXL_MAP_ALIGNMENT=2097152",
+            "BADFS_CXL_MAP_ALIGNMENT=4096",
             'char block_entry[64] = "BADFS_BENCH_BLOCK_SIZE="',
         ):
             self.assertIn(marker, source)
-        self.assertNotIn("BADFS_CXL_MAP_ALIGNMENT=4096", source)
+        self.assertNotIn("BADFS_CXL_MAP_ALIGNMENT=2097152", source)
         self.assertNotIn("BADFS_BENCH_BLOCK_SIZE=4096", source)
         self.assertIn('set_ifreq_name(&request, "lo")', source)
         self.assertIn("set_sockaddr(&request.value.address, ipv4(127, 0, 0, 1))", source)
