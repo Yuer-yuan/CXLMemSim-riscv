@@ -150,6 +150,7 @@ struct dax_device {
 	uint32_t major;
 	uint32_t minor;
 	uint64_t size;
+	uint64_t alignment;
 	uint64_t region_hi;
 	uint64_t region_lo;
 };
@@ -664,6 +665,13 @@ static void discover_dax(struct dax_device *device)
 	append_text(sysfs, sizeof(sysfs), "/size");
 	if (!read_unsigned_file(sysfs, &device->size) || !device->size)
 		fail("read-dax-size", 22);
+	text_copy(sysfs, sizeof(sysfs), "/sys/bus/dax/devices/");
+	append_text(sysfs, sizeof(sysfs), device->name);
+	append_text(sysfs, sizeof(sysfs), "/align");
+	if (!read_unsigned_file(sysfs, &device->alignment) ||
+	    device->alignment < 4096 ||
+	    (device->alignment & (device->alignment - 1)) != 0)
+		fail("read-dax-align", 22);
 
 	value = linux_device_number(device->major, device->minor);
 	length = syscall4(SYS_MKNODAT, AT_FDCWD, (long)device->path,
@@ -890,7 +898,8 @@ static size_t add_environment(char **environment, size_t count, char *entry)
 	return count;
 }
 
-static size_t common_environment(char **environment, char *device_entry)
+static size_t common_environment(char **environment, char *device_entry,
+				 char *alignment_entry)
 {
 	size_t count = 0;
 
@@ -901,7 +910,7 @@ static size_t common_environment(char **environment, char *device_entry)
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_DIRECT_READ=1");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_DIRECT_READ_REQUIRED=1");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_DEVICE_REQUIRED=1");
-	count = add_environment(environment, count, (char *)"BADFS_CXL_MAP_ALIGNMENT=4096");
+	count = add_environment(environment, count, alignment_entry);
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_TRACE=/tmp/lifecycle.jsonl");
 	count = add_environment(environment, count, (char *)"BADFS_LIFECYCLE_TRACE_STDOUT=1");
 	count = add_environment(environment, count, (char *)"BADFS_CXL_DIRECT_TRACE=/tmp/direct.jsonl");
@@ -920,10 +929,10 @@ static size_t common_environment(char **environment, char *device_entry)
 	return count;
 }
 
-static void run_node0(char *device_entry)
+static void run_node0(char *device_entry, char *alignment_entry)
 {
 	char *environment[MAX_ENV] = {0};
-	size_t count = common_environment(environment, device_entry);
+	size_t count = common_environment(environment, device_entry, alignment_entry);
 	long server;
 	long probe = -111;
 	unsigned int attempt;
@@ -951,7 +960,8 @@ static void run_node0(char *device_entry)
 	fail("server-ready-timeout", 110);
 }
 
-static void run_node1(char *device_entry, uint16_t server_port, uint64_t bytes)
+static void run_node1(char *device_entry, char *alignment_entry,
+		      uint16_t server_port, uint64_t bytes)
 {
 	char *environment[MAX_ENV] = {0};
 	char server_entry[64] = "BADFS_SERVERS=10.0.2.2:";
@@ -963,7 +973,7 @@ static void run_node1(char *device_entry, uint16_t server_port, uint64_t bytes)
 	uint64_t block_size = bytes < 1048576 ? bytes : 1048576;
 	char mode_workload[] = "BADFS_BENCH_MODE=workload";
 	char mode_inspect[] = "BADFS_BENCH_MODE=inspect";
-	size_t count = common_environment(environment, device_entry);
+	size_t count = common_environment(environment, device_entry, alignment_entry);
 	long child;
 	int status;
 
@@ -1008,7 +1018,8 @@ static void run_node1(char *device_entry, uint16_t server_port, uint64_t bytes)
 	power_off();
 }
 
-static void run_two_client(char *device_entry, uint16_t server_port,
+static void run_two_client(char *device_entry, char *alignment_entry,
+			   uint16_t server_port,
 			   uint16_t barrier_port, uint64_t bytes,
 			   unsigned int client_id)
 {
@@ -1051,7 +1062,7 @@ static void run_two_client(char *device_entry, uint16_t server_port,
 			environment[count] = 0;
 		text_copy(case_entry, sizeof(case_entry), "BADFS_BENCH_CASE=");
 		append_text(case_entry, sizeof(case_entry), cases[index]);
-		count = common_environment(environment, device_entry);
+		count = common_environment(environment, device_entry, alignment_entry);
 		count = add_environment(environment, count, server_entry);
 		count = add_environment(environment, count, barrier_entry);
 		count = add_environment(environment, count, (char *)"BADFS_BASE_PATH=/badfs");
@@ -1090,7 +1101,7 @@ static void run_two_client(char *device_entry, uint16_t server_port,
 
 	for (count = 0; count < MAX_ENV; count++)
 		environment[count] = 0;
-	count = common_environment(environment, device_entry);
+	count = common_environment(environment, device_entry, alignment_entry);
 	count = add_environment(environment, count, server_entry);
 	count = add_environment(environment, count, (char *)"BADFS_BASE_PATH=/badfs");
 	(void)add_environment(environment, count, mode_inspect);
@@ -1115,6 +1126,8 @@ void _start(void)
 	char clients_copy[16];
 	char barrier_port_copy[16];
 	char device_entry[MAX_PATH + 32] = "BADFS_LIFECYCLE_DEVICE=";
+	char alignment_entry[64] = "BADFS_CXL_MAP_ALIGNMENT=";
+	char alignment_text[24];
 	const char *role_value;
 	const char *port_value;
 	const char *bytes_value;
@@ -1223,6 +1236,8 @@ void _start(void)
 		fail("missing-dax", 19);
 	discover_dax(&dax);
 	append_text(device_entry, sizeof(device_entry), dax.path);
+	unsigned_to_text(dax.alignment, alignment_text, sizeof(alignment_text));
+	append_text(alignment_entry, sizeof(alignment_entry), alignment_text);
 
 	write_text("LEG_OFS_CXL_READY role=");
 	write_text(role_name(role));
@@ -1234,17 +1249,19 @@ void _start(void)
 	write_unsigned(dax.major);
 	write_text(" minor=");
 	write_unsigned(dax.minor);
+	write_text(" align=");
+	write_unsigned(dax.alignment);
 	write_text(" region_id=");
 	write_region_id(dax.region_hi, dax.region_lo);
 	write_text("\n");
 
 	if (role == ROLE_NODE0)
-		run_node0(device_entry);
+		run_node0(device_entry, alignment_entry);
 	if (clients == 2)
-		run_two_client(device_entry, (uint16_t)port,
+		run_two_client(device_entry, alignment_entry, (uint16_t)port,
 			       (uint16_t)barrier_port, bytes,
 			       role == ROLE_NODE1 ? 0 : 1);
 	if (role != ROLE_NODE1)
 		fail("single-client-role", 22);
-	run_node1(device_entry, (uint16_t)port, bytes);
+	run_node1(device_entry, alignment_entry, (uint16_t)port, bytes);
 }

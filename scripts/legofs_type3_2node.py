@@ -102,11 +102,14 @@ def build_qemu_command(
         "qemu-system-riscv64",
         "-M",
         "sifive_u",
+        "-cpu",
+        "rv64,h=false,sstc=false,svadu=false,zicboz=false,"
+        "zicbom=true,cbom_blocksize=64",
         "-machine",
         "cxl=on",
         "-machine",
         "cxl-fmw.0.targets.0=cxl-node%d,cxl-fmw.0.size=4G,"
-        "cxl-fmw.0.restrictions=0xe" % node,
+        "cxl-fmw.0.restrictions=0x29" % node,
         "-smp",
         "5",
         "-m",
@@ -137,11 +140,13 @@ def build_qemu_command(
         "-device",
         f"pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl-{prefix},hdm_for_passthrough=on",
         "-device",
-        f"cxl-rp,bus=cxl-{prefix},port=0,id=rp-t3-{prefix},chassis=0,slot=0",
+        f"cxl-rp,bus=cxl-{prefix},port=0,id=rp-t3-{prefix},chassis=0,slot=0,"
+        "x-256b-flit=on",
         "-device",
         (
             f"cxl-type3,bus=rp-t3-{prefix},persistent-memdev=t3ssd-{prefix},"
             f"lsa=t3lsa-{prefix},id=t3-{prefix},coherence-v2=on,"
+            "x-256b-flit=on,hdm-db=on,"
             f"cxlmemsim-addr=127.0.0.1,cxlmemsim-port={coherence_port},"
             f"coherence-v2-host-id={node},coherence-v2-cache-capacity=8388608,"
             "coherence-v2-cache-ways=4,coherence-v2-timeout-ms=5000,"
@@ -464,12 +469,36 @@ def validate_legofs_output(output, benchmark_bytes):
         for name in zero_audit:
             if _required_integer(audit, name) != 0:
                 raise ValueError(f"badfs lifecycle audit is not clean: {name}")
-        if _required_integer(audit, "direct_mapped_extents") != 1:
-            raise ValueError("badfs lifecycle audit must retain exactly one published direct extent")
+        if _required_integer(audit, "direct_mapped_extents") != 0:
+            raise ValueError("badfs lifecycle audit retained a userspace direct mapping")
+        published_ranges = _required_integer(audit, "published_ranges")
+        if published_ranges <= 0:
+            raise ValueError("badfs lifecycle audit has no published range")
+        if _required_integer(audit, "backend_live_extents") != published_ranges:
+            raise ValueError("badfs published ranges and live extents disagree")
+        extent_states = audit.get("extent_states")
+        if (
+            not isinstance(extent_states, dict)
+            or len(extent_states) != published_ranges
+            or any(state != "published" for state in extent_states.values())
+        ):
+            raise ValueError("badfs lifecycle extent states are not fully published")
+        if _required_integer(audit, "payload_checksum_bytes") != 0 or \
+                _required_integer(audit, "payload_checksum_scans") != 0:
+            raise ValueError("badfs direct path performed a payload checksum scan")
+        if _required_integer(audit, "payload_persist_bytes") != benchmark_bytes:
+            raise ValueError("badfs persisted payload byte count is incorrect")
+        if _required_integer(audit, "coherent_acquire_bytes") != benchmark_bytes:
+            raise ValueError("badfs coherent ownership byte count is incorrect")
         for name in direct_totals:
             direct_totals[name] += _required_integer(fabric, name)
-    if any(value <= 0 for value in direct_totals.values()):
-        raise ValueError("badfs strict direct read/write counters must be positive")
+    if (
+        direct_totals["trusted_direct_read_ops"] <= 0
+        or direct_totals["trusted_direct_write_ops"] <= 0
+        or direct_totals["trusted_direct_read_bytes"] != benchmark_bytes
+        or direct_totals["trusted_direct_write_bytes"] != benchmark_bytes
+    ):
+        raise ValueError("badfs strict direct read/write counters are incorrect")
     return {
         "benchmark": benchmark,
         "direct_totals": direct_totals,

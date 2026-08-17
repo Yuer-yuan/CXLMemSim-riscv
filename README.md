@@ -109,6 +109,13 @@ It adds a synthetic `pxb-cxl` bridge with
 U-Boot programs HPA `0x1000000000` with host decoder control `0x600` and
 endpoint decoder control `0x1600`.
 
+The Legofs runners now advertise the window as `DEVMEM | PMEM | BI`
+(`cxl-fmw.0.restrictions=0x29`), put both the root port and Type 3 endpoint in
+256-byte-flit mode, expose the endpoint HDM-DB BI Decoder, and publish a 64-byte
+Zicbom CMO node in ACPI RHCT. The Type 3 coherence-v2 path remains disabled
+after reset until Linux commits the standard BI Decoder control. Inconsistent
+`coherence-v2`, `hdm-db`, or flit-mode configuration fails device realization.
+
 ## Two-node Legofs Type 3 back-invalidation proof
 
 The second workflow builds the complete stack and runs the Zettai-US Legofs
@@ -152,8 +159,16 @@ trace contains the same operation ID and mapping range as a node1-directed
 dirty completion. Host monotonic timestamps must additionally prove:
 
 ```text
-node1 direct unmap < snoop send < model ACK < dirty completion < store success
+node1 direct unmap < snoop send < model ACK < dirty completion < store_direct_success
 ```
+
+Read-exclusive is a deterministic proof policy used only by this two-node
+harness; it is not enabled implicitly by the IO500 runner. The TCP MESI-v2
+messages are a private functional adapter, not CXL.mem wire packets. In
+particular, the adapter carries dirty 64-byte data in its model `SNOOP_ACK`,
+whereas real HDM-DB has separate CXL.mem dirty-data and BIRsp ordering. The
+proof therefore validates correlated state/data/order, not flit encoding,
+credits, link timing, or protocol compliance.
 
 The result is written to:
 
@@ -194,6 +209,13 @@ This is functional QEMU/TCG and CXLMemSim model evidence. The CXL SSDs are
 file-backed simulated persistent-memory devices; this does not claim a
 physical CXL link, CPU-cache or CXL.cache coherence, media durability across a
 host crash, or hardware performance.
+
+The persistence path is fail-closed: devdax `fsync` performs the advertised
+64-byte Zicbom range clean followed by `pmem_wmb`; QEMU hands the pending
+provider to CXLMemSim `Fence`; and a successful coherence-v2 Fence now requires
+the selected backing backend to flush successfully. For `ssd-stream` that ends
+in backing-file `fsync`. This proves the file-backed model boundary only; it is
+not evidence for physical NAND PLP or host-power-loss recovery.
 
 The guest benchmark is a libc-free static `rv64imafdc` executable delivered
 through a read-only external ext2 image on

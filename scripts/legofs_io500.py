@@ -193,11 +193,8 @@ def server_command(
         "--coherence-v2-snoop-timeout-ms=30000",
         "--backing-mode=ssd-stream",
         f"--ssd-backing-file={paths.central_ssd}",
-        f"--ssd-shared-cache-file={paths.device_dram}",
         "--ssd-page-size=4096",
         "--ssd-io-chunk-size=65536",
-        # The shared page grants pin at most 32 MiB per guest.  Cover all
-        # twelve 2-server topology endpoints without backend overcommit.
         f"--ssd-cache-mb={ssd_cache_mib}",
         "--ssd-read-ahead-pages=16",
         "--ssd-io-uring=false",
@@ -243,7 +240,8 @@ def qemu_command(
         "-machine", "cxl=on",
         "-machine",
         f"cxl-fmw.0.targets.0={machine_id},cxl-fmw.0.size={FMW_SIZE},"
-        "cxl-fmw.0.restrictions=0xe",
+        # Device-coherent, persistent HDM-DB: DEVMEM | PMEM | BI.
+        "cxl-fmw.0.restrictions=0x29",
         "-smp", "5",
         "-m", "2G",
         "-display", "none",
@@ -262,10 +260,12 @@ def qemu_command(
         "-device",
         f"pxb-cxl,bus=pcie.0,bus_nr=64,id={machine_id},hdm_for_passthrough=on",
         "-device",
-        f"cxl-rp,bus={machine_id},port=0,id=rp-{label},chassis=0,slot=0",
+        f"cxl-rp,bus={machine_id},port=0,id=rp-{label},chassis=0,slot=0,"
+        "x-256b-flit=on",
         "-device",
         f"cxl-type3,bus=rp-{label},persistent-memdev=t3ssd-{label},"
         f"lsa=t3lsa-{label},id=t3-{label},coherence-v2=on,"
+        "x-256b-flit=on,hdm-db=on,"
         f"cxlmemsim-addr=127.0.0.1,cxlmemsim-port={coherence_port},"
         f"coherence-v2-host-id={host_id},"
         f"coherence-v2-cache-capacity={coherence_cache_bytes},"
@@ -936,10 +936,8 @@ def validate_tiny_provider_counters(final_stats: dict, proof: dict) -> None:
                 raise ValueError(
                     f"writer-persisted proof lacks provider counter: {name}"
                 )
-        if final_stats.get("shared_write_grants", 0) <= 0 and final_stats.get("putm", 0) <= 0:
-            raise ValueError(
-                "writer-persisted proof lacks a shared-page grant or line PUTM"
-            )
+        if final_stats.get("putm", 0) <= 0:
+            raise ValueError("writer-persisted proof lacks a line PUTM")
     if bi_count > 0:
         for name in ("snp_data_inv", "model_acks", "dirty_data_completions"):
             if final_stats.get(name, 0) <= 0:
@@ -1067,7 +1065,10 @@ def execute(
             "type3_bytes_per_endpoint": ENDPOINT_BYTES,
             "shared_cxlmemsim_region_bytes": ENDPOINT_BYTES,
             "backend": "CXLMemSim ssd-stream over QEMU file-backed persistent-memdev",
-            "data_path": "shared device-DRAM mapping with range-granular coherence grants",
+            "data_path": (
+                "private 64-byte TCP MESI functional adapter gated by "
+                "guest-visible CXL Type 3 HDM-DB"
+            ),
             "coherence_cache_bytes_per_endpoint": coherence_cache_bytes,
             "ssd_cache_bytes": ssd_cache_mib * 1024**2,
             "server_read_exclusive": server_read_exclusive,
@@ -1145,9 +1146,7 @@ def execute(
                     coherence_port=coherence_port,
                     multicast_port=multicast_port,
                     coherence_cache_bytes=coherence_cache_bytes,
-                    read_exclusive=(
-                        paths.stage == "tiny" or server_read_exclusive
-                    ),
+                    read_exclusive=server_read_exclusive,
                 )
                 result["commands"][f"server{server_index}_qemu"] = command
                 console = Console(

@@ -37,6 +37,7 @@ class LegofsRuntimeTest(unittest.TestCase):
             self.assertEqual(command[:3], ["qemu-system-riscv64", "-M", "sifive_u"])
             self.assertEqual(sum("cxl-type3" in argument for argument in command), 1)
             self.assertIn("coherence-v2=on", joined)
+            self.assertIn("cxl-fmw.0.restrictions=0x29", joined)
             self.assertIn(f"coherence-v2-host-id={node}", joined)
             self.assertIn("coherence-v2-cache-capacity=8388608", joined)
             self.assertIn("coherence-v2-cache-ways=4", joined)

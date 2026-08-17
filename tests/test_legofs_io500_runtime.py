@@ -88,6 +88,7 @@ class Io500RuntimeTest(unittest.TestCase):
                 text,
             )
             self.assertIn("cxl-fmw.0.size=64G", text)
+            self.assertIn("cxl-fmw.0.restrictions=0x29", text)
             self.assertIn("persistent-memdev=", text)
             self.assertIn("size=64G,share=on", text)
             self.assertIn(f"mem-path={self.paths.device_dram}", text)
@@ -393,7 +394,7 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("export BADFS_FSYNC_ON_CLOSE=1", rank)
         self.assertIn("export BADFS_LIFECYCLE_BLOB=0", init)
         self.assertIn("export BADFS_LIFECYCLE_BLOB=0", rank)
-        self.assertIn('[ "$dax_align" = 4096 ]', init)
+        self.assertIn('[ "$dax_align" -ge 4096 ]', init)
         self.assertIn('export BADFS_CXL_MAP_ALIGNMENT="$dax_align"', init)
         self.assertIn('export BADFS_CXL_MAP_ALIGNMENT="$(cat /run/dax-align)"', rank)
         self.assertIn("export INTERCEPT_ALL_OBJS=1", rank)
@@ -737,15 +738,16 @@ class Io500RuntimeTest(unittest.TestCase):
             },
             writer,
         )
-        self.runner.validate_tiny_provider_counters(
-            {
-                "putm": 0,
-                "shared_write_grants": 1,
-                "request_fence": 1,
-                "persistence_fence_completions": 1,
-            },
-            writer,
-        )
+        with self.assertRaisesRegex(ValueError, "line PUTM"):
+            self.runner.validate_tiny_provider_counters(
+                {
+                    "putm": 0,
+                    "shared_write_grants": 1,
+                    "request_fence": 1,
+                    "persistence_fence_completions": 1,
+                },
+                writer,
+            )
         with self.assertRaisesRegex(ValueError, "persistence_fence_completions"):
             self.runner.validate_tiny_provider_counters(
                 {"putm": 1, "request_fence": 1}, writer

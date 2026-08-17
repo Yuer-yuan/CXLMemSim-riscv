@@ -95,7 +95,9 @@ dax_path="/dev/$dax_name"
 dax_size="$(cat "$dax_sys/size")" || fail dax-size
 [ "$dax_size" = 68719476736 ] || fail dax-size-mismatch "$dax_size"
 dax_align="$(cat "$dax_sys/align" 2>/dev/null || printf '4096')"
-[ "$dax_align" = 4096 ] || fail dax-align-mismatch "$dax_align"
+case "$dax_align" in ''|*[!0-9]*) fail dax-align-invalid "$dax_align" ;; esac
+[ "$dax_align" -ge 4096 ] && [ $((dax_align % 4096)) -eq 0 ] ||
+	fail dax-align-invalid "$dax_align"
 dax_driver="$(basename "$(readlink "$dax_sys/driver")")"
 [ "$dax_driver" = device_dax ] || fail dax-driver
 printf '%s\n' "$dax_path" > /run/dax-path

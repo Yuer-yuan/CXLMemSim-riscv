@@ -65,7 +65,13 @@ class ManifestTest(unittest.TestCase):
             ).stdout.strip(),
         )
         expected_qemu = subprocess.run(
-            ["git", "-C", str(ROOT), "rev-parse", "HEAD:components/qemu"],
+            [
+                "git",
+                "-C",
+                str(ROOT / "components" / "qemu"),
+                "rev-parse",
+                "HEAD",
+            ],
             check=True,
             text=True,
             capture_output=True,
