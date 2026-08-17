@@ -352,8 +352,9 @@ def server_command(
         command.append(f"--coherence-v2-trace={paths.coherence}")
     elif trace:
         command.append(f"--coherence-v2-proof-trace={paths.coherence}")
-    else:
-        command.append("--coherence-v2-counters=true")
+    # The audited author baseline always prints aggregate MESI counters during
+    # shutdown.  It has no counter-enable CLI switch, so the normal score path
+    # deliberately adds no non-standard simulator control here.
     return command
 
 

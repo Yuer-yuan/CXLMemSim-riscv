@@ -183,13 +183,15 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("--coherence-v2-proof-trace=", text)
 
         counter_text = " ".join(self.runner.server_command(self.paths, 19000, False))
-        self.assertIn("--coherence-v2-counters=true", counter_text)
+        self.assertNotIn("--coherence-v2-counters", counter_text)
+        self.assertNotIn("--coherence-v2-trace=", counter_text)
+        self.assertNotIn("--coherence-v2-proof-trace=", counter_text)
 
         full_text = " ".join(
             self.runner.server_command(self.paths, 19000, False, full_trace=True)
         )
         self.assertIn("--coherence-v2-trace=", full_text)
-        self.assertNotIn("--coherence-v2-counters=true", full_text)
+        self.assertNotIn("--coherence-v2-counters", full_text)
         self.assertNotIn("/dev/null", counter_text)
 
     def test_guests_derive_the_shared_region_identity_from_dax(self):
