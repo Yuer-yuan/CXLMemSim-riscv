@@ -261,6 +261,9 @@ def legofs_timing_breakdown(
     server_commit_ns = int(
         inspection.get("audit", {}).get("direct_write_total_ns", 0)
     )
+    server_state_validation_ns = int(
+        inspection.get("audit", {}).get("state_validation_ns", 0)
+    )
     return {
         "schema_version": "legofs.timing-breakdown.v1",
         "client_timed_intervals": groups,
@@ -273,9 +276,20 @@ def legofs_timing_breakdown(
         "server_commit_share_of_rank_wall": (
             server_commit_ns / rank_wall_ns if rank_wall_ns else 0.0
         ),
+        "server_state_deferred_updates": int(
+            inspection.get("audit", {}).get("state_deferred_updates", 0)
+        ),
+        "server_state_validation_ops": int(
+            inspection.get("audit", {}).get("state_validation_ops", 0)
+        ),
+        "server_state_validation_ns": server_state_validation_ns,
+        "server_state_validation_share_of_rank_wall": (
+            server_state_validation_ns / rank_wall_ns if rank_wall_ns else 0.0
+        ),
         "interpretation": (
             "client values are summed elapsed RPC/control intervals across ranks; "
-            "server commit is nested inside some client intervals and neither is CPU time"
+            "server commit and validation are nested inside some client intervals and "
+            "none of these counters is CPU time"
         ),
     }
 

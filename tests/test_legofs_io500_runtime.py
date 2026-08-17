@@ -689,13 +689,24 @@ hash = DCBA4321
         ]
         timing = self.runner.legofs_timing_breakdown(
             summaries,
-            {"audit": {"direct_write_total_ns": 25}},
+            {
+                "audit": {
+                    "direct_write_total_ns": 25,
+                    "state_deferred_updates": 7,
+                    "state_validation_ops": 3,
+                    "state_validation_ns": 10,
+                }
+            },
             wall_ns=100,
             client_count=2,
         )
         self.assertEqual(timing["client_timed_intervals_ns"], 120)
         self.assertEqual(timing["client_timed_share_of_rank_wall"], 0.6)
         self.assertEqual(timing["server_direct_write_commit_ns"], 25)
+        self.assertEqual(timing["server_state_deferred_updates"], 7)
+        self.assertEqual(timing["server_state_validation_ops"], 3)
+        self.assertEqual(timing["server_state_validation_ns"], 10)
+        self.assertEqual(timing["server_state_validation_share_of_rank_wall"], 0.05)
         self.assertIn("nested", timing["interpretation"])
 
     def test_strict_bi_proof_correlates_owner_range_and_host_order(self):
