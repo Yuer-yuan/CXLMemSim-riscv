@@ -212,6 +212,45 @@ class V2QemuBiPublicationTransferModeTest(unittest.TestCase):
         idle["schema"] = "legofs.v2.authority-telemetry.v1"
         self.runner.validate_authority_telemetry(idle, "anchor", False)
 
+    def test_calibration_authority_gate_requires_real_exact_batches_and_samples(self):
+        events = {
+            name: {"samples_ns": [1, 2, 3, 4]}
+            for name in (
+                "page_persist",
+                "tail_persist",
+                "root_publication",
+                "durable_anchor_publication",
+                "cow_path",
+                "append_1",
+                "append_2",
+                "append_4",
+                "append_8",
+            )
+        }
+        telemetry = {
+            "schema": "legofs.v2.authority-telemetry.v1",
+            "commands": 90,
+            "mutations": 90,
+            "mutation_failures": 0,
+            "read_failures": 0,
+            "mutation_durable_batches": 24,
+            "mutation_durable_batch_items": 90,
+            "mutation_durable_batch_max_items": 8,
+            "mutation_visible_ahead_returns": 0,
+            "vd_calibration_samples": {
+                "schema": "legofs.vd-authority-calibration.v1",
+                "events": events,
+            },
+        }
+        self.runner.validate_calibration_authority_telemetry(telemetry)
+        broken = dict(telemetry)
+        broken["mutation_durable_batch_max_items"] = 4
+        with self.assertRaisesRegex(ValueError, "eight-item"):
+            self.runner.validate_calibration_authority_telemetry(broken)
+        events["append_8"] = {"samples_ns": [1, 2, 3]}
+        with self.assertRaisesRegex(ValueError, "append_8"):
+            self.runner.validate_calibration_authority_telemetry(telemetry)
+
     def test_bounded_client_start_batches_cover_each_client_once(self):
         self.assertEqual(
             [list(batch) for batch in self.runner.bounded_start_batches(10, 2)],
@@ -275,7 +314,7 @@ class V2QemuBiPublicationTransferModeTest(unittest.TestCase):
 
     def test_vd_probe_bundle_uses_only_raw_source_samples(self):
         authority_events = {
-            name: {"samples_ns": [1, 2, 3]}
+            name: {"samples_ns": [1, 2, 3, 4]}
             for name in (
                 "page_persist",
                 "tail_persist",
@@ -304,7 +343,7 @@ class V2QemuBiPublicationTransferModeTest(unittest.TestCase):
             "schema": "legofs.cxlmemsim.request-completion-timing.v1",
             "instrumentation_available": True,
             "events": {
-                name: {"samples_ns": [7, 8, 9]}
+                name: {"samples_ns": [7, 8, 9, 10]}
                 for name in ("gets", "getm", "upgrade", "putm")
             },
         }
@@ -314,8 +353,8 @@ class V2QemuBiPublicationTransferModeTest(unittest.TestCase):
         self.assertEqual(probes["schema"], "legofs.vd-bi-calibration-probes.v1")
         self.assertEqual(probes["events"]["sq_cq"]["samples_ns"], [4, 5, 6])
         self.assertEqual(probes["events"]["sq_cq"]["warmup_samples_discarded"], 16)
-        self.assertEqual(probes["events"]["gets"]["samples_ns"], [8, 9])
-        self.assertEqual(probes["events"]["append_8"]["samples_ns"], [2, 3])
+        self.assertEqual(probes["events"]["gets"]["samples_ns"], [8, 9, 10])
+        self.assertEqual(probes["events"]["append_8"]["samples_ns"], [2, 3, 4])
         self.assertEqual(
             set(probes["events"]),
             {

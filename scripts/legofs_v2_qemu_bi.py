@@ -1149,6 +1149,71 @@ def validate_authority_telemetry(
             raise ValueError("eager baseline unexpectedly deferred metadata D")
 
 
+def validate_calibration_authority_telemetry(telemetry: dict[str, Any]) -> None:
+    """Reject calibration runs that did not execute the production primitives.
+
+    The calibration artifact intentionally forces exact 1/2/4/8 mutation
+    groups.  Its V-before-D counters therefore do not have the same shape as a
+    product workload and must not be checked with the candidate workload gate.
+    """
+    if telemetry.get("schema") != "legofs.v2.authority-telemetry.v1":
+        raise ValueError("unexpected authority telemetry schema")
+    counter_fields = (
+        "commands",
+        "mutations",
+        "mutation_failures",
+        "read_failures",
+        "mutation_durable_batches",
+        "mutation_durable_batch_items",
+        "mutation_durable_batch_max_items",
+        "mutation_visible_ahead_returns",
+    )
+    for field in counter_fields:
+        value = telemetry.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"calibration telemetry field {field} is not a counter")
+    if telemetry["mutation_failures"] != 0 or telemetry["read_failures"] != 0:
+        raise ValueError("calibration authority reported a semantic failure")
+    if telemetry["mutation_durable_batch_max_items"] != 8:
+        raise ValueError("calibration did not execute an exact eight-item durable batch")
+    if telemetry["mutation_durable_batches"] < 24:
+        raise ValueError("calibration did not execute every repeated durable batch")
+    if telemetry["mutation_durable_batch_items"] < 90:
+        raise ValueError("calibration durable batches did not cover every semantic item")
+    if telemetry["mutation_visible_ahead_returns"] != 0:
+        raise ValueError("calibration batch unexpectedly used V-before-D publication")
+
+    calibration = telemetry.get("vd_calibration_samples")
+    if (
+        not isinstance(calibration, dict)
+        or calibration.get("schema") != "legofs.vd-authority-calibration.v1"
+    ):
+        raise ValueError("calibration authority raw samples are absent")
+    events = calibration.get("events")
+    if not isinstance(events, dict):
+        raise ValueError("calibration authority events are malformed")
+    for name in (
+        "page_persist",
+        "tail_persist",
+        "root_publication",
+        "durable_anchor_publication",
+        "cow_path",
+        "append_1",
+        "append_2",
+        "append_4",
+        "append_8",
+    ):
+        samples = events.get(name, {}).get("samples_ns")
+        if (
+            not isinstance(samples, list)
+            or len(samples) < 4
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in samples)
+        ):
+            raise ValueError(
+                f"calibration authority event {name} lacks four positive raw samples"
+            )
+
+
 def read_trace(path: pathlib.Path) -> list[dict[str, Any]]:
     records = []
     with path.open("r", encoding="utf-8") as source:
@@ -1793,11 +1858,14 @@ def execute(paths: Paths, args: argparse.Namespace) -> dict[str, Any]:
                 "LEGOFS_V2_PROVIDER_STOP_BEGIN",
                 "LEGOFS_V2_PROVIDER_STOP_END",
             )
-            validate_authority_telemetry(
-                authority_telemetry,
-                paths.durable_progress_mode,
-                not args.admission_only,
-            )
+            if paths.vd_bi_calibration:
+                validate_calibration_authority_telemetry(authority_telemetry)
+            else:
+                validate_authority_telemetry(
+                    authority_telemetry,
+                    paths.durable_progress_mode,
+                    not args.admission_only,
+                )
             if provider_stop.get("schema") != "legofs.v2.bounded-provider-stop.v1":
                 raise ValueError("unexpected bounded provider stop schema")
             if any(
