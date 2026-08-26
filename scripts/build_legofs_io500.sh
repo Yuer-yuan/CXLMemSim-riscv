@@ -90,13 +90,17 @@ ensure_checkout()
 	directory="$4"
 	if [ ! -d "$directory/.git" ]; then
 		[ ! -e "$directory" ] || die "$name source exists but is not a Git checkout: $directory"
-		git clone "$repository" "$directory"
-		git -C "$directory" checkout --detach "$commit"
+		git init "$directory"
+		git -C "$directory" remote add origin "$repository"
 	fi
 	actual_repository="$(git -C "$directory" remote get-url origin)"
-	actual_commit="$(git -C "$directory" rev-parse HEAD)"
 	[ "$actual_repository" = "$repository" ] ||
 		die "$name repository mismatch: $actual_repository"
+	if ! git -C "$directory" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+		git -C "$directory" fetch --depth=1 origin "$commit"
+	fi
+	git -C "$directory" checkout --detach "$commit"
+	actual_commit="$(git -C "$directory" rev-parse HEAD)"
 	[ "$actual_commit" = "$commit" ] ||
 		die "$name commit mismatch: $actual_commit"
 }

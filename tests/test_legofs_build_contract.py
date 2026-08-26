@@ -125,6 +125,8 @@ class LegofsBuildContractTest(unittest.TestCase):
         source = (ROOT / "scripts/build_legofs_io500.sh").read_text(encoding="utf-8")
         self.assertIn('--source "legofs=$LEGOFS_ROOT"', source)
         self.assertNotIn("--no-artifact-hashes", source)
+        self.assertIn('fetch --depth=1 origin "$commit"', source)
+        self.assertNotIn('git clone "$repository" "$directory"', source)
 
     def test_linked_rust_toolchain_uses_its_actual_sysroot_target(self):
         for path in (BUILD, ROOT / "scripts/build_legofs_io500.sh"):
