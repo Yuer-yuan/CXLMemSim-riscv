@@ -3,6 +3,7 @@
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import pathlib
@@ -17,12 +18,22 @@ import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from legofs_type3_2node import Console, OwnedProcess, qemu_environment
+from legofs_local_candidate_gate import evaluate_local_run
 
 
 DEFAULT_CLIENTS = 10
+FILESYSTEM_MODES = ("legacy-cxl-reference", "rdwo-candidate")
+EVALUATION_MANIFEST_SCHEMA = "legofs.evaluation-run-manifest.v1"
+PHASE_EVIDENCE_MANIFEST_SCHEMA = "legofs.phase-evidence-manifest.v1"
 DEFAULT_COHERENCE_CACHE_MIB = 32
 DEFAULT_SSD_CACHE_MIB = 512
+POSIX_CAPABILITY_MATRIX = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "components/legofs/docs/superpowers/specs/legofs-v2-posix-capability-matrix.toml"
+)
 ENDPOINT_BYTES = 64 * 1024**3
+CXL_CONTROL_RING_BYTES = 256 * 1024
+CXL_CONTROL_DEFAULT_CLIENTS = 16
 FMW_SIZE = "64G"
 DECODER_SIZE = "0000001000000000"
 HOST_DECODER = (
@@ -44,7 +55,7 @@ HELLO_RE = re.compile(
     r"begin_ns=(\d+) end_ns=(\d+)"
 )
 RANK_RE = re.compile(
-    r"LEGOFS_IO500_RANK_EXEC stage=(\S+) rank=(\d+) size=(\d+) "
+    r"LEGOFS_IO500_RANK_EXEC mode=(\S+) stage=(\S+) rank=(\d+) size=(\d+) "
     r"endpoint=(\d+) dax=(\S+)"
 )
 SUMMARY_RE = re.compile(
@@ -53,6 +64,15 @@ SUMMARY_RE = re.compile(
 MPI_FATAL_MARKERS = (
     "BADFS_STRICT_LIFECYCLE_DIRECT_INIT_FAILED",
     "LEGOFS_IO500_FATAL",
+)
+KERNEL_PRINTK_INTERLEAVE_RE = re.compile(
+    r"\[\s*\d+(?:\.\d+)?\]\s+[A-Za-z0-9_.:-]+:"
+)
+KERNEL_PRINTK_SPLIT_PREFIX_RE = re.compile(
+    r"\[\s*\d+(?:\.\d+)?\]\s+[A-Za-z0-9_.:-]*"
+)
+KERNEL_PRINTK_INTERRUPT_TAIL_RE = re.compile(
+    r"[A-Za-z0-9_.:-]*timer:\s+interrupt took\s+\d+\s+ns"
 )
 SEMANTIC_SMOKE_STAGES = (
     "tiny",
@@ -88,10 +108,44 @@ CLIENT_TIMING_GROUPS = {
 }
 
 
+def cxl_control_layout(server_count: int, client_count: int) -> dict:
+    align = lambda value, unit: (value + unit - 1) // unit * unit
+    max_clients = max(CXL_CONTROL_DEFAULT_CLIENTS, client_count)
+    slot_stride = align(4096 + 2 * CXL_CONTROL_RING_BYTES, 4096)
+    server_stride = align(4096 + slot_stride * max_clients, 2 * 1024**2)
+    control_size = align(4096 + server_stride * server_count, 2 * 1024**2)
+    partition_size = (
+        (ENDPOINT_BYTES - control_size) // server_count // (2 * 1024**2)
+    ) * (2 * 1024**2)
+    return {
+        "protocol_version": 1,
+        "transport": "cxl-dax-ring",
+        "max_clients": max_clients,
+        "ring_bytes_per_direction": CXL_CONTROL_RING_BYTES,
+        "server_stride": server_stride,
+        "control_region_bytes": control_size,
+        "allocator_partitions": [
+            {
+                "server": server,
+                "offset": control_size + server * partition_size,
+                "length": partition_size,
+            }
+            for server in range(server_count)
+        ],
+    }
+
+
 class Paths:
-    def __init__(self, root: pathlib.Path, stage: str, result_label: str | None = None):
+    def __init__(
+        self,
+        root: pathlib.Path,
+        stage: str,
+        result_label: str | None = None,
+        filesystem_mode: str = "legacy-cxl-reference",
+    ):
         self.root = root.resolve()
         self.stage = stage
+        self.filesystem_mode = filesystem_mode
         self.result_label = result_label or stage
         self.build = self.root / "target/build/riscv-io500"
         self.platform = self.build / "platform"
@@ -101,8 +155,18 @@ class Paths:
             self.root / "target/results/legofs-io500/dependency-versions.txt"
         )
         self.isa_gate = self.root / "target/results/legofs-io500/isa-gate.txt"
-        self.run = self.root / "target/run/legofs-io500" / self.result_label
-        self.bundle = self.root / "target/results/legofs-io500" / self.result_label
+        self.run = (
+            self.root
+            / "target/run/legofs-io500"
+            / self.filesystem_mode
+            / self.result_label
+        )
+        self.bundle = (
+            self.root
+            / "target/results/legofs-io500"
+            / self.filesystem_mode
+            / self.result_label
+        )
         self.qemu = self.platform / "qemu-system-riscv64"
         self.cxlmemsim = self.platform / "cxlmemsim_server"
         self.opensbi = self.platform / "fw_dynamic.bin"
@@ -114,6 +178,26 @@ class Paths:
         self.device_dram = self.run / "cxlmemsim-device-dram.raw"
         self.client_result = self.run / "client0-results.ext2"
         self.result = self.bundle / "result.json"
+        self.payload_root = self.build / "payload-root"
+        self.payload_config = self.payload_root / "etc" / f"io500-{stage}.ini"
+        self.legacy_server = self.payload_root / "bin" / "badfs-server"
+        self.legacy_bench = self.payload_root / "bin" / "badfs-bench"
+        self.legacy_intercept = self.payload_root / "lib" / "libbadfs_intercept.so"
+        self.syscall_intercept = (
+            self.payload_root / "lib" / "libsyscall_intercept.so.0.1.0"
+        )
+        self.rdwo_client = self.payload_root / "bin" / "badfs-rdwo-client"
+        self.rdwo_server = self.payload_root / "bin" / "badfs-rdwo-server"
+        self.rdwo_host_agent = self.payload_root / "bin" / "badfs-rdwo-host-agent"
+        self.rdwo_intercept = (
+            self.payload_root / "lib" / "libbadfs_rdwo_intercept.so"
+        )
+        self.product_engine_manifest = (
+            self.payload_root / "etc" / "legofs-rdwo-engine.manifest"
+        )
+        self.product_capability_manifest = (
+            self.payload_root / "etc" / "legofs-rdwo-capabilities.manifest"
+        )
 
     def lsa(self, host_id: int) -> pathlib.Path:
         return self.run / f"endpoint-{host_id}-lsa.raw"
@@ -155,6 +239,33 @@ def atomic_json(path: pathlib.Path, value) -> None:
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_digest(value: dict) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_evidence_mode(record: dict) -> None:
+    if bool(record.get("functional_model_only")) == bool(
+        record.get("physical_hardware_evidence")
+    ):
+        raise ValueError(
+            "functional_model_only and physical_hardware_evidence must be exclusive"
+        )
 
 
 def process_resource_sample(process: subprocess.Popen) -> dict | None:
@@ -304,7 +415,30 @@ def prepare_paths(paths: Paths) -> None:
     paths.bundle.mkdir(parents=True, mode=0o700)
 
 
-def verify_manifest(paths: Paths) -> dict:
+def expected_mode_artifacts(paths: Paths, filesystem_mode: str) -> dict:
+    if filesystem_mode == "legacy-cxl-reference":
+        return {
+            "badfs_server": paths.legacy_server,
+            "badfs_bench": paths.legacy_bench,
+            "badfs_intercept": paths.legacy_intercept,
+            "syscall_intercept": paths.syscall_intercept,
+        }
+    if filesystem_mode == "rdwo-candidate":
+        return {
+            "rdwo_client": paths.rdwo_client,
+            "rdwo_server": paths.rdwo_server,
+            "rdwo_host_agent": paths.rdwo_host_agent,
+            "rdwo_intercept": paths.rdwo_intercept,
+            "product_engine_manifest": paths.product_engine_manifest,
+            "product_capability_manifest": paths.product_capability_manifest,
+        }
+    raise ValueError(f"unsupported filesystem mode: {filesystem_mode}")
+
+
+def verify_manifest(
+    paths: Paths,
+    filesystem_mode: str = "legacy-cxl-reference",
+) -> dict:
     manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
     expected = {
         "qemu": paths.qemu,
@@ -316,15 +450,114 @@ def verify_manifest(paths: Paths) -> dict:
         "dependency_versions": paths.dependency_versions,
         "isa_gate": paths.isa_gate,
     }
+    expected.update(expected_mode_artifacts(paths, filesystem_mode))
     if manifest.get("schema_version") != 2:
         raise ValueError("unsupported build manifest schema")
+    source = manifest.get("sources", {}).get("legofs")
+    if not isinstance(source, dict):
+        raise ValueError("build manifest lacks the LegoFS component source")
+    required_source_fields = ("commit", "tree", "dirty_diff_sha256", "status_sha256")
+    for field in required_source_fields:
+        value = source.get(field)
+        expected_length = 40 if field in ("commit", "tree") else 64
+        if not isinstance(value, str) or len(value) != expected_length:
+            raise ValueError(f"invalid LegoFS source provenance field: {field}")
     for name, path in expected.items():
         entry = manifest.get("artifacts", {}).get(name)
         if not path.is_file() or not isinstance(entry, dict):
             raise FileNotFoundError(f"missing manifested artifact: {name}")
         if path.stat().st_size <= 0:
             raise ValueError(f"empty build artifact: {name}")
+        expected_sha256 = entry.get("sha256")
+        if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+            raise ValueError(f"manifested artifact lacks sha256: {name}")
+        if sha256_file(path) != expected_sha256:
+            raise ValueError(f"manifested artifact hash mismatch: {name}")
     return {"manifest": manifest}
+
+
+def validate_evaluation_manifest(
+    manifest_path: pathlib.Path,
+    paths: Paths,
+    build: dict,
+    filesystem_mode: str,
+    server_count: int,
+    client_count: int,
+) -> dict:
+    record = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if record.get("schema_version") != EVALUATION_MANIFEST_SCHEMA:
+        raise ValueError("unsupported evaluation manifest schema")
+    closed = dict(record)
+    digest = closed.pop("manifest_digest", None)
+    if not isinstance(digest, str) or digest != canonical_digest(closed):
+        raise ValueError("evaluation manifest digest mismatch")
+    if record.get("filesystem_mode") != filesystem_mode:
+        raise ValueError("evaluation manifest filesystem mode mismatch")
+    if record.get("io500_mode") != "standard":
+        raise ValueError("current IO500 harness requires standard mode")
+    if record.get("product_consumes_this_manifest") is not False:
+        raise ValueError("evaluation manifest must remain external to the product")
+    if record.get("official_candidate") is not False:
+        raise ValueError("evaluation shell cannot predeclare an official candidate")
+    topology = record.get("topology", {})
+    if (
+        topology.get("server_guests") != server_count
+        or topology.get("client_guests") != client_count
+        or topology.get("mpi_ranks") != client_count
+        or topology.get("shared_cxl_type3_region_bytes") != ENDPOINT_BYTES
+        or topology.get("hdm_db_bi_required") is not True
+    ):
+        raise ValueError("evaluation manifest topology mismatch")
+    evidence = record.get("phase_evidence", {})
+    if (
+        evidence.get("schema_version") != PHASE_EVIDENCE_MANIFEST_SCHEMA
+        or evidence.get("external_only") is not True
+        or evidence.get("product_visible_phase_identity") is not False
+    ):
+        raise ValueError("evaluation phase evidence is not external-only")
+    records = evidence.get("records")
+    if not isinstance(records, list) or not records:
+        raise ValueError("evaluation manifest contains no phase evidence records")
+    for phase in records:
+        units = phase.get("required_metric_units")
+        expected_units = ["GiB/s", "kIOPS"] if str(phase.get("phase", "")).startswith("ior-") else ["kIOPS"]
+        if units != expected_units:
+            raise ValueError("evaluation phase metric units are incomplete")
+    expected_build_digest = record.get("build_identity", {}).get(
+        "build_manifest_sha256"
+    )
+    if expected_build_digest != sha256_file(paths.manifest):
+        raise ValueError("evaluation manifest build identity is stale")
+    artifacts = record.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise ValueError("evaluation manifest artifact table is empty")
+    for name, artifact in artifacts.items():
+        if not isinstance(artifact, dict):
+            raise ValueError(f"invalid evaluation artifact record: {name}")
+        artifact_path = pathlib.Path(str(artifact.get("path", "")))
+        if not artifact_path.is_absolute():
+            artifact_path = paths.root / artifact_path
+        if not artifact_path.is_file():
+            raise FileNotFoundError(f"evaluation artifact is missing: {name}")
+        if (
+            artifact.get("size") != artifact_path.stat().st_size
+            or artifact.get("sha256") != sha256_file(artifact_path)
+        ):
+            raise ValueError(f"evaluation artifact changed after preflight: {name}")
+    effective = record.get("effective_config", {})
+    config_path = pathlib.Path(str(effective.get("path", "")))
+    if not config_path.is_file():
+        raise FileNotFoundError("evaluation effective config is missing")
+    config_digest = effective.get("sha256")
+    if config_digest != sha256_file(config_path):
+        raise ValueError("evaluation effective config digest mismatch")
+    if not paths.payload_config.is_file():
+        raise FileNotFoundError("payload IO500 config is missing")
+    if config_digest != sha256_file(paths.payload_config):
+        raise ValueError("evaluation config is not the config embedded in the payload")
+    if build.get("manifest") is None:
+        raise ValueError("verified build manifest is unavailable")
+    return record
 
 
 def sparse_file(path: pathlib.Path, size: int) -> None:
@@ -473,6 +706,7 @@ def boot_guest(
     stage: str,
     server_count: int,
     client_count: int,
+    filesystem_mode: str,
     timeout: int,
 ) -> None:
     console.wait("Hit any key to stop autoboot", timeout)
@@ -493,7 +727,8 @@ def boot_guest(
         "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=5 "
         "cxl_core.pmem_as_dax=1 "
         f"io500.role={role} io500.index={index} io500.stage={stage} "
-        f"io500.server_count={server_count} io500.client_count={client_count}'",
+        f"io500.server_count={server_count} io500.client_count={client_count} "
+        f"io500.filesystem_mode={filesystem_mode}'",
         timeout,
     )
     console.send(f"bootefi 90000000:{paths.linux.stat().st_size:x} ${{fdtcontroladdr}}")
@@ -746,17 +981,19 @@ def parse_rank_markers(
     consoles: list[Console],
     stage: str,
     client_count: int = DEFAULT_CLIENTS,
+    filesystem_mode: str = "legacy-cxl-reference",
 ) -> list[dict]:
     records = []
     for console in consoles:
         for match in RANK_RE.finditer(console.output):
-            if match.group(1) == stage:
+            if match.group(1) == filesystem_mode and match.group(2) == stage:
                 records.append({
+                    "filesystem_mode": filesystem_mode,
                     "stage": stage,
-                    "rank": int(match.group(2)),
-                    "size": int(match.group(3)),
-                    "endpoint": int(match.group(4)),
-                    "dax": match.group(5),
+                    "rank": int(match.group(3)),
+                    "size": int(match.group(4)),
+                    "endpoint": int(match.group(5)),
+                    "dax": match.group(6),
                 })
     by_rank = {record["rank"]: record for record in records}
     if len(records) != client_count or set(by_rank) != set(range(client_count)):
@@ -778,6 +1015,8 @@ def validate_posix_summaries(
             raise ValueError("unexpected POSIX summary schema")
         if record.get("intercept_enabled") is not True:
             raise ValueError("POSIX summary does not prove syscall interception")
+        if record.get("control_transport") != "cxl-dax-ring":
+            raise ValueError("POSIX summary did not use the CXL DAX control transport")
         rank = record.get("mpi_rank")
         endpoint = record.get("endpoint")
         if rank not in range(client_count) or endpoint != rank:
@@ -912,6 +1151,50 @@ def read_event_records(path: pathlib.Path) -> list[dict]:
     return records
 
 
+def parse_marked_console_json(
+    events: list[dict], marker: str, source: pathlib.Path
+) -> tuple[list[tuple[dict, int]], list[dict]]:
+    """Parse app JSON from a shared UART without inventing interleaved bytes."""
+    records = []
+    discarded = []
+    for event_number, event in enumerate(events, 1):
+        line = event["line"]
+        if marker not in line:
+            continue
+        prefix, payload = line.split(marker, 1)
+        try:
+            record = json.loads(payload)
+        except json.JSONDecodeError as error:
+            printk = KERNEL_PRINTK_INTERLEAVE_RE.search(payload)
+            split_tail = KERNEL_PRINTK_INTERRUPT_TAIL_RE.search(
+                payload[error.pos:]
+            )
+            split_printk = (
+                KERNEL_PRINTK_SPLIT_PREFIX_RE.fullmatch(prefix) is not None
+                and split_tail is not None
+            )
+            if printk is None and not split_printk:
+                raise ValueError(
+                    f"invalid {marker.rstrip()} record in {source.name} "
+                    f"event {event_number}: {error}"
+                ) from error
+            discarded.append({
+                "classification": "guest-uart-kernel-printk-interleave",
+                "source": source.name,
+                "event_record": event_number,
+                "host_capture_ns": event["host_capture_ns"],
+                "json_error_offset": error.pos,
+                "kernel_printk_prefix": (
+                    printk.group(0)
+                    if printk is not None
+                    else prefix + split_tail.group(0)
+                ),
+            })
+            continue
+        records.append((record, event["host_capture_ns"]))
+    return records, discarded
+
+
 def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: int) -> dict:
     owner_endpoint = {
         record["owner"]: record["endpoint"]
@@ -919,38 +1202,37 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
         if isinstance(record.get("owner"), int) and isinstance(record.get("endpoint"), int)
     }
     client_events = read_event_records(paths.event_log("client0"))
-    server_events = []
+    server_event_sources = []
     for server_index in range(server_count):
-        server_events.extend(
-            read_event_records(paths.event_log(f"server{server_index}"))
-        )
-    server_events.sort(key=lambda event: event["host_capture_ns"])
+        source = paths.event_log(f"server{server_index}")
+        server_event_sources.append((source, read_event_records(source)))
+    direct_records, discarded = parse_marked_console_json(
+        client_events, "BADFS_DIRECT_MAP_TRACE_JSON ", paths.event_log("client0")
+    )
     direct = []
-    for event in client_events:
-        line = event["line"]
-        marker = "BADFS_DIRECT_MAP_TRACE_JSON "
-        if marker not in line:
-            continue
-        record = json.loads(line.split(marker, 1)[1])
+    for record, capture in direct_records:
         if (
             record.get("schema_version") == "badfs.direct-map-trace.v1"
             and record.get("event") in ("persisted", "drop", "unmap")
             and record.get("access") in ("write", "read_write")
             and record.get("rc") == 0
         ):
-            direct.append((record, event["host_capture_ns"]))
+            direct.append((record, capture))
+    lifecycle_records = []
+    for source, server_events in server_event_sources:
+        parsed, lifecycle_discarded = parse_marked_console_json(
+            server_events, "BADFS_LIFECYCLE_TRACE_JSON ", source
+        )
+        lifecycle_records.extend(parsed)
+        discarded.extend(lifecycle_discarded)
+    lifecycle_records.sort(key=lambda item: item[1])
     lifecycle = []
-    for event in server_events:
-        line = event["line"]
-        marker = "BADFS_LIFECYCLE_TRACE_JSON "
-        if marker not in line:
-            continue
-        record = json.loads(line.split(marker, 1)[1])
+    for record, capture in lifecycle_records:
         if (
             record.get("schema_version") == "badfs.lifecycle.v1"
             and record.get("event") in ("store_direct_begin", "store_direct_success")
         ):
-            lifecycle.append((record, event["host_capture_ns"]))
+            lifecycle.append((record, capture))
     coherence = parse_trace(paths.coherence)
     acks = {
         record.get("snoop_id"): record
@@ -1077,6 +1359,15 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
         raise ValueError("no exact writer-persisted or back-invalidation persistency proof")
     return {
         "count": len(writer_proofs) + len(bi_proofs),
+        "serial_trace_diagnostics": {
+            "discarded_uart_interleaved_records": len(discarded),
+            "discarded_records": discarded,
+            "policy": (
+                "discard only malformed app JSON with a complete Linux printk prefix, "
+                "or a timestamp/interrupt-tail split around the app marker; never "
+                "reconstruct interleaved fields"
+            ),
+        },
         "writer_persisted": {
             "count": len(writer_proofs),
             "first": writer_proofs[0] if writer_proofs else None,
@@ -1251,29 +1542,55 @@ def execute(
     timeout: int,
     server_count: int,
     client_count: int,
+    filesystem_mode: str,
+    evaluation_manifest: pathlib.Path | None,
     coherence_cache_bytes: int = DEFAULT_COHERENCE_CACHE_MIB * 1024**2,
     ssd_cache_mib: int = DEFAULT_SSD_CACHE_MIB,
     server_read_exclusive: bool = False,
     full_coherence_trace: bool = False,
 ) -> dict:
-    build = verify_manifest(paths)
+    build = verify_manifest(paths, filesystem_mode)
+    if paths.stage == "hello":
+        if evaluation_manifest is not None:
+            raise ValueError("MPI hello must not consume an IO500 evaluation manifest")
+        evaluation = None
+    else:
+        if evaluation_manifest is None:
+            raise ValueError("IO500 stages require an external evaluation manifest")
+        evaluation = validate_evaluation_manifest(
+            evaluation_manifest,
+            paths,
+            build,
+            filesystem_mode,
+            server_count,
+            client_count,
+        )
+    if filesystem_mode == "rdwo-candidate" and paths.stage != "hello":
+        raise RuntimeError(
+            "rdwo-candidate IO500 evidence collection is unavailable until V0.3"
+        )
     prepare_paths(paths)
     owner = str(uuid.uuid4())
     host_count = client_count + server_count
+    control_layout = cxl_control_layout(server_count, client_count)
     result = {
         "schema_version": "legofs.riscv.io500.v2",
         "status": "failed",
         "stage": paths.stage,
+        "filesystem_mode": filesystem_mode,
         "first_failure": None,
         "functional_model_only": True,
-        "physical_cxl_evidence": False,
+        "physical_hardware_evidence": False,
+        "functional_model_semantics_evidence": False,
         "owner_token": owner,
         "build": build,
+        "evaluation_manifest": evaluation,
         "topology": {
             "physical_hosts": 1,
             "server_guests": server_count,
             "client_guests": client_count,
             "mpi_ranks": client_count,
+            "filesystem_mode": filesystem_mode,
             "qemu_machine": "sifive_u",
             "type3_endpoints": host_count,
             "type3_bytes_per_endpoint": ENDPOINT_BYTES,
@@ -1283,18 +1600,13 @@ def execute(
                 "private 64-byte TCP MESI functional adapter gated by "
                 "guest-visible CXL Type 3 HDM-DB"
             ),
+            "legofs_control_path": "CXL DAX request/completion rings; no LegoFS TCP",
+            "cxl_control": control_layout,
             "coherence_cache_bytes_per_endpoint": coherence_cache_bytes,
             "ssd_cache_bytes": ssd_cache_mib * 1024**2,
             "server_read_exclusive": server_read_exclusive,
             "server_scope": f"{server_count} LegoFS server allocation partitions",
-            "allocator_partitions": [
-                {
-                    "server": server,
-                    "offset": server * (ENDPOINT_BYTES // server_count),
-                    "length": ENDPOINT_BYTES // server_count,
-                }
-                for server in range(server_count)
-            ],
+            "allocator_partitions": control_layout["allocator_partitions"],
         },
         "validity": {},
         "commands": {},
@@ -1383,6 +1695,7 @@ def execute(
                         paths.stage,
                         server_count,
                         client_count,
+                        filesystem_mode,
                         timeout,
                     )
                 )
@@ -1392,9 +1705,27 @@ def execute(
             console.wait(
                 f"LEGOFS_IO500_CXL_READY role=server index={server_index}", timeout
             )
+            console.wait(f"mode={filesystem_mode} dax=", timeout)
             console.wait(
                 f"LEGOFS_IO500_SERVER_READY index={server_index}", timeout
             )
+            # `Console.wait` can return as soon as the index substring arrives,
+            # before the rest of the serial line has been read. Wait for the
+            # CXL-specific suffix as well so validation cannot race a partial
+            # readiness marker.
+            console.wait("transport=cxl-dax-ring control_bytes=", timeout)
+            ready_marker = re.search(
+                rf"LEGOFS_IO500_SERVER_READY index={server_index} [^\n]+",
+                console.output,
+            )
+            if (
+                ready_marker is None
+                or f"mode={filesystem_mode}" not in ready_marker.group(0)
+                or "transport=cxl-dax-ring" not in ready_marker.group(0)
+            ):
+                raise ValueError(
+                    f"server{server_index} did not prove the CXL DAX control transport"
+                )
 
         boot_futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=client_count) as pool:
@@ -1425,6 +1756,7 @@ def execute(
                         paths.stage,
                         server_count,
                         client_count,
+                        filesystem_mode,
                         timeout,
                     )
                 )
@@ -1433,6 +1765,7 @@ def execute(
         for index, console in enumerate(client_consoles):
             console.wait(f"LEGOFS_IO500_CXL_READY role=client index={index}", timeout)
             console.wait(f"LEGOFS_IO500_CLIENT_READY index={index}", timeout)
+            console.wait(f"mode={filesystem_mode}", timeout)
 
         result["clock_sync"] = synchronize_guest_clocks(
             server_consoles, client_consoles, client_count=client_count
@@ -1462,22 +1795,26 @@ def execute(
             diagnostics = {}
             try:
                 diagnostics["rank_placement"] = parse_rank_markers(
-                    client_consoles, paths.stage, client_count
+                    client_consoles,
+                    paths.stage,
+                    client_count,
+                    filesystem_mode,
                 )
             except Exception as error:
                 diagnostics["rank_placement_error"] = str(error)
-            try:
-                diagnostics["posix_path_summaries"] = dump_summaries(
-                    client_consoles, client_count
-                )
-            except Exception as error:
-                diagnostics["posix_path_summary_error"] = str(error)
-            try:
-                diagnostics["lifecycle_inspection"] = inspect_servers(
-                    client_consoles[0], server_count, require_direct_read=False
-                )
-            except Exception as error:
-                diagnostics["lifecycle_inspection_error"] = str(error)
+            if filesystem_mode == "legacy-cxl-reference":
+                try:
+                    diagnostics["posix_path_summaries"] = dump_summaries(
+                        client_consoles, client_count
+                    )
+                except Exception as error:
+                    diagnostics["posix_path_summary_error"] = str(error)
+                try:
+                    diagnostics["lifecycle_inspection"] = inspect_servers(
+                        client_consoles[0], server_count, require_direct_read=False
+                    )
+                except Exception as error:
+                    diagnostics["lifecycle_inspection_error"] = str(error)
             result["failed_mpi_diagnostics"] = diagnostics
             raise
         finally:
@@ -1504,8 +1841,13 @@ def execute(
             }
         else:
             rank_records = parse_rank_markers(
-                client_consoles, paths.stage, client_count
+                client_consoles,
+                paths.stage,
+                client_count,
+                filesystem_mode,
             )
+            if filesystem_mode != "legacy-cxl-reference":
+                raise RuntimeError("candidate evidence collector was not selected")
             summaries = dump_summaries(client_consoles, client_count)
             inspection = inspect_servers(client_consoles[0], server_count)
             verifier = verify_io500(client_consoles[0], paths.stage)
@@ -1592,7 +1934,7 @@ def execute(
                 validate_tiny_provider_counters(
                     final_stats, result["strict_persistency_proof"]
                 )
-            result["physical_cxl_evidence"] = True
+            result["functional_model_semantics_evidence"] = True
         if paths.stage != "hello":
             if verifier["failure"] is not None:
                 raise RuntimeError(verifier["failure"])
@@ -1618,6 +1960,7 @@ def execute(
         }
         remaining = [item.process.pid for item in all_owned if item.matches_live_pid()]
         result["cleanup"] = {"owned_processes_remaining": remaining}
+        validate_evidence_mode(result)
         atomic_json(paths.result, result)
 
 
@@ -1639,6 +1982,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--server-count", type=int, choices=(1, 2), default=1)
     parser.add_argument("--client-count", type=int, default=DEFAULT_CLIENTS)
+    parser.add_argument(
+        "--filesystem-mode",
+        choices=FILESYSTEM_MODES,
+        default="legacy-cxl-reference",
+    )
+    parser.add_argument("--evaluation-manifest", type=pathlib.Path)
     parser.add_argument("--result-label")
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument(
@@ -1663,6 +2012,14 @@ def parse_args(argv=None):
         action="store_true",
         help="diagnostic mode: record every coherence event instead of counters",
     )
+    parser.add_argument(
+        "--local-candidate-gate",
+        action="store_true",
+        help=(
+            "fail closed unless local timed counter windows and the implemented "
+            "POSIX subset pass; never grants C3/C4 or official eligibility"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1681,13 +2038,20 @@ def main(argv=None) -> int:
     ):
         raise ValueError("result-label contains unsupported characters")
     root = pathlib.Path(__file__).resolve().parents[1]
-    paths = Paths(root, args.stage, args.result_label)
+    paths = Paths(
+        root,
+        args.stage,
+        args.result_label,
+        filesystem_mode=args.filesystem_mode,
+    )
     try:
         result = execute(
             paths,
             args.timeout,
             args.server_count,
             args.client_count,
+            args.filesystem_mode,
+            args.evaluation_manifest,
             args.coherence_cache_mib * 1024**2,
             args.ssd_cache_mib,
             args.server_read_exclusive,
@@ -1697,6 +2061,17 @@ def main(argv=None) -> int:
         print(f"error: {error}", file=sys.stderr)
         print(f"result: {paths.result}", file=sys.stderr)
         return 1
+    if args.local_candidate_gate:
+        gate = evaluate_local_run(result, POSIX_CAPABILITY_MATRIX)
+        result["local_candidate_gate"] = gate
+        atomic_json(paths.result, result)
+        if gate["decision"] != "local_functional_pass":
+            print(
+                "error: local candidate gate blocked; no C3/C4 or official claim was made",
+                file=sys.stderr,
+            )
+            print(f"result: {paths.result}", file=sys.stderr)
+            return 2
     print(f"LEGOFS_IO500_COMPLETE stage={args.stage} result={paths.result}")
     print(json.dumps(result, sort_keys=True))
     return 0

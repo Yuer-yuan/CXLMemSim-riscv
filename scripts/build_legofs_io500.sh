@@ -23,6 +23,8 @@ LLVM_MC="${LLVM_MC:-llvm-mc}"
 LLVM_RANLIB="${LLVM_RANLIB:-llvm-ranlib}"
 RUST_MUSL_TARGET=riscv64gc-unknown-linux-musl
 MUSL_VERSION=1.2.5
+MUSL_TARBALL_SHA256=a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
+MUSL_HOTPATCH_PADDING_PATCH="${ROOT}/scripts/patches/musl/0001-riscv64-syscall-hotpatch-padding.patch"
 LLVM_REPOSITORY=https://github.com/llvm/llvm-project.git
 LLVM_TAG=llvmorg-20.1.8
 LLVM_COMMIT=87f0227cb60147a26a1eeb4fb06e3b505e9c7261
@@ -61,7 +63,8 @@ while (($#)); do
 done
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "jobs must be a positive integer"
 
-for command in git make cmake ninja cargo rustup mke2fs debugfs truncate \
+for command in git make cmake ninja cargo rustup mke2fs debugfs truncate tar \
+	sha256sum \
 	file install rsync "${CROSS_COMPILE}gcc" \
 	"${CROSS_COMPILE}ar" "${CROSS_COMPILE}ld" \
 	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
@@ -211,6 +214,33 @@ require_syscall_intercept_abi()
 	done
 }
 
+require_musl_hotpatch_padding()
+{
+	binary="$1"
+	report="$2"
+	if ! "${CROSS_COMPILE}objdump" -d "$binary" |
+		awk '
+			$1 ~ /^[0-9a-f]+:$/ && $2 ~ /^[0-9a-f]+$/ {
+				if ($3 == "ecall") {
+					total++
+					if (previous_encoding != "00000013") {
+						bad++
+						printf "bad_ecall=%s previous_encoding=%s\n", \
+							$1, previous_encoding
+					}
+				}
+				previous_encoding = $2
+			}
+			END {
+				printf "ecall_count=%d bad_ecall_count=%d required_previous_encoding=00000013\n", \
+					total + 0, bad + 0
+				exit total == 0 || bad != 0
+			}' > "$report"; then
+		cat "$report" >&2
+		die "musl libc lacks a four-byte nop immediately before every ecall: $binary"
+	fi
+}
+
 reject_glibc_versions()
 {
 	binary="$1"
@@ -241,17 +271,42 @@ require_unwind_provider()
 }
 
 printf '%s\n' '[io500-build] bootstrap musl headers for compiler-rt'
-MUSL_SOURCE="${ROOT}/out/legofs-type3/toolchain-src/musl-${MUSL_VERSION}"
+MUSL_UPSTREAM_SOURCE="${ROOT}/out/legofs-type3/toolchain-src/musl-${MUSL_VERSION}"
 MUSL_TARBALL="${ROOT}/out/legofs-type3/toolchain-src/musl-${MUSL_VERSION}.tar.gz"
+MUSL_SOURCE="${TARGET_ROOT}/musl-${MUSL_VERSION}-io500-source"
+MUSL_SOURCE_STAMP="${MUSL_SOURCE}/.legofs-io500-source"
 MUSL_BOOTSTRAP_BUILD="${TARGET_ROOT}/musl-rv64imafdc-bootstrap-build"
 MUSL_BOOTSTRAP_PREFIX="${TARGET_ROOT}/musl-rv64imafdc-bootstrap"
-[ -x "$MUSL_SOURCE/configure" ] || die "baseline build did not prepare musl source"
+[ -x "$MUSL_UPSTREAM_SOURCE/configure" ] || die "baseline build did not prepare musl source"
 [ -s "$MUSL_TARBALL" ] || die "baseline build did not prepare musl tarball"
+[ -s "$MUSL_HOTPATCH_PADDING_PATCH" ] ||
+	die "missing musl syscall hotpatch-padding patch: $MUSL_HOTPATCH_PADDING_PATCH"
+actual_musl_tarball_sha256=$(sha256sum "$MUSL_TARBALL" | awk '{print $1}')
+[ "$actual_musl_tarball_sha256" = "$MUSL_TARBALL_SHA256" ] ||
+	die "musl tarball hash mismatch: $actual_musl_tarball_sha256"
+MUSL_HOTPATCH_PADDING_SHA256=$(sha256sum "$MUSL_HOTPATCH_PADDING_PATCH" |
+	awk '{print $1}')
+MUSL_SOURCE_ID="musl-${MUSL_VERSION} tar_sha256=${MUSL_TARBALL_SHA256} hotpatch_padding_sha256=${MUSL_HOTPATCH_PADDING_SHA256}"
+if [ ! -f "$MUSL_SOURCE_STAMP" ] ||
+	[ "$(cat "$MUSL_SOURCE_STAMP" 2>/dev/null || true)" != "$MUSL_SOURCE_ID" ]; then
+	rm -rf -- "$MUSL_SOURCE"
+	mkdir -p "$MUSL_SOURCE"
+	tar -xf "$MUSL_TARBALL" -C "$MUSL_SOURCE" --strip-components=1
+	(
+		cd "$MUSL_SOURCE"
+		GIT_DIR=/dev/null git apply "$MUSL_HOTPATCH_PADDING_PATCH"
+	)
+	printf '%s\n' "$MUSL_SOURCE_ID" > "$MUSL_SOURCE_STAMP"
+fi
+[ -x "$MUSL_SOURCE/configure" ] || die "patched musl source is incomplete"
+MUSL_BOOTSTRAP_STAMP="$MUSL_BOOTSTRAP_PREFIX/.legofs-musl-source"
 if [ ! -x "$MUSL_BOOTSTRAP_PREFIX/bin/musl-gcc" ] ||
+	! cmp -s "$MUSL_SOURCE_STAMP" "$MUSL_BOOTSTRAP_STAMP" ||
 	! grep -Fqx "prefix = $MUSL_BOOTSTRAP_PREFIX" \
 		"$MUSL_BOOTSTRAP_BUILD/config.mak" 2>/dev/null ||
 	! grep -Fq -- "-specs \"$MUSL_BOOTSTRAP_PREFIX/lib/musl-gcc.specs\"" \
 		"$MUSL_BOOTSTRAP_PREFIX/bin/musl-gcc" 2>/dev/null; then
+	rm -rf -- "$MUSL_BOOTSTRAP_BUILD" "$MUSL_BOOTSTRAP_PREFIX"
 	mkdir -p "$MUSL_BOOTSTRAP_BUILD" "$MUSL_BOOTSTRAP_PREFIX"
 	(
 		cd "$MUSL_BOOTSTRAP_BUILD"
@@ -261,6 +316,7 @@ if [ ! -x "$MUSL_BOOTSTRAP_PREFIX/bin/musl-gcc" ] ||
 		make -j "$JOBS"
 		make install
 	)
+	cp "$MUSL_SOURCE_STAMP" "$MUSL_BOOTSTRAP_STAMP"
 fi
 
 # compiler-rt's clear-cache implementation includes Linux UAPI headers even
@@ -305,11 +361,14 @@ require_sifive_u_isa "$BUILTINS_ARCHIVE"
 printf '%s\n' '[io500-build] final musl runtime with compiler-rt'
 MUSL_BUILD="${TARGET_ROOT}/musl-rv64imafdc-compiler-rt-build"
 MUSL_PREFIX="${TARGET_ROOT}/musl-rv64imafdc-compiler-rt"
+MUSL_FINAL_STAMP="$MUSL_PREFIX/.legofs-musl-source"
 if [ ! -x "$MUSL_PREFIX/bin/musl-gcc" ] ||
+	! cmp -s "$MUSL_SOURCE_STAMP" "$MUSL_FINAL_STAMP" ||
 	! grep -Fqx "prefix = $MUSL_PREFIX" "$MUSL_BUILD/config.mak" 2>/dev/null ||
 	! grep -Fqx "LIBCC = $BUILTINS_ARCHIVE" "$MUSL_BUILD/config.mak" 2>/dev/null ||
 	! grep -Fq -- "-specs \"$MUSL_PREFIX/lib/musl-gcc.specs\"" \
 		"$MUSL_PREFIX/bin/musl-gcc" 2>/dev/null; then
+	rm -rf -- "$MUSL_BUILD" "$MUSL_PREFIX"
 	mkdir -p "$MUSL_BUILD" "$MUSL_PREFIX"
 	(
 		cd "$MUSL_BUILD"
@@ -319,6 +378,7 @@ if [ ! -x "$MUSL_PREFIX/bin/musl-gcc" ] ||
 		make -j "$JOBS"
 		make install
 	)
+	cp "$MUSL_SOURCE_STAMP" "$MUSL_FINAL_STAMP"
 fi
 grep -Fqx "LIBCC = $BUILTINS_ARCHIVE" "$MUSL_BUILD/config.mak" ||
 	die 'final musl was not linked with the pinned compiler-rt archive'
@@ -346,6 +406,8 @@ grep -Fqx "$MUSL_BUILTINS $MUSL_EMPTY_LIBGCC_EH" "$MUSL_SPECS" ||
 MUSL_CC="$MUSL_PREFIX/bin/musl-gcc"
 export REALGCC="$NOV_GCC"
 require_sifive_u_isa "$MUSL_PREFIX/lib/libc.so"
+MUSL_ECALL_GATE="$RESULTS/musl-ecall-gate.txt"
+require_musl_hotpatch_padding "$MUSL_PREFIX/lib/libc.so" "$MUSL_ECALL_GATE"
 make -C "$ROOT/components/linux" O="$BASELINE/linux" ARCH=riscv \
 	INSTALL_HDR_PATH="$MUSL_PREFIX" headers_install >/dev/null
 
@@ -584,13 +646,15 @@ printf '%s\n' \
 	"mpich=$MPICH_COMMIT" "io500=$IO500_COMMIT" "ior=$IOR_COMMIT" \
 	"pfind=$PFIND_COMMIT" "busybox=$BUSYBOX_COMMIT" \
 	"syscall_intercept=$SYSINT_COMMIT" "capstone=$CAPSTONE_COMMIT" \
-	"musl_version=$MUSL_VERSION" \
+	"musl_version=$MUSL_VERSION" "musl_tarball_sha256=$MUSL_TARBALL_SHA256" \
+	"musl_hotpatch_padding_sha256=$MUSL_HOTPATCH_PADDING_SHA256" \
 	"llvm_tag=$LLVM_TAG" "llvm=$LLVM_COMMIT" \
 	> "$RESULTS/dependency-versions.txt"
 
 python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--output "$RESULTS/build-manifest.json" \
-	--no-artifact-hashes \
+	--source "legofs=$LEGOFS_ROOT" \
+	--source "cxlmemsim=$ROOT/components/cxlmemsim" \
 	--compiler "riscv_gcc=${CROSS_COMPILE}gcc --version" \
 	--compiler "riscv_nov_gcc=$NOV_GCC --version" \
 	--compiler "riscv_musl_gcc=$MUSL_CC --version" \
@@ -608,9 +672,15 @@ python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--artifact "mpiexec=$PAYLOAD_ROOT/bin/mpiexec.hydra" \
 	--artifact "hydra_proxy=$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	--artifact "io500_result_export=$PAYLOAD_ROOT/bin/export-io500-results" \
+	--artifact "badfs_server=$PAYLOAD_ROOT/bin/badfs-server" \
+	--artifact "badfs_bench=$PAYLOAD_ROOT/bin/badfs-bench" \
 	--artifact "compiler_rt_builtins=$BUILTINS_ARCHIVE" \
 	--artifact "libunwind=$PAYLOAD_ROOT/lib/libunwind.so.1" \
 	--artifact "badfs_intercept=$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \
+	--artifact "syscall_intercept=$PAYLOAD_ROOT/lib/libsyscall_intercept.so.0.1.0" \
+	--artifact "syscall_intercept_manifest=$SYSINT_BUILD_ROOT/manifest.txt" \
 	--artifact "dependency_versions=$RESULTS/dependency-versions.txt" \
-	--artifact "isa_gate=$ISA_REPORT"
+	--artifact "isa_gate=$ISA_REPORT" \
+	--artifact "musl_ecall_gate=$MUSL_ECALL_GATE" \
+	--artifact "musl_hotpatch_padding_patch=$MUSL_HOTPATCH_PADDING_PATCH"
 printf '[io500-build] manifest %s\n' "$RESULTS/build-manifest.json"

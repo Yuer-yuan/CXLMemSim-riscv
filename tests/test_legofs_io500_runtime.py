@@ -12,6 +12,28 @@ BUILD_SCRIPT = ROOT / "scripts" / "build_legofs_io500.sh"
 NOV_GCC = ROOT / "scripts" / "riscv64-nov-gcc"
 RANK_SCRIPT = ROOT / "guest" / "legofs_io500_rank.sh"
 INIT_SCRIPT = ROOT / "guest" / "legofs_io500_init.sh"
+SYSINT_BUILD_SCRIPT = ROOT / "scripts" / "build_syscall_intercept_riscv.sh"
+SYSINT_MUSL_PATCH = (
+    ROOT
+    / "scripts"
+    / "patches"
+    / "syscall-intercept-riscv"
+    / "0001-musl-constructor-uses-auxv.patch"
+)
+SYSINT_MUSL_LIBC_PATCH = (
+    ROOT
+    / "scripts"
+    / "patches"
+    / "syscall-intercept-riscv"
+    / "0002-musl-loader-is-libc.patch"
+)
+MUSL_HOTPATCH_PADDING_PATCH = (
+    ROOT
+    / "scripts"
+    / "patches"
+    / "musl"
+    / "0001-riscv64-syscall-hotpatch-padding.patch"
+)
 
 
 def load_runner():
@@ -64,6 +86,26 @@ class Io500RuntimeTest(unittest.TestCase):
         init = INIT_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("io500.client_count=", RUNNER.read_text(encoding="utf-8"))
         self.assertIn('-n "$client_count"', init)
+
+    def test_model_and_physical_evidence_modes_are_exclusive(self):
+        model = {
+            "functional_model_only": True,
+            "physical_hardware_evidence": False,
+        }
+        self.runner.validate_evidence_mode(model)
+        for invalid in (
+            {"functional_model_only": True, "physical_hardware_evidence": True},
+            {"functional_model_only": False, "physical_hardware_evidence": False},
+        ):
+            with self.assertRaisesRegex(ValueError, "must be exclusive"):
+                self.runner.validate_evidence_mode(invalid)
+
+    def test_local_candidate_gate_is_explicit_and_cannot_claim_hardware_or_official(self):
+        args = self.runner.parse_args(["--stage", "tiny", "--local-candidate-gate"])
+        self.assertTrue(args.local_candidate_gate)
+        source = (ROOT / "run-legofs-io500.sh").read_text(encoding="utf-8")
+        self.assertIn("--local-candidate-gate", source)
+        self.assertIn("never grants C3/C4", source)
 
     def test_topology_has_unique_hosts_on_one_shared_device_dram(self):
         commands = [
@@ -201,7 +243,28 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn('BADFS_LIFECYCLE_DEVICES="$(cat /run/lifecycle-devices)"', rank)
         self.assertIn("BADFS_LIFECYCLE_POOL_OFFSET", init)
         self.assertIn("BADFS_LIFECYCLE_REGION_SIZE=68719476736", init)
+        self.assertIn("BADFS_CONTROL_TRANSPORT=cxl", init + rank)
+        self.assertIn("BADFS_CXL_CONTROL_RING_SIZE=262144", init + rank)
+        self.assertNotIn("BADFS_CXL_HEARTBEAT_TIMEOUT_MS", init + rank)
+        self.assertIn('BADFS_CXL_CLIENT_SLOT="$endpoint_id"', rank)
+        self.assertNotIn("BADFS_SERVERS=", init + rank)
+        self.assertNotIn("nc -z -w 1 127.0.0.1 3345", init)
         self.assertNotIn('BADFS_FABRIC_REGION_ID=', init + rank)
+
+    def test_cxl_control_prefix_is_disjoint_from_allocator_partitions(self):
+        layout = self.runner.cxl_control_layout(2, 10)
+        self.assertEqual(layout["transport"], "cxl-dax-ring")
+        self.assertEqual(layout["control_region_bytes"] % (2 * 1024**2), 0)
+        partitions = layout["allocator_partitions"]
+        self.assertEqual(partitions[0]["offset"], layout["control_region_bytes"])
+        self.assertLessEqual(
+            partitions[-1]["offset"] + partitions[-1]["length"],
+            self.runner.ENDPOINT_BYTES,
+        )
+        self.assertLessEqual(
+            partitions[0]["offset"] + partitions[0]["length"],
+            partitions[1]["offset"],
+        )
 
     def test_sifive_u_payload_build_has_strict_isa_and_intercept_abi(self):
         wrapper = NOV_GCC.read_text(encoding="utf-8")
@@ -241,7 +304,7 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("/lib/ld-musl-riscv64.so.1", build)
         self.assertNotIn("/usr/riscv64-linux-gnu/lib/*.so", build)
 
-    def test_manifest_checks_live_artifacts_without_hash_or_head_gate(self):
+    def test_manifest_checks_artifact_hashes_and_source_provenance(self):
         artifacts = {
             "qemu": self.paths.qemu,
             "cxlmemsim_server": self.paths.cxlmemsim,
@@ -252,23 +315,260 @@ class Io500RuntimeTest(unittest.TestCase):
             "dependency_versions": self.paths.dependency_versions,
             "isa_gate": self.paths.isa_gate,
         }
+        artifacts.update(
+            self.runner.expected_mode_artifacts(
+                self.paths,
+                "legacy-cxl-reference",
+            )
+        )
+        for path in artifacts.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+        self.paths.manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest = {
+                "schema_version": 2,
+                "superproject_commit": "development-tree-may-be-dirty",
+                "sources": {
+                    "legofs": {
+                        "commit": "a" * 40,
+                        "tree": "b" * 40,
+                        "dirty_diff_sha256": "c" * 64,
+                        "status_sha256": "d" * 64,
+                    }
+                },
+                "artifacts": {
+                    name: {
+                        "path": str(path),
+                        "size": 1,
+                        "sha256": self.runner.sha256_file(path),
+                    }
+                    for name, path in artifacts.items()
+                },
+            }
+        self.paths.manifest.write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        build = self.runner.verify_manifest(self.paths)
+        self.assertEqual(build["manifest"], manifest)
+        artifacts["payload"].write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.runner.verify_manifest(self.paths)
+
+    def test_filesystem_modes_are_closed_and_result_roots_are_disjoint(self):
+        reference = self.runner.parse_args(
+            ["--stage", "hello", "--filesystem-mode", "legacy-cxl-reference"]
+        )
+        candidate = self.runner.parse_args(
+            ["--stage", "hello", "--filesystem-mode", "rdwo-candidate"]
+        )
+        self.assertEqual(reference.filesystem_mode, "legacy-cxl-reference")
+        self.assertEqual(candidate.filesystem_mode, "rdwo-candidate")
+        reference_paths = self.runner.Paths(
+            pathlib.Path(self.temporary.name),
+            "hello",
+            filesystem_mode=reference.filesystem_mode,
+        )
+        candidate_paths = self.runner.Paths(
+            pathlib.Path(self.temporary.name),
+            "hello",
+            filesystem_mode=candidate.filesystem_mode,
+        )
+        self.assertNotEqual(reference_paths.run, candidate_paths.run)
+        self.assertNotEqual(reference_paths.bundle, candidate_paths.bundle)
+        self.assertIn("legacy-cxl-reference", reference_paths.run.parts)
+        self.assertIn("rdwo-candidate", candidate_paths.run.parts)
+
+    def test_candidate_manifest_cannot_reuse_legacy_artifacts(self):
+        artifacts = {
+            "qemu": self.paths.qemu,
+            "cxlmemsim_server": self.paths.cxlmemsim,
+            "opensbi": self.paths.opensbi,
+            "u_boot": self.paths.uboot,
+            "linux": self.paths.linux,
+            "payload": self.paths.payload,
+            "dependency_versions": self.paths.dependency_versions,
+            "isa_gate": self.paths.isa_gate,
+        }
+        artifacts.update(
+            self.runner.expected_mode_artifacts(
+                self.paths,
+                "legacy-cxl-reference",
+            )
+        )
         for path in artifacts.values():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"x")
         self.paths.manifest.parent.mkdir(parents=True, exist_ok=True)
         self.paths.manifest.write_text(
-            json.dumps({
-                "schema_version": 2,
-                "superproject_commit": "development-tree-may-be-dirty",
-                "artifacts": {
-                    name: {"path": str(path), "size": 1}
-                    for name, path in artifacts.items()
-                },
-            }),
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "sources": {
+                        "legofs": {
+                            "commit": "a" * 40,
+                            "tree": "b" * 40,
+                            "dirty_diff_sha256": "c" * 64,
+                            "status_sha256": "d" * 64,
+                        }
+                    },
+                    "artifacts": {
+                        name: {
+                            "path": str(path),
+                            "size": 1,
+                            "sha256": self.runner.sha256_file(path),
+                        }
+                        for name, path in artifacts.items()
+                    },
+                }
+            ),
             encoding="utf-8",
         )
-        build = self.runner.verify_manifest(self.paths)
-        self.assertNotIn("sha256", json.dumps(build))
+        with self.assertRaisesRegex(FileNotFoundError, "rdwo_client"):
+            self.runner.verify_manifest(self.paths, "rdwo-candidate")
+
+    def test_candidate_uses_normal_mpi_branch_without_legacy_environment(self):
+        init = INIT_SCRIPT.read_text(encoding="utf-8")
+        rank = RANK_SCRIPT.read_text(encoding="utf-8")
+        runner = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("io500.filesystem_mode=", runner)
+        self.assertIn("legacy-cxl-reference|rdwo-candidate", init + rank)
+        self.assertIn("/payload/bin/badfs-rdwo-client --", rank)
+        self.assertIn("/payload/bin/badfs-rdwo-host-agent", init)
+        self.assertIn("/payload/bin/badfs-rdwo-server", init)
+        candidate_branch = rank.split("\nrdwo-candidate)\n", 1)[1].split(
+            "\nesac",
+            1,
+        )[0]
+        self.assertNotIn("BADFS_POSIX_DATA_PATH", candidate_branch)
+        self.assertNotIn("libbadfs_intercept.so", candidate_branch)
+        self.assertNotIn("legofs.v2=1", rank)
+
+    def test_evaluation_manifest_binds_mode_topology_build_and_payload_config(self):
+        self.paths.manifest.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.manifest.write_text('{"schema_version":2}\n', encoding="utf-8")
+        self.paths.payload_config.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.payload_config.write_text(
+            "[global]\nscc = TRUE\n",
+            encoding="utf-8",
+        )
+        effective = pathlib.Path(self.temporary.name) / "effective.ini"
+        effective.write_bytes(self.paths.payload_config.read_bytes())
+        artifact = pathlib.Path(self.temporary.name) / "io500"
+        artifact.write_bytes(b"binary")
+        manifest = {
+            "schema_version": "legofs.evaluation-run-manifest.v1",
+            "filesystem_mode": "legacy-cxl-reference",
+            "io500_mode": "standard",
+            "product_consumes_this_manifest": False,
+            "official_candidate": False,
+            "topology": {
+                "server_guests": 1,
+                "client_guests": 2,
+                "mpi_ranks": 2,
+                "shared_cxl_type3_region_bytes": self.runner.ENDPOINT_BYTES,
+                "hdm_db_bi_required": True,
+            },
+            "phase_evidence": {
+                "schema_version": "legofs.phase-evidence-manifest.v1",
+                "external_only": True,
+                "product_visible_phase_identity": False,
+                "records": [
+                    {
+                        "phase": "ior-easy-write",
+                        "required_metric_units": ["GiB/s", "kIOPS"],
+                    },
+                    {
+                        "phase": "mdtest-easy-write",
+                        "required_metric_units": ["kIOPS"],
+                    },
+                ],
+            },
+            "build_identity": {
+                "build_manifest_sha256": self.runner.sha256_file(
+                    self.paths.manifest
+                )
+            },
+            "artifacts": {
+                "io500": {
+                    "path": str(artifact),
+                    "size": artifact.stat().st_size,
+                    "sha256": self.runner.sha256_file(artifact),
+                }
+            },
+            "effective_config": {
+                "path": str(effective),
+                "sha256": self.runner.sha256_file(effective),
+            },
+        }
+        manifest["manifest_digest"] = self.runner.canonical_digest(manifest)
+        manifest_path = pathlib.Path(self.temporary.name) / "evaluation.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        validated = self.runner.validate_evaluation_manifest(
+            manifest_path,
+            self.paths,
+            {"manifest": {"schema_version": 2}},
+            "legacy-cxl-reference",
+            1,
+            2,
+        )
+        self.assertEqual(validated["manifest_digest"], manifest["manifest_digest"])
+
+        effective.write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "config digest mismatch"):
+            self.runner.validate_evaluation_manifest(
+                manifest_path,
+                self.paths,
+                {"manifest": {"schema_version": 2}},
+                "legacy-cxl-reference",
+                1,
+                2,
+            )
+
+    def test_syscall_interceptor_has_reproducible_musl_constructor_fix(self):
+        builder = SYSINT_BUILD_SCRIPT.read_text(encoding="utf-8")
+        patch = SYSINT_MUSL_PATCH.read_text(encoding="utf-8")
+        libc_patch = SYSINT_MUSL_LIBC_PATCH.read_text(encoding="utf-8")
+        io500_builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('archive --format=tar "$SYSINT_COMMIT"', builder)
+        self.assertIn("GIT_DIR=/dev/null git apply", builder)
+        self.assertIn("grep -q 'intercept(void)'", builder)
+        self.assertIn("grep -q 'getauxval(AT_EXECFN)'", builder)
+        self.assertIn("grep -q 'ld-musl-'", builder)
+        self.assertIn("+intercept(void)", patch)
+        self.assertIn(
+            "+\tcmdline = (const char *)(uintptr_t)getauxval(AT_EXECFN);",
+            patch,
+        )
+        self.assertIn("-\tcmdline = argv[0];", patch)
+        self.assertIn('+\tstatic const char musl[] = "ld-musl-";', libc_patch)
+        self.assertIn("+\t\tstrncmp(name, musl, sizeof(musl) - 1) == 0", libc_patch)
+        self.assertIn(
+            "syscall_intercept_manifest=$SYSINT_BUILD_ROOT/manifest.txt",
+            io500_builder,
+        )
+
+    def test_musl_ecalls_have_reproducible_hotpatch_padding_gate(self):
+        builder = BUILD_SCRIPT.read_text(encoding="utf-8")
+        patch = MUSL_HOTPATCH_PADDING_PATCH.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "MUSL_TARBALL_SHA256="
+            "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+            builder,
+        )
+        self.assertIn('MUSL_SOURCE="${TARGET_ROOT}/musl-', builder)
+        self.assertIn("GIT_DIR=/dev/null git apply", builder)
+        self.assertIn("require_musl_hotpatch_padding", builder)
+        self.assertIn('previous_encoding != "00000013"', builder)
+        self.assertIn("exit total == 0 || bad != 0", builder)
+        self.assertIn("musl_ecall_gate=$MUSL_ECALL_GATE", builder)
+        self.assertIn("musl_hotpatch_padding_patch=$MUSL_HOTPATCH_PADDING_PATCH", builder)
+        self.assertIn("+\t.option norvc", patch)
+        self.assertIn("+\tnop", patch)
+        self.assertNotIn("INTERCEPT_DEBUG_DUMP", RANK_SCRIPT.read_text())
 
     def test_registration_gate_requires_exact_host_and_session_sets(self):
         records = [
@@ -571,6 +871,7 @@ class Io500RuntimeTest(unittest.TestCase):
                 "mpi_rank": rank,
                 "endpoint": rank,
                 "intercept_enabled": True,
+                "control_transport": "cxl-dax-ring",
                 "syscall_classification": {
                     "totals": {
                         "handled": 1,
@@ -596,6 +897,7 @@ class Io500RuntimeTest(unittest.TestCase):
                 "mpi_rank": rank,
                 "endpoint": rank,
                 "intercept_enabled": True,
+                "control_transport": "cxl-dax-ring",
                 "stats": {"open_ops": 1},
                 "syscall_classification": {
                     "totals": {
@@ -818,6 +1120,103 @@ hash = DCBA4321
         self.assertEqual(proof["count"], 1)
         self.assertEqual(proof["writer_persisted"]["count"], 1)
         self.assertEqual(proof["backinvalidation"]["count"], 0)
+
+    def test_strict_proof_discards_but_does_not_reconstruct_printk_interleave(self):
+        self.paths.bundle.mkdir(parents=True)
+        direct = {
+            "schema_version": "badfs.direct-map-trace.v1",
+            "event": "persisted",
+            "access": "write",
+            "rc": 0,
+            "owner": 77,
+            "op_id": 9,
+            "offset": 4096,
+            "length": 4096,
+        }
+        client_lines = [
+            json.dumps({
+                "host_capture_ns": 50,
+                "line": (
+                    "BADFS_DIRECT_MAP_TRACE_JSON "
+                    '{"offset":409[   1.234567] hrtimer: interrupt took 12 ns}'
+                ),
+            }),
+            json.dumps({
+                "host_capture_ns": 100,
+                "line": "BADFS_DIRECT_MAP_TRACE_JSON "
+                + json.dumps(direct, separators=(",", ":")),
+            }),
+        ]
+        self.paths.event_log("client0").write_text(
+            "\n".join(client_lines) + "\n", encoding="utf-8"
+        )
+        server_lines = []
+        for capture, event in ((200, "store_direct_begin"), (300, "store_direct_success")):
+            record = {
+                "schema_version": "badfs.lifecycle.v1",
+                "event": event,
+                "owner": 77,
+                "op_id": 9,
+                "mapping_offset": 4096,
+                "mapping_length": 4096,
+                "fault_point": "writer_persisted",
+            }
+            server_lines.append(json.dumps({
+                "host_capture_ns": capture,
+                "line": "BADFS_LIFECYCLE_TRACE_JSON "
+                + json.dumps(record, separators=(",", ":")),
+            }))
+        self.paths.event_log("server0").write_text(
+            "\n".join(server_lines) + "\n", encoding="utf-8"
+        )
+        self.paths.coherence.write_text("", encoding="utf-8")
+
+        proof = self.runner.strict_persistency_proof(
+            self.paths, [{"owner": 77, "endpoint": 3}], 1
+        )
+
+        diagnostics = proof["serial_trace_diagnostics"]
+        self.assertEqual(proof["count"], 1)
+        self.assertEqual(diagnostics["discarded_uart_interleaved_records"], 1)
+        self.assertEqual(
+            diagnostics["discarded_records"][0]["classification"],
+            "guest-uart-kernel-printk-interleave",
+        )
+
+    def test_marked_console_json_rejects_unclassified_malformed_record(self):
+        events = [{
+            "host_capture_ns": 1,
+            "line": "BADFS_DIRECT_MAP_TRACE_JSON {not-json}",
+        }]
+        with self.assertRaisesRegex(ValueError, "invalid BADFS_DIRECT_MAP_TRACE_JSON"):
+            self.runner.parse_marked_console_json(
+                events,
+                "BADFS_DIRECT_MAP_TRACE_JSON ",
+                pathlib.Path("client0-events.jsonl"),
+            )
+
+    def test_marked_console_json_discards_split_hrtimer_printk(self):
+        events = [{
+            "host_capture_ns": 2,
+            "line": (
+                "[   84.441635] hBADFS_DIRECT_MAP_TRACE_JSON "
+                '{"offset":316669952,"ortimer: interrupt took 9281000 ns'
+            ),
+        }]
+
+        records, discarded = self.runner.parse_marked_console_json(
+            events,
+            "BADFS_DIRECT_MAP_TRACE_JSON ",
+            pathlib.Path("client0-events.jsonl"),
+        )
+
+        self.assertEqual(records, [])
+        self.assertEqual(len(discarded), 1)
+        self.assertEqual(
+            discarded[0]["classification"],
+            "guest-uart-kernel-printk-interleave",
+        )
+        self.assertIn("interrupt took 9281000 ns", discarded[0]["kernel_printk_prefix"])
 
     def test_tiny_provider_counters_follow_the_selected_persistence_path(self):
         writer = {

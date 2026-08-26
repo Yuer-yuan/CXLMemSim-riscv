@@ -34,6 +34,8 @@ REQUIRED_BUILD_ARTIFACTS = (
 )
 MODE_BUILD_ARTIFACTS = {
     "legacy-cxl-reference": (
+        "badfs_server",
+        "badfs_bench",
         "badfs_intercept",
         "syscall_intercept",
     ),
