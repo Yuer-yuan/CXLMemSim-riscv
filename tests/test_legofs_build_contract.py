@@ -160,6 +160,13 @@ class LegofsBuildContractTest(unittest.TestCase):
         )
         self.assertNotIn("--no-artifact-hashes", source)
         self.assertIn('fetch --depth=1 origin "$commit"', source)
+        self.assertIn(
+            'ensure_checkout SyscallIntercept "$SYSINT_REPOSITORY" '
+            '"$SYSINT_COMMIT"',
+            source,
+        )
+        self.assertIn('SYSINT_ROOT="$SOURCES/syscall-intercept"', source)
+        self.assertNotIn('LEGOFS_TOOL_ROOT="${ROOT}/.cxl-bi-tools"', source)
         self.assertNotIn('git clone "$repository" "$directory"', source)
         self.assertIn(
             'fetch --depth=1 --filter=blob:none origin "$LLVM_COMMIT"',

@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 LEGOFS_ROOT="${ROOT}/components/legofs"
-LEGOFS_TOOL_ROOT="${ROOT}/.cxl-bi-tools"
 TARGET_ROOT="${ROOT}/target/build/riscv-io500"
 SOURCES="${ROOT}/target/build/sources"
 PLATFORM="${TARGET_ROOT}/platform"
@@ -111,6 +110,8 @@ ensure_checkout IO500 "$IO500_REPOSITORY" "$IO500_COMMIT" "$SOURCES/io500"
 ensure_checkout IOR "$IOR_REPOSITORY" "$IOR_COMMIT" "$SOURCES/io500/build/ior"
 ensure_checkout pfind "$PFIND_REPOSITORY" "$PFIND_COMMIT" "$SOURCES/io500/build/pfind"
 ensure_checkout BusyBox "$BUSYBOX_REPOSITORY" "$BUSYBOX_COMMIT" "$SOURCES/busybox"
+ensure_checkout SyscallIntercept "$SYSINT_REPOSITORY" "$SYSINT_COMMIT" \
+	"$SOURCES/syscall-intercept"
 LLVM_SOURCE="$SOURCES/llvm-project"
 if [ ! -d "$LLVM_SOURCE/.git" ]; then
 	[ ! -e "$LLVM_SOURCE" ] || die "LLVM source exists but is not a Git checkout: $LLVM_SOURCE"
@@ -537,7 +538,7 @@ make -C "$IOR_SOURCE" distclean >/dev/null 2>&1 || true
 )
 
 printf '%s\n' '[io500-build] workspace RISC-V syscall interceptor'
-SYSINT_ROOT="$LEGOFS_TOOL_ROOT/syscall-intercept-riscv" \
+SYSINT_ROOT="$SOURCES/syscall-intercept" \
 SYSINT_CAPSTONE_MIRROR="$SOURCES/capstone.git" \
 SYSINT_BUILD_ROOT="$SYSINT_BUILD_ROOT" SYSINT_JOBS="$JOBS" \
 RISCV_CC="$MUSL_CC" \

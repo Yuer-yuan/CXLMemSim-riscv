@@ -293,7 +293,7 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("reject_glibc_versions", build)
         self.assertIn("-C panic=abort", build)
         self.assertIn(
-            'SYSINT_ROOT="$LEGOFS_TOOL_ROOT/syscall-intercept-riscv"',
+            'SYSINT_ROOT="$SOURCES/syscall-intercept"',
             build,
         )
         self.assertIn(
