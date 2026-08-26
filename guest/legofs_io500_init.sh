@@ -275,17 +275,19 @@ if [ "$role" = server ]; then
 	attempt=0
 	while [ "$attempt" -lt 240 ]; do
 		if ! kill -0 "$server_pid" 2>/dev/null; then
-			set +e
-			wait "$server_pid"
-			server_rc=$?
-			set -e
+			if wait "$server_pid"; then
+				server_rc=0
+			else
+				server_rc=$?
+			fi
 			fail server-exit "$server_rc"
 		fi
 		if [ "$filesystem_mode" = rdwo-candidate ] && ! kill -0 "$host_agent_pid" 2>/dev/null; then
-			set +e
-			wait "$host_agent_pid"
-			host_agent_rc=$?
-			set -e
+			if wait "$host_agent_pid"; then
+				host_agent_rc=0
+			else
+				host_agent_rc=$?
+			fi
 			fail rdwo-host-agent-exit "$host_agent_rc"
 		fi
 		server_ready=0
@@ -381,9 +383,12 @@ while IFS= read -r line; do
 		;;
 	LEGOFS_VERIFY\ *)
 		verify_stage="${line#LEGOFS_VERIFY }"
-		/payload/bin/io500-verify "/results/$verify_stage/config.ini" \
-			"/results/$verify_stage/result.txt" 1
-		rc=$?
+		if /payload/bin/io500-verify "/results/$verify_stage/config.ini" \
+			"/results/$verify_stage/result.txt" 1; then
+			rc=0
+		else
+			rc=$?
+		fi
 		echo "LEGOFS_IO500_VERIFY_EXIT stage=$verify_stage rc=$rc"
 		;;
 	LEGOFS_INSPECT)
@@ -391,10 +396,11 @@ while IFS= read -r line; do
 			echo "LEGOFS_IO500_COMMAND_REJECTED index=$index mode=$filesystem_mode command=legacy-inspect"
 			continue
 		fi
-		set +e
-		BADFS_BENCH_MODE=inspect /payload/bin/badfs-bench
-		rc=$?
-		set -e
+		if BADFS_BENCH_MODE=inspect /payload/bin/badfs-bench; then
+			rc=0
+		else
+			rc=$?
+		fi
 		echo "LEGOFS_IO500_INSPECT_EXIT index=$index rc=$rc"
 		;;
 	LEGOFS_DUMP_SUMMARIES)

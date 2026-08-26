@@ -723,6 +723,22 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn('export BADFS_CXL_MAP_ALIGNMENT="$(cat /run/dax-align)"', rank)
         self.assertIn("export INTERCEPT_ALL_OBJS=1", rank)
 
+    def test_guest_command_loop_captures_expected_failures_without_errexit_leak(self):
+        init = INIT_SCRIPT.read_text()
+        self.assertNotIn("set -e", init)
+        self.assertIn(
+            'if /payload/bin/io500-verify "/results/$verify_stage/config.ini"',
+            init,
+        )
+        self.assertIn(
+            'echo "LEGOFS_IO500_VERIFY_EXIT stage=$verify_stage rc=$rc"',
+            init,
+        )
+        self.assertIn(
+            "if BADFS_BENCH_MODE=inspect /payload/bin/badfs-bench; then",
+            init,
+        )
+
     def test_guest_shutdown_grace_is_concurrent(self):
         barrier = threading.Barrier(3)
 
