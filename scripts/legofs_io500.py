@@ -18,6 +18,10 @@ import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from legofs_type3_2node import Console, OwnedProcess, qemu_environment
+from legofs_candidate_evidence import (
+    create_skeleton as create_candidate_evidence,
+    validate as validate_candidate_evidence,
+)
 from legofs_local_candidate_gate import evaluate_local_run
 
 
@@ -1565,10 +1569,6 @@ def execute(
             server_count,
             client_count,
         )
-    if filesystem_mode == "rdwo-candidate" and paths.stage != "hello":
-        raise RuntimeError(
-            "rdwo-candidate IO500 evidence collection is unavailable until V0.3"
-        )
     prepare_paths(paths)
     owner = str(uuid.uuid4())
     host_count = client_count + server_count
@@ -1613,6 +1613,18 @@ def execute(
         "processes": {},
         "cleanup": {},
     }
+    if filesystem_mode == "rdwo-candidate":
+        result["candidate_evidence"] = create_candidate_evidence(
+            run_id=paths.result_label,
+            stage=paths.stage,
+            owner_token=owner,
+            build_manifest=build["manifest"],
+            evaluation_manifest=evaluation,
+            server_count=server_count,
+            client_count=client_count,
+            qemu_machine="sifive_u",
+            shared_region_bytes=ENDPOINT_BYTES,
+        )
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     tcp.bind(("127.0.0.1", 0))
@@ -1847,7 +1859,10 @@ def execute(
                 filesystem_mode,
             )
             if filesystem_mode != "legacy-cxl-reference":
-                raise RuntimeError("candidate evidence collector was not selected")
+                validate_candidate_evidence(result["candidate_evidence"])
+                raise RuntimeError(
+                    "candidate phase terminal evidence is not_yet_supported until V1"
+                )
             summaries = dump_summaries(client_consoles, client_count)
             inspection = inspect_servers(client_consoles[0], server_count)
             verifier = verify_io500(client_consoles[0], paths.stage)
@@ -1960,6 +1975,8 @@ def execute(
         }
         remaining = [item.process.pid for item in all_owned if item.matches_live_pid()]
         result["cleanup"] = {"owned_processes_remaining": remaining}
+        if filesystem_mode == "rdwo-candidate":
+            validate_candidate_evidence(result["candidate_evidence"])
         validate_evidence_mode(result)
         atomic_json(paths.result, result)
 
