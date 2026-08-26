@@ -51,16 +51,15 @@ legofs_git_root="$(git -C "${LEGOFS_SOURCE_ROOT}" rev-parse --show-toplevel 2>/d
 [[ "$(cd -- "${legofs_git_root}" && pwd -P)" == "${LEGOFS_SOURCE_ROOT}" ]] ||
 	die "LegoFS component path is not its Git worktree root: ${LEGOFS_SOURCE_ROOT}"
 
-for command in cargo rustc rustup "${CROSS_COMPILE}gcc" \
+for command in cargo rustc "${CROSS_COMPILE}gcc" \
 	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" cmake ninja make mke2fs \
 	debugfs truncate python3 wget sha256sum tar install stat cmp; do
 	command -v "${command}" >/dev/null || die "required command is missing: ${command}"
 done
-if ! rustup target list --installed | grep -qx "${RUST_TARGET}"; then
-	printf '%s\n' "error: Rust target ${RUST_TARGET} is not installed" >&2
-	printf '%s\n' "remediation: rustup target add ${RUST_TARGET}" >&2
-	exit 2
-fi
+rust_sysroot="$(rustc --print sysroot)"
+rust_std=("${rust_sysroot}/lib/rustlib/${RUST_TARGET}/lib"/libstd-*.rlib)
+[[ -f "${rust_std[0]}" ]] ||
+	die "active rustc sysroot lacks target: ${RUST_TARGET} (${rust_sysroot})"
 
 mkdir -p \
 	"${BUILD}/qemu" "${BUILD}/opensbi" "${BUILD}/u-boot" \

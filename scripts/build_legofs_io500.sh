@@ -63,7 +63,7 @@ while (($#)); do
 done
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "jobs must be a positive integer"
 
-for command in git make cmake ninja cargo rustup mke2fs debugfs truncate tar \
+for command in git make cmake ninja cargo rustc mke2fs debugfs truncate tar \
 	sha256sum \
 	file install rsync "${CROSS_COMPILE}gcc" \
 	"${CROSS_COMPILE}ar" "${CROSS_COMPILE}ld" \
@@ -73,8 +73,10 @@ for command in git make cmake ninja cargo rustup mke2fs debugfs truncate tar \
 	"$LLVM_RANLIB"; do
 	command -v "$command" >/dev/null || die "required command is missing: $command"
 done
-rustup target list --installed | grep -qx "$RUST_MUSL_TARGET" ||
-	die "Rust target is not installed: $RUST_MUSL_TARGET"
+rust_sysroot="$(rustc --print sysroot)"
+rust_std=("$rust_sysroot/lib/rustlib/$RUST_MUSL_TARGET/lib"/libstd-*.rlib)
+[ -f "${rust_std[0]}" ] ||
+	die "active rustc sysroot lacks target: $RUST_MUSL_TARGET ($rust_sysroot)"
 [ -x "$NOV_GCC" ] || die "missing no-RVV compiler wrapper: $NOV_GCC"
 
 mkdir -p "$TARGET_ROOT" "$SOURCES" "$PLATFORM" "$PAYLOAD_ROOT" \

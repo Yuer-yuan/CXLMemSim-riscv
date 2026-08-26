@@ -44,8 +44,11 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertNotIn("BADFS_BENCH_BLOCK_SIZE=4096", source)
         self.assertIn('set_ifreq_name(&request, "lo")', source)
         self.assertIn("set_sockaddr(&request.value.address, ipv4(127, 0, 0, 1))", source)
-        self.assertIn("connect_tcp(ipv4(127, 0, 0, 1), 3345)", source)
-        self.assertIn("LEG_OFS_SERVER_PROBE errno=", source)
+        self.assertIn("BADFS_CONTROL_TRANSPORT=cxl", source)
+        self.assertIn("BADFS_CXL_CLIENT_SLOT=0", source)
+        self.assertIn("control_transport=cxl-dax-ring", source)
+        self.assertNotIn("connect_tcp(", source)
+        self.assertNotIn("BADFS_SERVERS=", source)
 
     def test_cxl_devdax_exposes_real_persistence_flush(self):
         device = (ROOT / "components/linux/drivers/dax/device.c").read_text()
@@ -117,6 +120,18 @@ class LegofsBuildContractTest(unittest.TestCase):
         ):
             with self.subTest(artifact=artifact):
                 self.assertIn(f'--artifact "{artifact}=', source)
+
+    def test_io500_build_hashes_artifacts_and_records_live_legofs_source(self):
+        source = (ROOT / "scripts/build_legofs_io500.sh").read_text(encoding="utf-8")
+        self.assertIn('--source "legofs=$LEGOFS_ROOT"', source)
+        self.assertNotIn("--no-artifact-hashes", source)
+
+    def test_linked_rust_toolchain_uses_its_actual_sysroot_target(self):
+        for path in (BUILD, ROOT / "scripts/build_legofs_io500.sh"):
+            source = path.read_text(encoding="utf-8")
+            self.assertIn("rustc --print sysroot", source)
+            self.assertIn("libstd-*.rlib", source)
+            self.assertNotIn("rustup target list", source)
 
 
 if __name__ == "__main__":
