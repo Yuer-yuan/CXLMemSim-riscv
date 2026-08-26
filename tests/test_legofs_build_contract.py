@@ -167,6 +167,17 @@ class LegofsBuildContractTest(unittest.TestCase):
         )
         self.assertNotIn("git clone --filter=blob:none --no-checkout", source)
 
+    def test_io500_build_binds_working_cross_linker_for_shared_mpich(self):
+        source = (ROOT / "scripts/build_legofs_io500.sh").read_text(encoding="utf-8")
+        self.assertIn('MPICH_LD="$(command -v "${CROSS_COMPILE}ld")"', source)
+        self.assertIn("MPICH linker is not an executable GNU ld", source)
+        self.assertIn('RANLIB="${CROSS_COMPILE}ranlib" LD="$MPICH_LD"', source)
+        self.assertIn(
+            'test -e "$MPICH_PREFIX/lib/libmpi.so.0.0.0"',
+            source,
+        )
+        self.assertNotIn('make -j "$JOBS" lib/libmpi.la', source)
+
     def test_linked_rust_toolchain_uses_its_actual_sysroot_target(self):
         for path in (BUILD, ROOT / "scripts/build_legofs_io500.sh"):
             source = path.read_text(encoding="utf-8")

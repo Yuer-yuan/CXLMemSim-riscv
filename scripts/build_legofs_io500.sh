@@ -475,6 +475,10 @@ require_sifive_u_isa "$BUSYBOX_BUILD/busybox"
 
 printf '%s\n' '[io500-build] MPICH 4.3.2 ch3:sock + Hydra'
 git -C "$SOURCES/mpich" submodule update --init
+MPICH_LD="$(command -v "${CROSS_COMPILE}ld")" ||
+	die "missing ${CROSS_COMPILE}ld linker wrapper"
+"$MPICH_LD" -v 2>&1 | grep -Fq 'GNU ld' ||
+	die "MPICH linker is not an executable GNU ld: $MPICH_LD"
 if [ ! -x "$SOURCES/mpich/configure" ]; then
 	(
 		cd "$SOURCES/mpich"
@@ -492,7 +496,7 @@ if [ ! -x "$MPICH_PREFIX/bin/mpiexec.hydra" ] ||
 			--build=x86_64-pc-linux-gnu --host=riscv64-linux-gnu \
 			--prefix="$MPICH_PREFIX" \
 			CC="$MUSL_CC" AR="${CROSS_COMPILE}ar" \
-			RANLIB="${CROSS_COMPILE}ranlib" \
+			RANLIB="${CROSS_COMPILE}ranlib" LD="$MPICH_LD" \
 			CPPFLAGS='-include signal.h' \
 			--with-device=ch3:sock --with-pm=hydra \
 			--disable-fortran --disable-cxx --disable-romio \
@@ -502,6 +506,8 @@ if [ ! -x "$MPICH_PREFIX/bin/mpiexec.hydra" ] ||
 		make install
 	)
 fi
+test -e "$MPICH_PREFIX/lib/libmpi.so.0.0.0" ||
+	die 'MPICH shared-library payload was not produced'
 MPICC="$MPICH_PREFIX/bin/mpicc"
 
 printf '%s\n' '[io500-build] real-MPI IOR, pfind, IO500, and verifier'
