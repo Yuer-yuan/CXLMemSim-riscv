@@ -23,6 +23,14 @@ MUSL_TARBALL="${MUSL_SOURCE_ROOT}/musl-${MUSL_VERSION}.tar.gz"
 MUSL_BUILD="${BUILD}/musl-rv64gc"
 MUSL_PREFIX="${OUT}/toolchain/musl-rv64gc"
 MUSL_CC="${MUSL_PREFIX}/bin/musl-gcc"
+PMEM_DEB_VERSION=1.13.1-1.1ubuntu2
+PMEM_DEV_SHA256=f710b78cc1ca3650e312d92c1a32f77597e727a4d042061485f8e6485aed4195
+PMEM_RUNTIME_SHA256=8f1be1cc834a98f0cf5c0950153f7f939a0c2c92095e98cd7bb40c752c545c1b
+PMEM_DEB_CACHE="${ROOT}/target/download-cache/pmdk"
+PMEM_SYSROOT="${OUT}/toolchain/libpmem-amd64"
+PMEM_DEV_DEB="${PMEM_DEB_CACHE}/libpmem-dev_${PMEM_DEB_VERSION}_amd64.deb"
+PMEM_RUNTIME_DEB="${PMEM_DEB_CACHE}/libpmem1_${PMEM_DEB_VERSION}_amd64.deb"
+PMEM_MANIFEST="${RESULTS}/libpmem-debs.txt"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 die()
@@ -55,7 +63,7 @@ legofs_git_root="$(git -C "${LEGOFS_SOURCE_ROOT}" rev-parse --show-toplevel 2>/d
 
 for command in cargo rustc git "${CROSS_COMPILE}gcc" \
 	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" cmake ninja make mke2fs \
-	debugfs truncate python3 wget sha256sum tar install stat cmp; do
+	apt-get debugfs dpkg-deb pkg-config truncate python3 wget sha256sum tar install stat cmp; do
 	command -v "${command}" >/dev/null || die "required command is missing: ${command}"
 done
 rust_sysroot="$(rustc --print sysroot)"
@@ -157,6 +165,37 @@ cmp "${badfs_server}" "${verify_server}" || die 'badfs-server ext2 payload is in
 cmp "${badfs_bench}" "${verify_bench}" || die 'badfs-bench ext2 payload is incomplete'
 
 printf '%s\n' '[legofs-build] QEMU riscv64-softmmu with Type-3 MESI v2 BI'
+mkdir -p "${PMEM_DEB_CACHE}" "${PMEM_SYSROOT}"
+if [[ ! -f "${PMEM_DEV_DEB}" ]]; then
+	(cd "${PMEM_DEB_CACHE}" && apt-get download "libpmem-dev=${PMEM_DEB_VERSION}")
+fi
+if [[ ! -f "${PMEM_RUNTIME_DEB}" ]]; then
+	(cd "${PMEM_DEB_CACHE}" && apt-get download "libpmem1=${PMEM_DEB_VERSION}")
+fi
+printf '%s  %s\n' "${PMEM_DEV_SHA256}" "${PMEM_DEV_DEB}" | sha256sum -c -
+printf '%s  %s\n' "${PMEM_RUNTIME_SHA256}" "${PMEM_RUNTIME_DEB}" | sha256sum -c -
+pmem_stamp="version=${PMEM_DEB_VERSION} dev=${PMEM_DEV_SHA256} runtime=${PMEM_RUNTIME_SHA256}"
+if [[ ! -f "${PMEM_SYSROOT}/.complete" ]] ||
+	[[ "$(<"${PMEM_SYSROOT}/.complete")" != "${pmem_stamp}" ]]; then
+	dpkg-deb -x "${PMEM_RUNTIME_DEB}" "${PMEM_SYSROOT}"
+	dpkg-deb -x "${PMEM_DEV_DEB}" "${PMEM_SYSROOT}"
+	printf '%s\n' "${pmem_stamp}" > "${PMEM_SYSROOT}/.complete"
+fi
+mkdir -p "${PMEM_SYSROOT}/pkgconfig"
+sed "s|^prefix=/usr$|prefix=${PMEM_SYSROOT}/usr|" \
+	"${PMEM_SYSROOT}/usr/lib/x86_64-linux-gnu/pkgconfig/libpmem.pc" \
+	> "${PMEM_SYSROOT}/pkgconfig/libpmem.pc.tmp"
+mv "${PMEM_SYSROOT}/pkgconfig/libpmem.pc.tmp" \
+	"${PMEM_SYSROOT}/pkgconfig/libpmem.pc"
+export PKG_CONFIG_PATH="${PMEM_SYSROOT}/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+export LD_LIBRARY_PATH="${PMEM_SYSROOT}/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+[[ "$(pkg-config --modversion libpmem)" == 1.13.1 ]] ||
+	die 'pinned libpmem pkg-config identity mismatch'
+printf '%s\n' \
+	"version=${PMEM_DEB_VERSION}" \
+	"libpmem_dev_sha256=${PMEM_DEV_SHA256}" \
+	"libpmem_runtime_sha256=${PMEM_RUNTIME_SHA256}" \
+	> "${PMEM_MANIFEST}"
 slirp_source="${ROOT}/components/qemu/subprojects/slirp"
 if [[ ! -d "${slirp_source}/.git" ]]; then
 	[[ ! -e "${slirp_source}" ]] ||
@@ -267,6 +306,7 @@ python3 "${ROOT}/scripts/write_manifest.py" \
 	--artifact "legofs_disk=${legofs_disk}" \
 	--artifact "badfs_server=${badfs_server}" \
 	--artifact "badfs_bench=${badfs_bench}" \
-	--artifact "cxlmemsim_server=${cxlmemsim_server}"
+	--artifact "cxlmemsim_server=${cxlmemsim_server}" \
+	--artifact "libpmem_build=${PMEM_MANIFEST}"
 
 printf '%s\n' "[legofs-build] manifest ${RESULTS}/build-manifest.json"

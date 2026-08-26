@@ -30,6 +30,7 @@ REQUIRED_BUILD_ARTIFACTS = (
     "hydra_proxy",
     "io500_result_export",
     "dependency_versions",
+    "libpmem_build",
     "isa_gate",
 )
 MODE_BUILD_ARTIFACTS = {

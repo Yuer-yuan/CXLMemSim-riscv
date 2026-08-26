@@ -110,6 +110,11 @@ class LegofsBuildContractTest(unittest.TestCase):
             source,
         )
         self.assertIn('fetch --depth=1 origin "${SLIRP_COMMIT}"', source)
+        self.assertIn("PMEM_DEB_VERSION=1.13.1-1.1ubuntu2", source)
+        self.assertIn("PMEM_DEV_SHA256=f710b78c", source)
+        self.assertIn("PMEM_RUNTIME_SHA256=8f1be1cc", source)
+        self.assertIn("pkg-config --modversion libpmem", source)
+        self.assertIn('libpmem_build=${PMEM_MANIFEST}', source)
         self.assertIn("--no-artifact-hashes", source)
         self.assertNotIn('${ROOT}/../..', source)
         self.assertIn('--compiler "qemu=${qemu} --version"', source)

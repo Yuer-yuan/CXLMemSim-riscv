@@ -695,6 +695,7 @@ python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--artifact "syscall_intercept=$PAYLOAD_ROOT/lib/libsyscall_intercept.so.0.1.0" \
 	--artifact "syscall_intercept_manifest=$SYSINT_BUILD_ROOT/manifest.txt" \
 	--artifact "dependency_versions=$RESULTS/dependency-versions.txt" \
+	--artifact "libpmem_build=$ROOT/out/legofs-type3/results/libpmem-debs.txt" \
 	--artifact "isa_gate=$ISA_REPORT" \
 	--artifact "musl_ecall_gate=$MUSL_ECALL_GATE" \
 	--artifact "musl_hotpatch_padding_patch=$MUSL_HOTPATCH_PADDING_PATCH"
