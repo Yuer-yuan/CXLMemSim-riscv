@@ -10,6 +10,7 @@ PAYLOAD_ROOT="${TARGET_ROOT}/payload-root"
 INITRAMFS="${TARGET_ROOT}/initramfs"
 IMAGES="${TARGET_ROOT}/images"
 RESULTS="${ROOT}/target/results/legofs-io500"
+RDWO_RESULTS="${RESULTS}/rdwo-v1.1"
 CARGO_TARGET="${TARGET_ROOT}/cargo-rv64imafdc-compiler-rt"
 MPICH_BUILD="${TARGET_ROOT}/mpich-rv64imafdc-compiler-rt-build"
 MPICH_PREFIX="${TARGET_ROOT}/mpich-rv64imafdc-compiler-rt-install"
@@ -66,6 +67,7 @@ for command in git make cmake ninja cargo rustc mke2fs debugfs truncate tar \
 	sha256sum \
 	file install rsync "${CROSS_COMPILE}gcc" \
 	"${CROSS_COMPILE}ar" "${CROSS_COMPILE}ld" \
+	"${CROSS_COMPILE}nm" "${CROSS_COMPILE}strings" \
 	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
 	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
 	"${CROSS_COMPILE}strip" "$CLANG" "$LLVM_AR" "$LLVM_MC" \
@@ -79,7 +81,7 @@ rust_std=("$rust_sysroot/lib/rustlib/$RUST_MUSL_TARGET/lib"/libstd-*.rlib)
 [ -x "$NOV_GCC" ] || die "missing no-RVV compiler wrapper: $NOV_GCC"
 
 mkdir -p "$TARGET_ROOT" "$SOURCES" "$PLATFORM" "$PAYLOAD_ROOT" \
-	"$INITRAMFS" "$IMAGES" "$RESULTS" "$CARGO_TARGET"
+	"$INITRAMFS" "$IMAGES" "$RESULTS" "$RDWO_RESULTS" "$CARGO_TARGET"
 
 ensure_checkout()
 {
@@ -555,6 +557,72 @@ RUSTFLAGS="-C target-feature=-crt-static -C panic=abort \
 	--release --target "$RUST_MUSL_TARGET" -p badfs-intercept \
 	--features syscall-intercept-backend
 
+printf '%s\n' '[io500-build] link-time independent RDWO V1.1 artifacts'
+cargo build --manifest-path "$LEGOFS_ROOT/Cargo.toml" --release \
+	-p badfs-rdwo-client --bin badfs-rdwo-manifest
+RUSTFLAGS="-C target-feature=-crt-static -C panic=abort \
+-C link-arg=-L$LIBUNWIND_PREFIX/lib" \
+	cargo build --manifest-path "$LEGOFS_ROOT/Cargo.toml" \
+	--release --target "$RUST_MUSL_TARGET" \
+	-p badfs-rdwo-client -p badfs-rdwo-server \
+	-p badfs-rdwo-host-agent -p badfs-rdwo-intercept
+RDWO_CROSS="$CARGO_TARGET/$RUST_MUSL_TARGET/release"
+RDWO_CLIENT="$RDWO_CROSS/badfs-rdwo-client"
+RDWO_SERVER="$RDWO_CROSS/badfs-rdwo-server"
+RDWO_HOST_AGENT="$RDWO_CROSS/badfs-rdwo-host-agent"
+RDWO_INTERCEPT="$RDWO_CROSS/libbadfs_rdwo_intercept.so"
+RDWO_SOURCE_IDENTITY="$RDWO_RESULTS/source-identity.txt"
+(
+	cd "$LEGOFS_ROOT"
+	{
+		printf '%s\n' Cargo.toml Cargo.lock badfs-common/Cargo.toml \
+			badfs-common/src/lib.rs badfs-common/src/product_manifest.rs
+		find badfs-rdwo-client badfs-rdwo-server badfs-rdwo-host-agent \
+			badfs-rdwo-intercept -type f -print
+	} | LC_ALL=C sort -u | while IFS= read -r source; do
+		sha256sum "$source"
+	done
+) > "$RDWO_SOURCE_IDENTITY"
+RDWO_CARGO_TREE="$RDWO_RESULTS/cargo-tree.txt"
+cargo tree --manifest-path "$LEGOFS_ROOT/Cargo.toml" --edges normal,build \
+	-p badfs-rdwo-client -p badfs-rdwo-server \
+	-p badfs-rdwo-host-agent -p badfs-rdwo-intercept > "$RDWO_CARGO_TREE"
+RDWO_CLOSURE="$RDWO_RESULTS/closure.json"
+python3 "$ROOT/scripts/legofs_rdwo_closure.py" \
+	--cargo-tree "$RDWO_CARGO_TREE" \
+	--source-identity "$RDWO_SOURCE_IDENTITY" \
+	--artifact "client=$RDWO_CLIENT" \
+	--artifact "server=$RDWO_SERVER" \
+	--artifact "host_agent=$RDWO_HOST_AGENT" \
+	--artifact "intercept=$RDWO_INTERCEPT" \
+	--readelf "${CROSS_COMPILE}readelf" \
+	--nm "${CROSS_COMPILE}nm" \
+	--strings "${CROSS_COMPILE}strings" \
+	--output "$RDWO_CLOSURE"
+RDWO_REGION_IDENTITY="$RDWO_RESULTS/cxl-region-plane-template.txt"
+RDWO_GENESIS_IDENTITY="$RDWO_RESULTS/genesis-routing-template.txt"
+printf '%s\n' \
+	'schema=legofs.rdwo-cxl-region-plane.v1' \
+	'backend=cxl-region-only' \
+	'planes=catalog,metadata,payload,queue,persistence,recovery' \
+	'region_generation=1' > "$RDWO_REGION_IDENTITY"
+printf '%s\n' \
+	'schema=legofs.rdwo-genesis-routing.v1' \
+	'format_generation=1' \
+	'routing_generation=1' \
+	'state=bootstrap-template-not-serving' > "$RDWO_GENESIS_IDENTITY"
+RDWO_CAPABILITY_MANIFEST="$RDWO_RESULTS/legofs-rdwo-capabilities.manifest"
+RDWO_ENGINE_MANIFEST="$RDWO_RESULTS/legofs-rdwo-engine.manifest"
+"$CARGO_TARGET/release/badfs-rdwo-manifest" generate \
+	"$RDWO_CAPABILITY_MANIFEST" "$RDWO_ENGINE_MANIFEST" \
+	4c65676f46535244574f563131000001 1 1 d-before-v \
+	"$RDWO_REGION_IDENTITY" "$RDWO_GENESIS_IDENTITY" \
+	"$RDWO_SOURCE_IDENTITY" "$RDWO_CARGO_TREE" "$RDWO_CLOSURE"
+[ "$(wc -c < "$RDWO_CAPABILITY_MANIFEST")" -eq 256 ] ||
+	die 'RDWO capability manifest is not the fixed 256-byte ABI'
+[ "$(wc -c < "$RDWO_ENGINE_MANIFEST")" -eq 320 ] ||
+	die 'RDWO engine manifest is not the fixed 320-byte ABI'
+
 printf '%s\n' '[io500-build] MPI placement probe'
 "$MPICC" -O2 -Wall -Wextra -Werror "$ROOT/guest/mpi_hello.c" \
 	-Wl,-rpath,/payload/lib \
@@ -577,8 +645,16 @@ install -m 0755 "$TARGET_ROOT/export-io500-results" \
 install -m 0755 "$ROOT/guest/legofs_io500_rank.sh" "$PAYLOAD_ROOT/bin/run-io500-rank"
 install -m 0755 "$BASELINE/legofs-bin/badfs-server" "$PAYLOAD_ROOT/bin/badfs-server"
 install -m 0755 "$BASELINE/legofs-bin/badfs-bench" "$PAYLOAD_ROOT/bin/badfs-bench"
+install -m 0755 "$RDWO_CLIENT" "$PAYLOAD_ROOT/bin/badfs-rdwo-client"
+install -m 0755 "$RDWO_SERVER" "$PAYLOAD_ROOT/bin/badfs-rdwo-server"
+install -m 0755 "$RDWO_HOST_AGENT" "$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent"
 install -m 0755 "$CARGO_TARGET/$RUST_MUSL_TARGET/release/libbadfs_intercept.so" \
 	"$PAYLOAD_ROOT/lib/libbadfs_intercept.so"
+install -m 0755 "$RDWO_INTERCEPT" "$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so"
+install -m 0644 "$RDWO_ENGINE_MANIFEST" \
+	"$PAYLOAD_ROOT/etc/legofs-rdwo-engine.manifest"
+install -m 0644 "$RDWO_CAPABILITY_MANIFEST" \
+	"$PAYLOAD_ROOT/etc/legofs-rdwo-capabilities.manifest"
 cp -a "$MPICH_PREFIX/lib/"libmpi.so* "$PAYLOAD_ROOT/lib/"
 cp -a "$SYSINT_BUILD_ROOT/build/"libsyscall_intercept.so* "$PAYLOAD_ROOT/lib/"
 cp -a "$LIBUNWIND_PREFIX/lib/"libunwind.so* "$PAYLOAD_ROOT/lib/"
@@ -628,10 +704,19 @@ for binary in "$PAYLOAD_ROOT/bin/io500" "$PAYLOAD_ROOT/bin/io500-verify" \
 	"$PAYLOAD_ROOT/bin/mpiexec.hydra" "$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_ROOT/bin/mpi-hello" "$PAYLOAD_ROOT/bin/export-io500-results" \
 	"$PAYLOAD_ROOT/bin/badfs-server" \
-	"$PAYLOAD_ROOT/bin/badfs-bench" "$PAYLOAD_ROOT/lib/libmpi.so" \
+	"$PAYLOAD_ROOT/bin/badfs-bench" \
+	"$PAYLOAD_ROOT/bin/badfs-rdwo-client" \
+	"$PAYLOAD_ROOT/bin/badfs-rdwo-server" \
+	"$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent" \
+	"$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so" \
+	"$PAYLOAD_ROOT/lib/libmpi.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so" \
 	"$PAYLOAD_ROOT/lib/libsyscall_intercept.so" \
-	"$PAYLOAD_ROOT/lib/libbadfs_intercept.so"; do
+	"$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \
+	"$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so" \
+	"$PAYLOAD_ROOT/bin/badfs-rdwo-client" \
+	"$PAYLOAD_ROOT/bin/badfs-rdwo-server" \
+	"$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent"; do
 	file -L "$binary" | grep -q 'RISC-V' || die "payload binary is not RISC-V: $binary"
 	require_sifive_u_isa "$binary"
 done
@@ -696,6 +781,15 @@ python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--artifact "io500_result_export=$PAYLOAD_ROOT/bin/export-io500-results" \
 	--artifact "badfs_server=$PAYLOAD_ROOT/bin/badfs-server" \
 	--artifact "badfs_bench=$PAYLOAD_ROOT/bin/badfs-bench" \
+	--artifact "rdwo_client=$PAYLOAD_ROOT/bin/badfs-rdwo-client" \
+	--artifact "rdwo_server=$PAYLOAD_ROOT/bin/badfs-rdwo-server" \
+	--artifact "rdwo_host_agent=$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent" \
+	--artifact "rdwo_intercept=$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so" \
+	--artifact "rdwo_engine_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-engine.manifest" \
+	--artifact "rdwo_capability_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-capabilities.manifest" \
+	--artifact "rdwo_closure=$RDWO_CLOSURE" \
+	--artifact "rdwo_cargo_tree=$RDWO_CARGO_TREE" \
+	--artifact "rdwo_source_identity=$RDWO_SOURCE_IDENTITY" \
 	--artifact "compiler_rt_builtins=$BUILTINS_ARCHIVE" \
 	--artifact "libunwind=$PAYLOAD_ROOT/lib/libunwind.so.1" \
 	--artifact "badfs_intercept=$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \
