@@ -120,6 +120,13 @@ class LegofsBuildContractTest(unittest.TestCase):
             source,
         )
         self.assertIn('libpmem_build=${PMEM_MANIFEST}', source)
+        self.assertIn("SPDLOG_DEB_VERSION=1:1.12.0+ds-2build1", source)
+        self.assertIn("SPDLOG_DEV_SHA256=850b97a9", source)
+        self.assertIn("FMT_DEB_VERSION=9.1.0+ds1-2", source)
+        self.assertIn("FMT_DEV_SHA256=cc05cae4", source)
+        self.assertIn("-DCXLMEMSIM_ENABLE_RDMA=OFF", source)
+        self.assertIn("-DCXLMEMSIM_ENABLE_SLUGALLOCATOR=OFF", source)
+        self.assertIn('cxlmemsim_build_deps=${CXL_DEPS_MANIFEST}', source)
         self.assertIn("--no-artifact-hashes", source)
         self.assertNotIn('${ROOT}/../..', source)
         self.assertIn('--compiler "qemu=${qemu} --version"', source)
@@ -139,6 +146,10 @@ class LegofsBuildContractTest(unittest.TestCase):
     def test_io500_build_hashes_artifacts_and_records_live_legofs_source(self):
         source = (ROOT / "scripts/build_legofs_io500.sh").read_text(encoding="utf-8")
         self.assertIn('--source "legofs=$LEGOFS_ROOT"', source)
+        self.assertIn(
+            'cxlmemsim_build_deps=$ROOT/out/legofs-type3/results/cxlmemsim-build-debs.txt',
+            source,
+        )
         self.assertNotIn("--no-artifact-hashes", source)
         self.assertIn('fetch --depth=1 origin "$commit"', source)
         self.assertNotIn('git clone "$repository" "$directory"', source)

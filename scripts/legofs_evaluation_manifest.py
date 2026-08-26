@@ -31,6 +31,7 @@ REQUIRED_BUILD_ARTIFACTS = (
     "io500_result_export",
     "dependency_versions",
     "libpmem_build",
+    "cxlmemsim_build_deps",
     "isa_gate",
 )
 MODE_BUILD_ARTIFACTS = {

@@ -31,6 +31,19 @@ PMEM_SYSROOT="${OUT}/toolchain/libpmem-amd64"
 PMEM_DEV_DEB="${PMEM_DEB_CACHE}/libpmem-dev_${PMEM_DEB_VERSION}_amd64.deb"
 PMEM_RUNTIME_DEB="${PMEM_DEB_CACHE}/libpmem1_${PMEM_DEB_VERSION}_amd64.deb"
 PMEM_MANIFEST="${RESULTS}/libpmem-debs.txt"
+SPDLOG_DEB_VERSION=1:1.12.0+ds-2build1
+SPDLOG_DEV_SHA256=850b97a93e252c1d2f9d8e9f59cac919015efb56241138098637f84a188ae3a0
+SPDLOG_RUNTIME_SHA256=e69e315e1596b6cf97a714ae797e55d42765664a739a0b30beac35164a4edaff
+FMT_DEB_VERSION=9.1.0+ds1-2
+FMT_DEV_SHA256=cc05cae4b7c6e541b6871e3333329605c0d90312a852f2c3b507ad5c30dd9914
+FMT_RUNTIME_SHA256=0a9dd337aea7ae59aba44994a92dd2780365b534a714518477c4e906f0efd297
+CXL_DEB_CACHE="${ROOT}/target/download-cache/cxlmemsim"
+CXL_DEPS_SYSROOT="${OUT}/toolchain/cxlmemsim-amd64"
+SPDLOG_DEV_DEB="${CXL_DEB_CACHE}/libspdlog-dev_1%3a1.12.0+ds-2build1_amd64.deb"
+SPDLOG_RUNTIME_DEB="${CXL_DEB_CACHE}/libspdlog1.12_1%3a1.12.0+ds-2build1_amd64.deb"
+FMT_DEV_DEB="${CXL_DEB_CACHE}/libfmt-dev_${FMT_DEB_VERSION}_amd64.deb"
+FMT_RUNTIME_DEB="${CXL_DEB_CACHE}/libfmt9_${FMT_DEB_VERSION}_amd64.deb"
+CXL_DEPS_MANIFEST="${RESULTS}/cxlmemsim-build-debs.txt"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 die()
@@ -233,10 +246,54 @@ qemu_configure_args=(
 )
 ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
 
+printf '%s\n' '[legofs-build] pinned CXLMemSim build dependencies'
+mkdir -p "${CXL_DEB_CACHE}" "${CXL_DEPS_SYSROOT}"
+if [[ ! -f "${SPDLOG_DEV_DEB}" ]]; then
+	(cd "${CXL_DEB_CACHE}" && apt-get download "libspdlog-dev=${SPDLOG_DEB_VERSION}")
+fi
+if [[ ! -f "${SPDLOG_RUNTIME_DEB}" ]]; then
+	(cd "${CXL_DEB_CACHE}" && apt-get download "libspdlog1.12=${SPDLOG_DEB_VERSION}")
+fi
+if [[ ! -f "${FMT_DEV_DEB}" ]]; then
+	(cd "${CXL_DEB_CACHE}" && apt-get download "libfmt-dev=${FMT_DEB_VERSION}")
+fi
+if [[ ! -f "${FMT_RUNTIME_DEB}" ]]; then
+	(cd "${CXL_DEB_CACHE}" && apt-get download "libfmt9=${FMT_DEB_VERSION}")
+fi
+printf '%s  %s\n' "${SPDLOG_DEV_SHA256}" "${SPDLOG_DEV_DEB}" | sha256sum -c -
+printf '%s  %s\n' "${SPDLOG_RUNTIME_SHA256}" "${SPDLOG_RUNTIME_DEB}" | sha256sum -c -
+printf '%s  %s\n' "${FMT_DEV_SHA256}" "${FMT_DEV_DEB}" | sha256sum -c -
+printf '%s  %s\n' "${FMT_RUNTIME_SHA256}" "${FMT_RUNTIME_DEB}" | sha256sum -c -
+cxl_deps_stamp="spdlog=${SPDLOG_DEB_VERSION} fmt=${FMT_DEB_VERSION} spdlog_dev=${SPDLOG_DEV_SHA256} spdlog_runtime=${SPDLOG_RUNTIME_SHA256} fmt_dev=${FMT_DEV_SHA256} fmt_runtime=${FMT_RUNTIME_SHA256}"
+if [[ ! -f "${CXL_DEPS_SYSROOT}/.complete" ]] ||
+	[[ "$(<"${CXL_DEPS_SYSROOT}/.complete")" != "${cxl_deps_stamp}" ]]; then
+	dpkg-deb -x "${SPDLOG_RUNTIME_DEB}" "${CXL_DEPS_SYSROOT}"
+	dpkg-deb -x "${SPDLOG_DEV_DEB}" "${CXL_DEPS_SYSROOT}"
+	dpkg-deb -x "${FMT_RUNTIME_DEB}" "${CXL_DEPS_SYSROOT}"
+	dpkg-deb -x "${FMT_DEV_DEB}" "${CXL_DEPS_SYSROOT}"
+	printf '%s\n' "${cxl_deps_stamp}" > "${CXL_DEPS_SYSROOT}/.complete"
+fi
+[[ -f "${CXL_DEPS_SYSROOT}/usr/lib/x86_64-linux-gnu/cmake/spdlog/spdlogConfig.cmake" ]] ||
+	die 'pinned spdlog CMake package is missing'
+[[ -f "${CXL_DEPS_SYSROOT}/usr/lib/x86_64-linux-gnu/cmake/fmt/fmt-config.cmake" ]] ||
+	die 'pinned fmt CMake package is missing'
+printf '%s\n' \
+	"spdlog_version=${SPDLOG_DEB_VERSION}" \
+	"spdlog_dev_sha256=${SPDLOG_DEV_SHA256}" \
+	"spdlog_runtime_sha256=${SPDLOG_RUNTIME_SHA256}" \
+	"fmt_version=${FMT_DEB_VERSION}" \
+	"fmt_dev_sha256=${FMT_DEV_SHA256}" \
+	"fmt_runtime_sha256=${FMT_RUNTIME_SHA256}" \
+	> "${CXL_DEPS_MANIFEST}"
+
 printf '%s\n' '[legofs-build] CXLMemSim MESI-v2 server'
 cmake --fresh -U RDMACM_LIB -U IBVERBS_LIB \
 	-S "${ROOT}/components/cxlmemsim" -B "${BUILD}/cxlmemsim" \
-	-DCMAKE_BUILD_TYPE=Release
+	-DCMAKE_BUILD_TYPE=Release \
+	-DCMAKE_PREFIX_PATH="${CXL_DEPS_SYSROOT}/usr" \
+	-DCXLMEMSIM_BUILD_MICROBENCHMARKS=OFF \
+	-DCXLMEMSIM_ENABLE_RDMA=OFF \
+	-DCXLMEMSIM_ENABLE_SLUGALLOCATOR=OFF
 cmake --build "${BUILD}/cxlmemsim" --target cxlmemsim_server \
 	--parallel "${JOBS}"
 
@@ -314,6 +371,7 @@ python3 "${ROOT}/scripts/write_manifest.py" \
 	--artifact "badfs_server=${badfs_server}" \
 	--artifact "badfs_bench=${badfs_bench}" \
 	--artifact "cxlmemsim_server=${cxlmemsim_server}" \
-	--artifact "libpmem_build=${PMEM_MANIFEST}"
+	--artifact "libpmem_build=${PMEM_MANIFEST}" \
+	--artifact "cxlmemsim_build_deps=${CXL_DEPS_MANIFEST}"
 
 printf '%s\n' "[legofs-build] manifest ${RESULTS}/build-manifest.json"
