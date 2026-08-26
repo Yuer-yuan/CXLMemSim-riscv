@@ -105,6 +105,11 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertIn('--source "legofs=${LEGOFS_SOURCE_ROOT}"', source)
         self.assertIn("--enable-libpmem", source)
         self.assertIn("--enable-slirp", source)
+        self.assertIn(
+            "SLIRP_COMMIT=26be815b86e8d49add8c9a8b320239b9594ff03d",
+            source,
+        )
+        self.assertIn('fetch --depth=1 origin "${SLIRP_COMMIT}"', source)
         self.assertIn("--no-artifact-hashes", source)
         self.assertNotIn('${ROOT}/../..', source)
         self.assertIn('--compiler "qemu=${qemu} --version"', source)

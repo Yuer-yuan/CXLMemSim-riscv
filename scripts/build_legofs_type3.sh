@@ -13,6 +13,8 @@ CARGO_TARGET="${BUILD}/cargo"
 LEGOFS_BIN="${BUILD}/legofs-bin"
 CROSS_COMPILE="${CROSS_COMPILE:-riscv64-linux-gnu-}"
 RUST_TARGET="riscv64gc-unknown-linux-musl"
+SLIRP_REPOSITORY=https://gitlab.freedesktop.org/slirp/libslirp.git
+SLIRP_COMMIT=26be815b86e8d49add8c9a8b320239b9594ff03d
 MUSL_VERSION=1.2.5
 MUSL_SHA256=a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
 MUSL_SOURCE_ROOT="${OUT}/toolchain-src"
@@ -51,7 +53,7 @@ legofs_git_root="$(git -C "${LEGOFS_SOURCE_ROOT}" rev-parse --show-toplevel 2>/d
 [[ "$(cd -- "${legofs_git_root}" && pwd -P)" == "${LEGOFS_SOURCE_ROOT}" ]] ||
 	die "LegoFS component path is not its Git worktree root: ${LEGOFS_SOURCE_ROOT}"
 
-for command in cargo rustc "${CROSS_COMPILE}gcc" \
+for command in cargo rustc git "${CROSS_COMPILE}gcc" \
 	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" cmake ninja make mke2fs \
 	debugfs truncate python3 wget sha256sum tar install stat cmp; do
 	command -v "${command}" >/dev/null || die "required command is missing: ${command}"
@@ -155,6 +157,21 @@ cmp "${badfs_server}" "${verify_server}" || die 'badfs-server ext2 payload is in
 cmp "${badfs_bench}" "${verify_bench}" || die 'badfs-bench ext2 payload is incomplete'
 
 printf '%s\n' '[legofs-build] QEMU riscv64-softmmu with Type-3 MESI v2 BI'
+slirp_source="${ROOT}/components/qemu/subprojects/slirp"
+if [[ ! -d "${slirp_source}/.git" ]]; then
+	[[ ! -e "${slirp_source}" ]] ||
+		die "QEMU slirp source exists but is not a Git checkout: ${slirp_source}"
+	git init "${slirp_source}"
+	git -C "${slirp_source}" remote add origin "${SLIRP_REPOSITORY}"
+fi
+[[ "$(git -C "${slirp_source}" remote get-url origin)" == "${SLIRP_REPOSITORY}" ]] ||
+	die 'QEMU slirp repository mismatch'
+if ! git -C "${slirp_source}" cat-file -e "${SLIRP_COMMIT}^{commit}" 2>/dev/null; then
+	git -C "${slirp_source}" fetch --depth=1 origin "${SLIRP_COMMIT}"
+fi
+git -C "${slirp_source}" checkout --detach "${SLIRP_COMMIT}"
+[[ "$(git -C "${slirp_source}" rev-parse HEAD)" == "${SLIRP_COMMIT}" ]] ||
+	die 'QEMU slirp commit mismatch'
 qemu_configure_args=(
 	--target-list=riscv64-softmmu
 	--disable-docs
