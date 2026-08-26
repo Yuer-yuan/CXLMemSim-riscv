@@ -177,10 +177,39 @@ class EvaluationManifestTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot change"):
             self.build(enabled_phases=[], stonewall_seconds=None, mdtest_items=4)
 
-    def test_smoke_config_cannot_authorize_a_stage(self):
+    def test_smoke_config_is_digest_closed_but_cannot_authorize_a_stage(self):
         smoke = self.root / "io500-tiny.ini"
-        smoke.write_text(self.source.read_text(encoding="utf-8"), encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "io500-standard.ini"):
+        sections = []
+        for section in self.module.RUN_SECTIONS:
+            sections.append(
+                f"[{section}]\nrun = "
+                + ("TRUE" if section in {"mdtest-easy", "mdtest-easy-write"} else "FALSE")
+                + "\n"
+            )
+        smoke.write_text(
+            "[global]\nscc = TRUE\n\n[debug]\nstonewall-time = 1\n\n"
+            + "\n".join(sections),
+            encoding="utf-8",
+        )
+        manifest = self.build(
+            source_config=smoke,
+            enabled_phases=[],
+            stonewall_seconds=None,
+            mdtest_items=None,
+        )
+        self.assertEqual(manifest["classification"], "diagnostic-custom-shape")
+        self.assertFalse(manifest["official_parameter_shape"])
+        self.assertFalse(manifest["official_candidate"])
+        self.assertTrue(manifest["allowed_derivation"]["source_bytes_preserved"])
+        self.assertEqual(
+            (self.root / "effective.ini").read_bytes(),
+            smoke.read_bytes(),
+        )
+
+    def test_custom_diagnostic_cannot_be_silently_rewritten(self):
+        smoke = self.root / "io500-tiny.ini"
+        smoke.write_text("[global]\nscc = TRUE\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "cannot be modified"):
             self.build(source_config=smoke)
 
     def test_build_artifact_hash_mismatch_fails_closed(self):

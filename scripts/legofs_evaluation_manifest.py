@@ -213,6 +213,35 @@ def validate_standard_source(
         raise ValueError("pinned standard config must keep 300-second stonewall")
 
 
+def parse_config_bool(value: str | None, *, section: str) -> bool:
+    if value is None:
+        raise ValueError(f"diagnostic config must explicitly set {section}.run")
+    normalized = value.upper()
+    if normalized == "TRUE":
+        return True
+    if normalized == "FALSE":
+        return False
+    raise ValueError(f"diagnostic config has invalid {section}.run={value}")
+
+
+def configured_phases(
+    parser: configparser.ConfigParser,
+    mode_order: Iterable[str],
+) -> tuple[str, ...]:
+    enabled = []
+    for phase in mode_order:
+        phase_enabled = parse_config_bool(option(parser, phase, "run"), section=phase)
+        group = PHASE_GROUP.get(phase)
+        group_enabled = (
+            parse_config_bool(option(parser, group, "run"), section=group)
+            if group is not None
+            else True
+        )
+        if phase_enabled and group_enabled:
+            enabled.append(phase)
+    return tuple(enabled)
+
+
 def derive_profile(
     source: pathlib.Path,
     enabled_phases: Iterable[str],
@@ -227,7 +256,6 @@ def derive_profile(
     str,
 ]:
     parser = read_config(source)
-    validate_standard_source(source, parser)
     if io500_mode not in IO500_MODES:
         raise ValueError(f"unsupported IO500 mode: {io500_mode}")
     mode_order = IO500_MODES[io500_mode]
@@ -240,6 +268,25 @@ def derive_profile(
         raise ValueError(
             f"phase(s) require IO500 extended mode: {', '.join(unavailable)}"
         )
+    if source.name != "io500-standard.ini":
+        if requested or stonewall_seconds is not None or mdtest_items is not None:
+            raise ValueError(
+                "custom diagnostic configs cannot be modified by the manifest tool"
+            )
+        phases = configured_phases(parser, mode_order)
+        if not phases:
+            raise ValueError("custom diagnostic config enables no IO500 phases")
+        phase_set = set(phases)
+        for phase in phases:
+            missing = set(PHASE_PREREQUISITES.get(phase, ())) - phase_set
+            if missing:
+                raise ValueError(
+                    f"diagnostic config phase {phase} lacks prerequisite(s): "
+                    + ", ".join(sorted(missing))
+                )
+        return parser, phases, phases, "diagnostic-custom-shape"
+
+    validate_standard_source(source, parser)
     if not requested:
         if stonewall_seconds is not None or mdtest_items is not None:
             raise ValueError(
@@ -441,7 +488,11 @@ def build_evaluation_manifest(
         stonewall_seconds=stonewall_seconds,
         mdtest_items=mdtest_items,
     )
-    rendered = config_bytes(parser)
+    rendered = (
+        config_bytes(parser)
+        if classification == "diagnostic-upstream-shape"
+        else source_config.read_bytes()
+    )
     build_identity, artifacts = resolve_artifacts(
         build_manifest,
         filesystem_mode,
@@ -466,7 +517,12 @@ def build_evaluation_manifest(
             "sha256": hashlib.sha256(rendered).hexdigest(),
         },
         "allowed_derivation": {
-            "run_flags_only": True,
+            "source_bytes_preserved": (
+                classification != "diagnostic-upstream-shape"
+            ),
+            "run_flags_rewritten": (
+                classification == "diagnostic-upstream-shape"
+            ),
             "stonewall_seconds": stonewall_seconds,
             "mdtest_items": mdtest_items,
             "transfer_size_changed": False,
