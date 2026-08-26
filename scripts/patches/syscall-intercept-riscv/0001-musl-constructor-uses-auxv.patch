@@ -1,0 +1,16 @@
+diff --git a/src/intercept.c b/src/intercept.c
+--- a/src/intercept.c
++++ b/src/intercept.c
+@@ -492,10 +492,9 @@ mprotect_asm_wrappers(void)
+  * statically with libsyscall_intercept.
+  */
+ static __attribute__((constructor)) void
+-intercept(int argc, char **argv)
++intercept(void)
+ {
+-	(void) argc;
+-	cmdline = argv[0];
++	cmdline = (const char *)(uintptr_t)getauxval(AT_EXECFN);
+ 
+ 	if (!syscall_hook_in_process_allowed())
+ 		return;

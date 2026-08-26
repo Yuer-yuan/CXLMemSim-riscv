@@ -27,6 +27,13 @@ SYSINT_MUSL_LIBC_PATCH = (
     / "syscall-intercept-riscv"
     / "0002-musl-loader-is-libc.patch"
 )
+SYSINT_PREBUILT_CAPSTONE_PATCH = (
+    ROOT
+    / "scripts"
+    / "patches"
+    / "syscall-intercept-riscv"
+    / "0003-prebuilt-capstone-c-only.patch"
+)
 MUSL_HOTPATCH_PADDING_PATCH = (
     ROOT
     / "scripts"
@@ -549,6 +556,22 @@ class Io500RuntimeTest(unittest.TestCase):
             "syscall_intercept_manifest=$SYSINT_BUILD_ROOT/manifest.txt",
             io500_builder,
         )
+
+    def test_syscall_interceptor_uses_pinned_c_only_riscv_capstone(self):
+        builder = SYSINT_BUILD_SCRIPT.read_text(encoding="utf-8")
+        patch = SYSINT_PREBUILT_CAPSTONE_PATCH.read_text(encoding="utf-8")
+
+        self.assertIn('archive --format=tar "$CAPSTONE_COMMIT"', builder)
+        self.assertIn("CAPSTONE_ARCHS=riscv", builder)
+        self.assertIn("CAPSTONE_BUILD_CORE_ONLY=yes", builder)
+        self.assertIn("CAPSTONE_STATIC=yes", builder)
+        self.assertIn("CAPSTONE_SHARED=no", builder)
+        self.assertIn("-DBUILD_CPP_TEST=OFF", builder)
+        self.assertIn("-DUSE_PREBUILT_CAPSTONE=ON", builder)
+        self.assertNotIn("RISCV_CXX", builder)
+        self.assertIn("+option(BUILD_CPP_TEST", patch)
+        self.assertIn("+option(USE_PREBUILT_CAPSTONE", patch)
+        self.assertIn('"${PREBUILT_CAPSTONE_LIBRARY}"', patch)
 
     def test_musl_ecalls_have_reproducible_hotpatch_padding_gate(self):
         builder = BUILD_SCRIPT.read_text(encoding="utf-8")

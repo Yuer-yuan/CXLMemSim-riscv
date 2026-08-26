@@ -1,0 +1,21 @@
+diff --git a/src/intercept.c b/src/intercept.c
+--- a/src/intercept.c
++++ b/src/intercept.c
+@@ -361,6 +361,7 @@ should_patch_object(uintptr_t addr, const char *path)
+ 
+ 	static const char libc[] = "libc";
+ 	static const char pthr[] = "libpthread";
++	static const char musl[] = "ld-musl-";
+ 	static const char caps[] = "libcapstone";
+ 
+ 	if (is_vdso(addr, path)) {
+@@ -385,7 +386,8 @@ should_patch_object(uintptr_t addr, const char *path)
+ 		return false;
+ 	}
+ 
+-	if (str_match(name, len, libc)) {
++	if (str_match(name, len, libc) ||
++		strncmp(name, musl, sizeof(musl) - 1) == 0) {
+ 		debug_dump(" - libc found\n");
+ 		libc_found = true;
+ 		return true;
