@@ -73,7 +73,11 @@ class RdwoClosureTest(unittest.TestCase):
         self.assertIn("d-before-v", source)
         self.assertIn("bootstrap-template-not-serving", source)
         self.assertIn('rdwo_closure=$RDWO_CLOSURE', source)
-        self.assertIn('rdwo_engine_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-engine.manifest', source)
+        self.assertIn('product_engine_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-engine.manifest', source)
+        self.assertIn(
+            'product_capability_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-capabilities.manifest',
+            source,
+        )
 
 
 if __name__ == "__main__":

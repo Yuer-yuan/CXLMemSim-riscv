@@ -785,8 +785,8 @@ python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--artifact "rdwo_server=$PAYLOAD_ROOT/bin/badfs-rdwo-server" \
 	--artifact "rdwo_host_agent=$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent" \
 	--artifact "rdwo_intercept=$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so" \
-	--artifact "rdwo_engine_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-engine.manifest" \
-	--artifact "rdwo_capability_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-capabilities.manifest" \
+	--artifact "product_engine_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-engine.manifest" \
+	--artifact "product_capability_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-capabilities.manifest" \
 	--artifact "rdwo_closure=$RDWO_CLOSURE" \
 	--artifact "rdwo_cargo_tree=$RDWO_CARGO_TREE" \
 	--artifact "rdwo_source_identity=$RDWO_SOURCE_IDENTITY" \
