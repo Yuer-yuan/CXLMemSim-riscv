@@ -127,6 +127,11 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertNotIn("--no-artifact-hashes", source)
         self.assertIn('fetch --depth=1 origin "$commit"', source)
         self.assertNotIn('git clone "$repository" "$directory"', source)
+        self.assertIn(
+            'fetch --depth=1 --filter=blob:none origin "$LLVM_COMMIT"',
+            source,
+        )
+        self.assertNotIn("git clone --filter=blob:none --no-checkout", source)
 
     def test_linked_rust_toolchain_uses_its_actual_sysroot_target(self):
         for path in (BUILD, ROOT / "scripts/build_legofs_io500.sh"):

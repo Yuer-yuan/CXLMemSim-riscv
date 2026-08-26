@@ -114,14 +114,18 @@ ensure_checkout BusyBox "$BUSYBOX_REPOSITORY" "$BUSYBOX_COMMIT" "$SOURCES/busybo
 LLVM_SOURCE="$SOURCES/llvm-project"
 if [ ! -d "$LLVM_SOURCE/.git" ]; then
 	[ ! -e "$LLVM_SOURCE" ] || die "LLVM source exists but is not a Git checkout: $LLVM_SOURCE"
-	git clone --filter=blob:none --no-checkout "$LLVM_REPOSITORY" "$LLVM_SOURCE"
-	git -C "$LLVM_SOURCE" sparse-checkout init --cone
-	git -C "$LLVM_SOURCE" sparse-checkout set \
-		cmake llvm/cmake llvm/utils/llvm-lit runtimes libunwind compiler-rt
-	git -C "$LLVM_SOURCE" checkout --detach "$LLVM_COMMIT"
+	git init "$LLVM_SOURCE"
+	git -C "$LLVM_SOURCE" remote add origin "$LLVM_REPOSITORY"
 fi
 [ "$(git -C "$LLVM_SOURCE" remote get-url origin)" = "$LLVM_REPOSITORY" ] ||
 	die 'LLVM repository mismatch'
+if ! git -C "$LLVM_SOURCE" cat-file -e "${LLVM_COMMIT}^{commit}" 2>/dev/null; then
+	git -C "$LLVM_SOURCE" fetch --depth=1 --filter=blob:none origin "$LLVM_COMMIT"
+fi
+git -C "$LLVM_SOURCE" sparse-checkout init --cone
+git -C "$LLVM_SOURCE" sparse-checkout set \
+	cmake llvm/cmake llvm/utils/llvm-lit runtimes libunwind compiler-rt
+git -C "$LLVM_SOURCE" checkout --detach "$LLVM_COMMIT"
 [ "$(git -C "$LLVM_SOURCE" rev-parse HEAD)" = "$LLVM_COMMIT" ] ||
 	die 'LLVM commit mismatch'
 if [ ! -d "$LLVM_SOURCE/compiler-rt" ]; then
@@ -131,10 +135,15 @@ for path in cmake llvm/cmake llvm/utils/llvm-lit runtimes libunwind compiler-rt;
 	[ -d "$LLVM_SOURCE/$path" ] || die "LLVM sparse checkout lacks: $path"
 done
 if [ ! -d "$SOURCES/capstone.git" ]; then
-	git clone --mirror "$CAPSTONE_REPOSITORY" "$SOURCES/capstone.git"
+	git init --bare "$SOURCES/capstone.git"
+	git --git-dir="$SOURCES/capstone.git" remote add origin "$CAPSTONE_REPOSITORY"
 fi
 [ "$(git --git-dir="$SOURCES/capstone.git" remote get-url origin)" = "$CAPSTONE_REPOSITORY" ] ||
 	die 'Capstone mirror repository mismatch'
+if ! git --git-dir="$SOURCES/capstone.git" \
+	cat-file -e "${CAPSTONE_COMMIT}^{commit}" 2>/dev/null; then
+	git --git-dir="$SOURCES/capstone.git" fetch --depth=1 origin "$CAPSTONE_COMMIT"
+fi
 git --git-dir="$SOURCES/capstone.git" cat-file -e "${CAPSTONE_COMMIT}^{commit}" ||
 	die 'Capstone mirror lacks the pinned commit'
 
