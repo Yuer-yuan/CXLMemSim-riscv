@@ -114,6 +114,11 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertIn("PMEM_DEV_SHA256=f710b78c", source)
         self.assertIn("PMEM_RUNTIME_SHA256=8f1be1cc", source)
         self.assertIn("pkg-config --modversion libpmem", source)
+        self.assertIn("pkg-config --variable=libdir libpmem", source)
+        self.assertIn(
+            's|^libdir=/usr/lib/x86_64-linux-gnu$|libdir=${pmem_libdir}|',
+            source,
+        )
         self.assertIn('libpmem_build=${PMEM_MANIFEST}', source)
         self.assertIn("--no-artifact-hashes", source)
         self.assertNotIn('${ROOT}/../..', source)

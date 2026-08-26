@@ -182,15 +182,22 @@ if [[ ! -f "${PMEM_SYSROOT}/.complete" ]] ||
 	printf '%s\n' "${pmem_stamp}" > "${PMEM_SYSROOT}/.complete"
 fi
 mkdir -p "${PMEM_SYSROOT}/pkgconfig"
-sed "s|^prefix=/usr$|prefix=${PMEM_SYSROOT}/usr|" \
+pmem_libdir="${PMEM_SYSROOT}/usr/lib/x86_64-linux-gnu"
+sed \
+	-e "s|^prefix=/usr$|prefix=${PMEM_SYSROOT}/usr|" \
+	-e "s|^libdir=/usr/lib/x86_64-linux-gnu$|libdir=${pmem_libdir}|" \
 	"${PMEM_SYSROOT}/usr/lib/x86_64-linux-gnu/pkgconfig/libpmem.pc" \
 	> "${PMEM_SYSROOT}/pkgconfig/libpmem.pc.tmp"
 mv "${PMEM_SYSROOT}/pkgconfig/libpmem.pc.tmp" \
 	"${PMEM_SYSROOT}/pkgconfig/libpmem.pc"
 export PKG_CONFIG_PATH="${PMEM_SYSROOT}/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
-export LD_LIBRARY_PATH="${PMEM_SYSROOT}/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export LD_LIBRARY_PATH="${pmem_libdir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 [[ "$(pkg-config --modversion libpmem)" == 1.13.1 ]] ||
 	die 'pinned libpmem pkg-config identity mismatch'
+[[ "$(pkg-config --variable=libdir libpmem)" == "${pmem_libdir}" ]] ||
+	die 'pinned libpmem pkg-config library path escaped its sysroot'
+[[ -e "${pmem_libdir}/libpmem.so" ]] ||
+	die 'pinned libpmem linker input is missing'
 printf '%s\n' \
 	"version=${PMEM_DEB_VERSION}" \
 	"libpmem_dev_sha256=${PMEM_DEV_SHA256}" \
