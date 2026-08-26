@@ -32,6 +32,7 @@ REQUIRED_BUILD_ARTIFACTS = (
     "dependency_versions",
     "libpmem_build",
     "cxlmemsim_build_deps",
+    "uboot_build_deps",
     "isa_gate",
 )
 MODE_BUILD_ARTIFACTS = {

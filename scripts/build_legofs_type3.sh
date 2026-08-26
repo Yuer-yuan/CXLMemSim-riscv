@@ -44,6 +44,12 @@ SPDLOG_RUNTIME_DEB="${CXL_DEB_CACHE}/libspdlog1.12_1%3a1.12.0+ds-2build1_amd64.d
 FMT_DEV_DEB="${CXL_DEB_CACHE}/libfmt-dev_${FMT_DEB_VERSION}_amd64.deb"
 FMT_RUNTIME_DEB="${CXL_DEB_CACHE}/libfmt9_${FMT_DEB_VERSION}_amd64.deb"
 CXL_DEPS_MANIFEST="${RESULTS}/cxlmemsim-build-debs.txt"
+SWIG_DEB_VERSION=4.2.0-2ubuntu1
+SWIG_DEB_SHA256=5925dc6e25348bdb350c44a9157da350ef608666b2a21f7057222e8b6aebd61d
+UBOOT_DEB_CACHE="${ROOT}/target/download-cache/uboot"
+SWIG_SYSROOT="${OUT}/toolchain/swig-amd64"
+SWIG_DEB="${UBOOT_DEB_CACHE}/swig_${SWIG_DEB_VERSION}_amd64.deb"
+UBOOT_DEPS_MANIFEST="${RESULTS}/uboot-build-debs.txt"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 die()
@@ -301,6 +307,27 @@ printf '%s\n' '[legofs-build] OpenSBI and CXL U-Boot'
 make -C "${ROOT}/components/opensbi" O="${BUILD}/opensbi" \
 	CROSS_COMPILE="${CROSS_COMPILE}" PLATFORM=generic \
 	'platform-cflags-y=-std=gnu11' -j "${JOBS}"
+mkdir -p "${UBOOT_DEB_CACHE}" "${SWIG_SYSROOT}"
+if [[ ! -f "${SWIG_DEB}" ]]; then
+	(cd "${UBOOT_DEB_CACHE}" && apt-get download "swig=${SWIG_DEB_VERSION}")
+fi
+printf '%s  %s\n' "${SWIG_DEB_SHA256}" "${SWIG_DEB}" | sha256sum -c -
+swig_stamp="version=${SWIG_DEB_VERSION} sha256=${SWIG_DEB_SHA256}"
+if [[ ! -f "${SWIG_SYSROOT}/.complete" ]] ||
+	[[ "$(<"${SWIG_SYSROOT}/.complete")" != "${swig_stamp}" ]]; then
+	dpkg-deb -x "${SWIG_DEB}" "${SWIG_SYSROOT}"
+	printf '%s\n' "${swig_stamp}" > "${SWIG_SYSROOT}/.complete"
+fi
+mkdir -p "${SWIG_SYSROOT}/bin"
+ln -sfn "${SWIG_SYSROOT}/usr/bin/swig4.0" "${SWIG_SYSROOT}/bin/swig"
+export PATH="${SWIG_SYSROOT}/bin:${PATH}"
+export SWIG_LIB="${SWIG_SYSROOT}/usr/share/swig4.0"
+swig -version | grep -Fq 'SWIG Version 4.2.0' ||
+	die 'pinned SWIG identity mismatch'
+printf '%s\n' \
+	"swig_version=${SWIG_DEB_VERSION}" \
+	"swig_sha256=${SWIG_DEB_SHA256}" \
+	> "${UBOOT_DEPS_MANIFEST}"
 make -C "${ROOT}/components/u-boot" O="${BUILD}/u-boot" \
 	CROSS_COMPILE="${CROSS_COMPILE}" sifive_unleashed_qemu_cxl_defconfig
 python3 "${ROOT}/scripts/prepare_uboot_pylibfdt.py" \
@@ -372,6 +399,7 @@ python3 "${ROOT}/scripts/write_manifest.py" \
 	--artifact "badfs_bench=${badfs_bench}" \
 	--artifact "cxlmemsim_server=${cxlmemsim_server}" \
 	--artifact "libpmem_build=${PMEM_MANIFEST}" \
-	--artifact "cxlmemsim_build_deps=${CXL_DEPS_MANIFEST}"
+	--artifact "cxlmemsim_build_deps=${CXL_DEPS_MANIFEST}" \
+	--artifact "uboot_build_deps=${UBOOT_DEPS_MANIFEST}"
 
 printf '%s\n' "[legofs-build] manifest ${RESULTS}/build-manifest.json"

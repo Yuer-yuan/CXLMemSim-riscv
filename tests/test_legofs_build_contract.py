@@ -127,6 +127,10 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertIn("-DCXLMEMSIM_ENABLE_RDMA=OFF", source)
         self.assertIn("-DCXLMEMSIM_ENABLE_SLUGALLOCATOR=OFF", source)
         self.assertIn('cxlmemsim_build_deps=${CXL_DEPS_MANIFEST}', source)
+        self.assertIn("SWIG_DEB_VERSION=4.2.0-2ubuntu1", source)
+        self.assertIn("SWIG_DEB_SHA256=5925dc6e", source)
+        self.assertIn("SWIG_LIB=", source)
+        self.assertIn('uboot_build_deps=${UBOOT_DEPS_MANIFEST}', source)
         self.assertIn("--no-artifact-hashes", source)
         self.assertNotIn('${ROOT}/../..', source)
         self.assertIn('--compiler "qemu=${qemu} --version"', source)
@@ -148,6 +152,10 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertIn('--source "legofs=$LEGOFS_ROOT"', source)
         self.assertIn(
             'cxlmemsim_build_deps=$ROOT/out/legofs-type3/results/cxlmemsim-build-debs.txt',
+            source,
+        )
+        self.assertIn(
+            'uboot_build_deps=$ROOT/out/legofs-type3/results/uboot-build-debs.txt',
             source,
         )
         self.assertNotIn("--no-artifact-hashes", source)
