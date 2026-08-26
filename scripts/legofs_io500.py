@@ -702,6 +702,34 @@ def wait_log(path: pathlib.Path, marker: str, process, timeout: int) -> None:
     raise TimeoutError(f"timed out waiting for {marker!r}")
 
 
+def wait_guest_marker(
+    console: Console, marker: str, timeout: int, start: int = 0
+) -> None:
+    """Wait for guest readiness while treating a guest fatal as terminal."""
+    deadline = time.monotonic() + timeout
+    with console.condition:
+        while True:
+            stage_output = console.output[start:]
+            for fatal in MPI_FATAL_MARKERS:
+                if fatal in stage_output:
+                    line = stage_output[stage_output.index(fatal):].splitlines()[0]
+                    raise RuntimeError(
+                        f"guest reported fatal marker {line!r} while waiting "
+                        f"for {marker!r}"
+                    )
+            if marker in stage_output:
+                return
+            if console.process.poll() is not None:
+                raise RuntimeError(
+                    f"QEMU exited with {console.process.returncode} while waiting "
+                    f"for {marker!r}"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for {marker!r}")
+            console.condition.wait(min(remaining, 0.5))
+
+
 def boot_guest(
     console: Console,
     paths: Paths,
@@ -1714,18 +1742,20 @@ def execute(
             for future in server_boot_futures:
                 future.result()
         for server_index, console in enumerate(server_consoles):
-            console.wait(
+            wait_guest_marker(
+                console,
                 f"LEGOFS_IO500_CXL_READY role=server index={server_index}", timeout
             )
-            console.wait(f"mode={filesystem_mode} dax=", timeout)
-            console.wait(
+            wait_guest_marker(console, f"mode={filesystem_mode} dax=", timeout)
+            wait_guest_marker(
+                console,
                 f"LEGOFS_IO500_SERVER_READY index={server_index}", timeout
             )
             # `Console.wait` can return as soon as the index substring arrives,
             # before the rest of the serial line has been read. Wait for the
             # CXL-specific suffix as well so validation cannot race a partial
             # readiness marker.
-            console.wait("transport=cxl-dax-ring control_bytes=", timeout)
+            wait_guest_marker(console, "transport=cxl-dax-ring control_bytes=", timeout)
             ready_marker = re.search(
                 rf"LEGOFS_IO500_SERVER_READY index={server_index} [^\n]+",
                 console.output,
@@ -1775,9 +1805,13 @@ def execute(
             for future in boot_futures:
                 future.result()
         for index, console in enumerate(client_consoles):
-            console.wait(f"LEGOFS_IO500_CXL_READY role=client index={index}", timeout)
-            console.wait(f"LEGOFS_IO500_CLIENT_READY index={index}", timeout)
-            console.wait(f"mode={filesystem_mode}", timeout)
+            wait_guest_marker(
+                console, f"LEGOFS_IO500_CXL_READY role=client index={index}", timeout
+            )
+            wait_guest_marker(
+                console, f"LEGOFS_IO500_CLIENT_READY index={index}", timeout
+            )
+            wait_guest_marker(console, f"mode={filesystem_mode}", timeout)
 
         result["clock_sync"] = synchronize_guest_clocks(
             server_consoles, client_consoles, client_count=client_count

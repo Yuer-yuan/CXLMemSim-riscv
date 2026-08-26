@@ -789,6 +789,42 @@ class Io500RuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fatal marker"):
             self.runner.wait_mpi_exit(console, "tiny", timeout=3600, start=0)
 
+    def test_guest_readiness_fatal_is_reported_immediately(self):
+        class FakeProcess:
+            returncode = None
+
+            @staticmethod
+            def poll():
+                return None
+
+        class FakeConsole:
+            def __init__(self, output):
+                self.output = output
+                self.condition = threading.Condition()
+                self.process = FakeProcess()
+
+        console = FakeConsole(
+            "LEGOFS_IO500_FATAL step=server-exit rc=78\r\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "fatal marker"):
+            self.runner.wait_guest_marker(
+                console, "LEGOFS_IO500_SERVER_READY index=0", timeout=3600
+            )
+
+        console.output = (
+            "LEGOFS_IO500_SERVER_READY index=0\r\n"
+            "LEGOFS_IO500_FATAL step=server-exit rc=78\r\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "fatal marker"):
+            self.runner.wait_guest_marker(
+                console, "LEGOFS_IO500_SERVER_READY index=0", timeout=3600
+            )
+
+        console.output = "LEGOFS_IO500_SERVER_READY index=0\r\n"
+        self.runner.wait_guest_marker(
+            console, "LEGOFS_IO500_SERVER_READY index=0", timeout=1
+        )
+
     def test_verifier_exit_is_observed_immediately(self):
         class FakeProcess:
             returncode = None
