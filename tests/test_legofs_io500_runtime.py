@@ -10,6 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOP_LEVEL_RUNNER = ROOT / "run-legofs-io500.sh"
 RUNNER = ROOT / "scripts" / "legofs_io500.py"
 BUILD_SCRIPT = ROOT / "scripts" / "build_legofs_io500.sh"
+SYSINT_COMPAT_BUILD_SCRIPT = ROOT / "scripts" / "build_syscall_intercept_riscv.sh"
 PAYLOAD_REBUILD_SCRIPT = ROOT / "scripts" / "rebuild_legofs_io500_payload.sh"
 BOOTSTRAP_REBUILD_SCRIPT = ROOT / "scripts" / "rebuild_legofs_io500_bootstrap.sh"
 NOV_GCC = ROOT / "scripts" / "riscv64-nov-gcc"
@@ -574,7 +575,17 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("reject_glibc_versions", build)
         self.assertIn("-C panic=abort", build)
         self.assertIn(
-            'SYSINT_ROOT="$LEGOFS_TOOL_ROOT/syscall-intercept-riscv"',
+            'SYSINT_ROOT="$LEGOFS_ROOT/third_party/syscall-intercept-riscv"',
+            build,
+        )
+        self.assertIn(
+            '"$LEGOFS_ROOT/scripts/build-syscall-intercept-riscv.sh"',
+            build,
+        )
+        self.assertIn('SYSINT_MUSL_LIBC="$MUSL_PREFIX/lib/libc.so"', build)
+        self.assertNotIn("LEGOFS_TOOL_ROOT", build)
+        self.assertNotIn(
+            '"$ROOT/scripts/build_syscall_intercept_riscv.sh"',
             build,
         )
         self.assertIn(
@@ -584,6 +595,15 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("LLVM_COMMIT=87f0227cb60147a26a1eeb4fb06e3b505e9c7261", build)
         self.assertIn("/lib/ld-musl-riscv64.so.1", build)
         self.assertNotIn("/usr/riscv64-linux-gnu/lib/*.so", build)
+
+    def test_workspace_syscall_intercept_entry_forwards_to_legofs(self):
+        wrapper = SYSINT_COMPAT_BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "components/legofs/scripts/build-syscall-intercept-riscv.sh",
+            wrapper,
+        )
+        self.assertNotIn(".cxl-bi-tools", wrapper)
+        self.assertNotIn("cmake -S", wrapper)
 
     def test_payload_only_mode_is_explicit_and_mutually_exclusive(self):
         runner = TOP_LEVEL_RUNNER.read_text(encoding="utf-8")

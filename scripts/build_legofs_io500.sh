@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 LEGOFS_ROOT="${ROOT}/components/legofs"
-LEGOFS_TOOL_ROOT="${ROOT}/.cxl-bi-tools"
 TARGET_ROOT="${ROOT}/target/build/riscv-io500"
 SOURCES="${ROOT}/target/build/sources"
 PLATFORM="${TARGET_ROOT}/platform"
@@ -454,11 +453,12 @@ make -C "$IOR_SOURCE" distclean >/dev/null 2>&1 || true
 )
 
 printf '%s\n' '[io500-build] workspace RISC-V syscall interceptor'
-SYSINT_ROOT="$LEGOFS_TOOL_ROOT/syscall-intercept-riscv" \
+SYSINT_ROOT="$LEGOFS_ROOT/third_party/syscall-intercept-riscv" \
 SYSINT_CAPSTONE_MIRROR="$SOURCES/capstone.git" \
 SYSINT_BUILD_ROOT="$SYSINT_BUILD_ROOT" SYSINT_JOBS="$JOBS" \
+SYSINT_MUSL_LIBC="$MUSL_PREFIX/lib/libc.so" \
 RISCV_CC="$MUSL_CC" \
-	"$ROOT/scripts/build_syscall_intercept_riscv.sh"
+	"$LEGOFS_ROOT/scripts/build-syscall-intercept-riscv.sh"
 
 printf '%s\n' '[io500-build] LegoFS preload library and baseline static server tools'
 export CARGO_TARGET_DIR="$CARGO_TARGET"
