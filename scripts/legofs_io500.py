@@ -2,6 +2,7 @@
 """Run one or two LegoFS servers and independent RISC-V IO500 clients."""
 
 import argparse
+import hashlib
 import concurrent.futures
 import json
 import os
@@ -12,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -24,6 +26,8 @@ DEFAULT_COHERENCE_CACHE_MIB = 32
 DEFAULT_SSD_CACHE_MIB = 512
 ENDPOINT_BYTES = 64 * 1024**3
 FMW_SIZE = "64G"
+SERVING_MAX_LANES = 64
+RECOVERY_CONTROL_LANE_BASE = SERVING_MAX_LANES - 4
 DECODER_SIZE = "0000001000000000"
 HOST_DECODER = (
     "CXL host decoder0: HPA 0000001000000000 "
@@ -49,6 +53,13 @@ RANK_RE = re.compile(
 )
 SUMMARY_RE = re.compile(
     r"LEGOFS_IO500_POSIX_SUMMARY index=(\d+) file=(\S+) (\{[^\n]+\})"
+)
+CLEAN_RESTART_CONTROL_RE = re.compile(
+    r"badfs_clean_restart_control (\{[^\n]+\})"
+)
+EXPORT_SUMMARY_RE = re.compile(
+    r"LEGOFS_IO500_EXPORT_POSIX_SUMMARY endpoint=(\d+) file=(\S+) "
+    r"(\{[^\n]+\})"
 )
 MPI_FATAL_MARKERS = (
     "BADFS_STRICT_LIFECYCLE_DIRECT_INIT_FAILED",
@@ -264,8 +275,60 @@ def legofs_timing_breakdown(
     server_state_validation_ns = int(
         inspection.get("audit", {}).get("state_validation_ns", 0)
     )
+    transport_client = {
+        field: sum(
+            int(item.get("client_timing", {}).get(field, 0))
+            for record in summaries
+            for item in record.get("cxl_serving_evidence", [])
+        )
+        for field in (
+            "calls",
+            "call_gate_wait_ns",
+            "syscall_prepare_ns",
+            "sq_credit_wait_ns",
+            "sq_publish_ns",
+            "cq_wait_ns",
+        )
+    }
+    transport_authority = {
+        field: sum(
+            int(item.get("authority_timing", {}).get(field, 0))
+            for record in summaries
+            for item in record.get("cxl_serving_evidence", [])
+        )
+        for field in (
+            "sqe_consumed",
+            "cqe_published",
+            "authority_queue_wait_ns",
+            "dispatcher_backend_ns",
+            "cqe_publish_ns",
+        )
+    }
+    audit = inspection.get("audit", {})
+    metadata_wal_persist_ns = int(audit.get("metadata_wal_persist_ns", 0))
+    lifecycle_payload_persist_ns = int(
+        audit.get("direct_write_payload_persist_ns", 0)
+    )
+    lifecycle_state_persist_ns = int(audit.get("direct_write_state_persist_ns", 0))
+    arena_acquire = {
+        field: int(audit.get(field, 0))
+        for field in (
+            "arena_acquire_calls",
+            "arena_acquire_slots",
+            "arena_acquire_lock_wait_ns",
+            "arena_acquire_state_clone_ns",
+            "arena_acquire_allocation_plan_ns",
+            "arena_acquire_backend_reserve_ns",
+            "arena_acquire_state_build_ns",
+            "arena_acquire_state_validate_ns",
+            "arena_acquire_grant_install_ns",
+            "arena_acquire_state_persist_ns",
+            "arena_acquire_trace_ns",
+            "arena_acquire_total_ns",
+        )
+    }
     return {
-        "schema_version": "legofs.timing-breakdown.v1",
+        "schema_version": "legofs.timing-breakdown.v4",
         "client_timed_intervals": groups,
         "client_timed_intervals_ns": client_wait_ns,
         "aggregate_rank_wall_ns": rank_wall_ns,
@@ -286,9 +349,54 @@ def legofs_timing_breakdown(
         "server_state_validation_share_of_rank_wall": (
             server_state_validation_ns / rank_wall_ns if rank_wall_ns else 0.0
         ),
+        "transport_client": transport_client,
+        "transport_authority": transport_authority,
+        "arena_acquire": arena_acquire,
+        "persistence": {
+            "metadata_wal_persist_ns": metadata_wal_persist_ns,
+            "metadata_wal_persist_barriers": int(
+                audit.get("metadata_wal_persist_barriers", 0)
+            ),
+            "metadata_wal_persist_records": int(
+                audit.get("metadata_wal_persist_records", 0)
+            ),
+            "metadata_wal_persist_bytes": int(
+                audit.get("metadata_wal_persist_bytes", 0)
+            ),
+            "lifecycle_payload_persist_ns": lifecycle_payload_persist_ns,
+            "lifecycle_state_persist_ns": lifecycle_state_persist_ns,
+            "persistence_wait_ns": metadata_wal_persist_ns
+            + lifecycle_payload_persist_ns
+            + lifecycle_state_persist_ns,
+            "provider_persist_barriers": int(
+                audit.get("provider_persist_barriers", 0)
+            ),
+            "provider_persist_bytes": int(audit.get("provider_persist_bytes", 0)),
+            "provider_persist_ns": int(audit.get("provider_persist_ns", 0)),
+            "provider_payload_barriers": int(
+                audit.get("provider_payload_barriers", 0)
+            ),
+            "provider_payload_bytes": int(
+                audit.get("provider_payload_bytes", 0)
+            ),
+            "provider_allocator_barriers": int(
+                audit.get("provider_allocator_barriers", 0)
+            ),
+            "provider_allocator_bytes": int(
+                audit.get("provider_allocator_bytes", 0)
+            ),
+            "foreground_checkpoint_waits": int(
+                audit.get("foreground_checkpoint_waits", 0)
+            ),
+            "foreground_checkpoint_wait_ns": int(
+                audit.get("foreground_checkpoint_wait_ns", 0)
+            ),
+        },
+        "visibility_durability": audit.get("visibility_durability", {}),
         "interpretation": (
             "client values are summed elapsed RPC/control intervals across ranks; "
-            "server commit and validation are nested inside some client intervals and "
+            "transport and persistence intervals are separately accumulated and may be "
+            "nested or overlap across ranks, so they are not additive wall-time shares; "
             "none of these counters is CPU time"
         ),
     }
@@ -322,8 +430,24 @@ def verify_manifest(paths: Paths) -> dict:
         entry = manifest.get("artifacts", {}).get(name)
         if not path.is_file() or not isinstance(entry, dict):
             raise FileNotFoundError(f"missing manifested artifact: {name}")
-        if path.stat().st_size <= 0:
+        size = path.stat().st_size
+        if size <= 0:
             raise ValueError(f"empty build artifact: {name}")
+        recorded_path = pathlib.Path(str(entry.get("path", "")))
+        if not recorded_path.is_absolute():
+            recorded_path = paths.root / recorded_path
+        if recorded_path.resolve() != path.resolve():
+            raise ValueError(f"build artifact path mismatch: {name}")
+        if entry.get("size") != size:
+            raise ValueError(f"build artifact size mismatch: {name}")
+        recorded_digest = entry.get("sha256")
+        if recorded_digest is not None:
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != recorded_digest:
+                raise ValueError(f"build artifact hash mismatch: {name}")
     return {"manifest": manifest}
 
 
@@ -473,6 +597,7 @@ def boot_guest(
     stage: str,
     server_count: int,
     client_count: int,
+    serving_transport: str,
     timeout: int,
 ) -> None:
     console.wait("Hit any key to stop autoboot", timeout)
@@ -493,23 +618,32 @@ def boot_guest(
         "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=5 "
         "cxl_core.pmem_as_dax=1 "
         f"io500.role={role} io500.index={index} io500.stage={stage} "
-        f"io500.server_count={server_count} io500.client_count={client_count}'",
+        f"io500.server_count={server_count} io500.client_count={client_count} "
+        f"io500.serving_transport={serving_transport}'",
         timeout,
     )
     console.send(f"bootefi 90000000:{paths.linux.stat().st_size:x} ${{fdtcontroladdr}}")
 
 
 def parse_trace(path: pathlib.Path) -> list[dict]:
+    # The tiny-stage persistence proof is collected while CXLMemSim is still
+    # appending to this file.  Read one byte snapshot and discard only its
+    # unterminated tail; iterating the live file can otherwise observe the
+    # writer between the body and newline of an otherwise valid JSON record.
+    snapshot = path.read_bytes()
+    complete_end = snapshot.rfind(b"\n")
+    if complete_end < 0:
+        return []
     records = []
-    with path.open("r", encoding="utf-8") as source:
-        for number, line in enumerate(source, 1):
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ValueError(f"invalid coherence JSONL record {number}: {error}") from error
-            if record.get("schema_version") != 1:
-                raise ValueError("unsupported coherence trace schema")
-            records.append(record)
+    complete = snapshot[:complete_end].decode("utf-8")
+    for number, line in enumerate(complete.splitlines(), 1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid coherence JSONL record {number}: {error}") from error
+        if record.get("schema_version") != 1:
+            raise ValueError("unsupported coherence trace schema")
+        records.append(record)
     return records
 
 
@@ -615,6 +749,7 @@ def synchronize_guest_clocks(
     *,
     target_epoch: int | None = None,
     client_count: int = DEFAULT_CLIENTS,
+    allowed_receipt_lag_seconds: int = 5,
 ) -> dict:
     if len(client_consoles) != client_count:
         raise ValueError(f"clock sync requires {client_count} client guests")
@@ -665,7 +800,7 @@ def synchronize_guest_clocks(
                         f"timed out waiting for clock-sync receipt from {role}{index}"
                     )
                 console.condition.wait(min(remaining, 0.5))
-        if not target_epoch <= observed <= target_epoch + 5:
+        if not target_epoch <= observed <= target_epoch + allowed_receipt_lag_seconds:
             raise ValueError(
                 f"clock-sync receipt for {role}{index} is outside the allowed window"
             )
@@ -680,15 +815,205 @@ def synchronize_guest_clocks(
         "target_epoch": target_epoch,
         "host_dispatch_monotonic_ns": dispatch_ns,
         "host_complete_monotonic_ns": time.monotonic_ns(),
+        "allowed_receipt_lag_seconds": allowed_receipt_lag_seconds,
         "records": records,
     }
 
 
+def _send_and_wait(
+    console: Console, command: str, marker: str, timeout: int
+) -> dict:
+    start = len(console.output)
+    started_ns = time.monotonic_ns()
+    console.send(command)
+    console.wait(marker, timeout, start)
+    completed_ns = time.monotonic_ns()
+    return {
+        "command": command,
+        "marker": marker,
+        "started_monotonic_ns": started_ns,
+        "completed_monotonic_ns": completed_ns,
+        "elapsed_ns": completed_ns - started_ns,
+        "output": console.output[start:],
+    }
+
+
+def run_clean_restart_fault(
+    server_console: Console,
+    client_consoles: list[Console],
+    timeout: int,
+) -> dict:
+    """Exercise one cooperative process restart without preserving open OFDs."""
+    if len(client_consoles) != 2:
+        raise ValueError("clean-server-restart requires exactly two client guests")
+    events = []
+    events.append(_send_and_wait(
+        client_consoles[0],
+        "LEGOFS_CLEAN_RESTART_COHORT produce 42",
+        "LEGOFS_IO500_CLEAN_RESTART_COHORT_EXIT index=0 action=produce endpoint=42 generation=1 rc=0",
+        timeout,
+    ))
+    events.append(_send_and_wait(
+        client_consoles[1],
+        "LEGOFS_CLEAN_RESTART_COHORT observe 43",
+        "LEGOFS_IO500_CLEAN_RESTART_COHORT_EXIT index=1 action=observe endpoint=43 generation=1 rc=0",
+        timeout,
+    ))
+    control = _send_and_wait(
+        client_consoles[0],
+        "LEGOFS_CLEAN_RESTART_CONTROL 2 7640891576956012809",
+        "LEGOFS_IO500_CLEAN_RESTART_CONTROL_EXIT index=0 target_generation=2 rc=0",
+        timeout,
+    )
+    events.append(control)
+    control_records = [
+        json.loads(match.group(1).rstrip("\r"))
+        for match in CLEAN_RESTART_CONTROL_RE.finditer(control["output"])
+    ]
+    if len(control_records) != 1:
+        raise ValueError(
+            f"clean restart emitted {len(control_records)} control records, expected one"
+        )
+    transport = control_records[0].get("transport", {})
+    if transport.get("filesystem_tcp_requests_after_cxl_ready") != 0:
+        raise ValueError("clean restart used filesystem TCP after CXL ready")
+    if transport.get("legacy_tarpc_calls_after_cxl_ready") != 0:
+        raise ValueError("clean restart used legacy tarpc after CXL ready")
+    if transport.get("blob_tcp_bytes_after_cxl_ready") != 0:
+        raise ValueError("clean restart used Blob TCP after CXL ready")
+    if transport.get("transport_fallbacks_after_cxl_ready") != 0:
+        raise ValueError("clean restart used transport fallback after CXL ready")
+    opcodes = transport.get("dispatches_by_opcode", {})
+    if {str(key): int(value) for key, value in opcodes.items()} != {
+        "2": 1,
+        "3": 1,
+        "4": 1,
+    }:
+        raise ValueError(f"unexpected clean-restart opcode counts: {opcodes}")
+
+    events.append(_send_and_wait(
+        server_console,
+        "LEGOFS_SERVER_CLEAN_RESTART 2",
+        "LEGOFS_IO500_SERVER_RESTARTED index=0",
+        timeout,
+    ))
+    for index, console in enumerate(client_consoles):
+        events.append(_send_and_wait(
+            console,
+            "LEGOFS_CLIENT_GENERATION 2",
+            f"LEGOFS_IO500_CLIENT_GENERATION_SET index={index} generation=2",
+            timeout,
+        ))
+    events.append(_send_and_wait(
+        client_consoles[0],
+        "LEGOFS_CLEAN_RESTART_COHORT recover 42",
+        "LEGOFS_IO500_CLEAN_RESTART_COHORT_EXIT index=0 action=recover endpoint=42 generation=2 rc=0",
+        timeout,
+    ))
+    events.append(_send_and_wait(
+        client_consoles[1],
+        "LEGOFS_CLEAN_RESTART_COHORT delete 43",
+        "LEGOFS_IO500_CLEAN_RESTART_COHORT_EXIT index=1 action=delete endpoint=43 generation=2 rc=0",
+        timeout,
+    ))
+    return {
+        "schema_version": "legofs.clean-server-restart.v1",
+        "profile": "clean-server-restart",
+        "functional_model_only": True,
+        "physical_hardware_evidence": False,
+        "cohort_a": ["produce", "observe"],
+        "cohort_b": ["recover", "delete"],
+        "control": control_records,
+        "events": [
+            {key: value for key, value in event.items() if key != "output"}
+            for event in events
+        ],
+    }
+
+
+def run_unauthorized_clean_restart_probe(
+    server_console: Console,
+    timeout: int,
+) -> dict:
+    """Prove that a successor without clean authorization dies pre-listener."""
+    event = _send_and_wait(
+        server_console,
+        "LEGOFS_SERVER_UNAUTHORIZED_RESTART_PROBE 2",
+        (
+            "LEGOFS_IO500_UNAUTHORIZED_RESTART_REJECTED index=0 "
+            "target_generation=2 listener_open=0"
+        ),
+        timeout,
+    )
+    return {
+        "schema_version": "legofs.unauthorized-clean-restart.v1",
+        "profile": "reject-unauthorized-clean-restart",
+        "functional_model_only": True,
+        "physical_hardware_evidence": False,
+        "event": event,
+    }
+
+
+def run_active_lane_retirement_probe(
+    client_consoles: list[Console],
+    timeout: int,
+) -> dict:
+    """Prove that recovery control reports, but never retires, a live lane."""
+    if len(client_consoles) != 2:
+        raise ValueError("reject-active-clean-retirement requires two clients")
+    holder = client_consoles[0]
+    inspector = client_consoles[1]
+    holder_start = len(holder.output)
+    holder.send("LEGOFS_CLEAN_RESTART_COHORT hold 42")
+    holder.wait("badfs_clean_restart_hold_ready hold_ms=30000", timeout, holder_start)
+    inspection = _send_and_wait(
+        inspector,
+        "LEGOFS_INSPECT_ENDPOINT 41",
+        "LEGOFS_IO500_INSPECT_ENDPOINT_EXIT index=1 endpoint=41 rc=0",
+        timeout,
+    )
+    lifecycle_inspection = parse_server_inspection(
+        inspection["output"],
+        1,
+        expected_active_client_lanes=1,
+    )
+    recovery = lifecycle_inspection["recovery_control"]
+    retirement = recovery.get("retirement", {})
+    if retirement.get("active_client_lanes") != 1:
+        raise ValueError(f"active lane was not preserved: {retirement}")
+    transport = recovery.get("transport", {})
+    for forbidden in (
+        "filesystem_tcp_requests_after_cxl_ready",
+        "legacy_tarpc_calls_after_cxl_ready",
+        "blob_tcp_bytes_after_cxl_ready",
+        "transport_fallbacks_after_cxl_ready",
+    ):
+        if transport.get(forbidden) != 0:
+            raise ValueError(f"active-lane probe used forbidden path: {forbidden}")
+    holder.wait(
+        (
+            "LEGOFS_IO500_CLEAN_RESTART_COHORT_EXIT index=0 action=hold "
+            "endpoint=42 generation=1 rc=0"
+        ),
+        timeout,
+        holder_start,
+    )
+    return {
+        "schema_version": "legofs.active-clean-retirement.v1",
+        "profile": "reject-active-clean-retirement",
+        "functional_model_only": True,
+        "physical_hardware_evidence": False,
+        "lifecycle_inspection": lifecycle_inspection,
+    }
+
+
 def launch_mpi(
+    server_consoles: list[Console],
     client_consoles: list[Console],
     stage: str,
     timeout: int,
     client_count: int = DEFAULT_CLIENTS,
+    serving_transport: str = "legacy",
 ) -> dict:
     coordinator = client_consoles[0]
     start = len(coordinator.output)
@@ -701,12 +1026,80 @@ def launch_mpi(
         client_consoles[proxy_id].send(f"LEGOFS_PROXY {by_proxy[proxy_id]}")
     for proxy_id, console in enumerate(client_consoles):
         console.wait(f"LEGOFS_IO500_PROXY_STARTED index={proxy_id}", 30)
-    rc = wait_mpi_exit(coordinator, stage, timeout, start)
+    post_preflight_clock_sync = None
+    if stage == "tiny" and serving_transport == "cxl":
+        # Hydra forwards every rank's stdout through the coordinator console,
+        # even though each rank executes in a different client guest.
+        for endpoint in range(client_count):
+            coordinator.wait(
+                f"LEGOFS_IO500_PREFLIGHT_READY endpoint={endpoint}", timeout
+            )
+        post_preflight_clock_sync = synchronize_guest_clocks(
+            server_consoles, client_consoles, client_count=client_count
+        )
+        for endpoint in range(client_count):
+            coordinator.wait(
+                f"LEGOFS_IO500_PREFLIGHT_RELEASED endpoint={endpoint}", 30
+            )
+    # Oversubscribed TCG advances each VM's wall clock according to the host
+    # time that VM receives.  IO500's official find phase compares ctime from
+    # client0's result disk with ctime assigned by other guests, so a one-shot
+    # boot synchronization is insufficient.  Maintain a common wall-clock
+    # epoch while MPI runs; IO500 elapsed time remains MPI monotonic time.
+    maintain_clocks = stage == "tiny" and serving_transport == "cxl"
+    clock_stop = threading.Event()
+    clock_maintenance = []
+    clock_errors = []
+
+    def maintain_guest_clocks() -> None:
+        while not clock_stop.wait(1.0):
+            try:
+                clock_maintenance.append(
+                    synchronize_guest_clocks(
+                        server_consoles,
+                        client_consoles,
+                        client_count=client_count,
+                        # Under saturated TCG the date command can be queued
+                        # for several host seconds after all consoles receive
+                        # it.  The filesystem-level find predicate remains the
+                        # authoritative correctness check; this larger bound
+                        # only prevents that queueing delay from aborting the
+                        # diagnostic helper itself.
+                        allowed_receipt_lag_seconds=30,
+                    )
+                )
+            except BaseException as error:
+                clock_errors.append(error)
+                return
+
+    clock_thread = None
+    if maintain_clocks:
+        clock_thread = threading.Thread(
+            target=maintain_guest_clocks,
+            name="legofs-io500-clock-maintenance",
+            daemon=True,
+        )
+        clock_thread.start()
+    try:
+        rc = wait_mpi_exit(coordinator, stage, timeout, start)
+    finally:
+        if clock_thread is not None:
+            clock_stop.set()
+            clock_thread.join(timeout=35)
+    if clock_thread is not None and clock_thread.is_alive():
+        raise TimeoutError("guest clock maintenance did not stop")
     return {
         "launcher": "MPICH Hydra manual",
         "coordinator": "client0",
         "returncode": rc,
         "proxy_commands": [by_proxy[index] for index in range(client_count)],
+        "post_preflight_clock_sync": post_preflight_clock_sync,
+        "clock_maintenance": {
+            "enabled": maintain_clocks,
+            "interval_seconds": 1.0 if maintain_clocks else None,
+            "synchronizations": clock_maintenance,
+            "errors": [str(error) for error in clock_errors],
+        },
         "output_start": start,
         "output_end": len(coordinator.output),
     }
@@ -769,24 +1162,152 @@ def parse_rank_markers(
     return [by_rank[index] for index in range(client_count)]
 
 
+def validate_cxl_path_summary(
+    record: dict,
+    endpoint: int,
+    authority_count: int | None = None,
+) -> int:
+    if record.get("schema_version") != "badfs.posix.path-summary.v4":
+        raise ValueError("unexpected POSIX summary schema")
+    if record.get("intercept_enabled") is not True:
+        raise ValueError("POSIX summary does not prove syscall interception")
+    classification = record.get("syscall_classification", {})
+    totals = classification.get("totals", {})
+    if totals.get("forbidden_badfs_forward") != 0:
+        raise ValueError("BadFS-owned syscall escaped to the guest kernel")
+
+    evidence = record.get("cxl_serving_evidence")
+    if not isinstance(evidence, list) or not evidence:
+        raise ValueError("POSIX summary lacks CXL serving evidence")
+    if authority_count is not None and len(evidence) != authority_count:
+        raise ValueError("CXL authority evidence count differs between processes")
+    if {item.get("authority_id") for item in evidence} != set(range(len(evidence))):
+        raise ValueError("CXL serving evidence does not cover contiguous authorities")
+    for item in evidence:
+        authority_id = item["authority_id"]
+        if item.get("lane_id") != endpoint:
+            raise ValueError(
+                f"authority {authority_id} lane does not match endpoint {endpoint}"
+            )
+        if item.get("lane_role") != "client_fs":
+            raise ValueError(
+                f"authority {authority_id} IO500 lane is not CLIENT_FS"
+            )
+        if any(
+            not isinstance(item.get(name), int) or item[name] <= 0
+            for name in (
+                "format_generation",
+                "session_generation",
+                "lane_generation",
+            )
+        ):
+            raise ValueError("CXL serving evidence has an invalid generation")
+        if item.get("bootstrap_tcp_exchanges") != 1:
+            raise ValueError("CXL bootstrap exchange count is not exactly one")
+        if item.get("bootstrap_tcp_connections") != 1:
+            raise ValueError("CXL bootstrap connection count is not exactly one")
+        if not isinstance(item.get("bootstrap_tcp_bytes"), int) or item[
+            "bootstrap_tcp_bytes"
+        ] <= 0:
+            raise ValueError("CXL bootstrap byte evidence is missing")
+        submitted = item.get("sqe_submitted")
+        consumed = item.get("cqe_consumed")
+        if not isinstance(submitted, int) or submitted <= 0 or consumed != submitted:
+            raise ValueError("local CXL SQ/CQ counters are not balanced")
+        sequences = item.get("shared_sequences")
+        if not isinstance(sequences, dict) or any(
+            sequences.get(name) != submitted
+            for name in (
+                "sq_produced",
+                "sq_consumed",
+                "cq_produced",
+                "cq_consumed",
+            )
+        ):
+            raise ValueError("shared CXL SQ/CQ lane sequences are not balanced")
+        authority_timing = item.get("authority_timing")
+        if not isinstance(authority_timing, dict) or any(
+            not isinstance(authority_timing.get(name), int)
+            or authority_timing[name] < 0
+            for name in (
+                "sqe_consumed",
+                "cqe_published",
+                "authority_queue_wait_ns",
+                "dispatcher_backend_ns",
+                "cqe_publish_ns",
+            )
+        ):
+            raise ValueError("CXL authority timing evidence is incomplete")
+        if (
+            authority_timing["sqe_consumed"] != submitted
+            or authority_timing["cqe_published"] != submitted
+            or authority_timing["dispatcher_backend_ns"] <= 0
+        ):
+            raise ValueError("CXL authority evidence does not cover every request")
+        client_timing = item.get("client_timing")
+        if not isinstance(client_timing, dict) or any(
+            not isinstance(client_timing.get(name), int) or client_timing[name] < 0
+            for name in (
+                "calls",
+                "call_gate_wait_ns",
+                "syscall_prepare_ns",
+                "sq_credit_wait_ns",
+                "sq_publish_ns",
+                "cq_wait_ns",
+            )
+        ):
+            raise ValueError("CXL client timing evidence is incomplete")
+        if (
+            client_timing["calls"] != submitted
+            or client_timing["sq_publish_ns"] <= 0
+            or client_timing["cq_wait_ns"] <= 0
+        ):
+            raise ValueError("CXL client timing evidence does not cover every request")
+        dispatches = item.get("dispatches_by_opcode")
+        if not isinstance(dispatches, dict) or not dispatches:
+            raise ValueError("CXL serving evidence lacks opcode dispatches")
+        try:
+            valid_dispatches = [
+                (int(opcode), count)
+                for opcode, count in dispatches.items()
+                if 0 < int(opcode) < 256 and isinstance(count, int) and count > 0
+            ]
+        except (TypeError, ValueError):
+            raise ValueError("CXL opcode dispatch evidence is malformed") from None
+        if (
+            len(valid_dispatches) != len(dispatches)
+            or sum(count for _, count in valid_dispatches) != submitted
+        ):
+            raise ValueError("CXL opcode dispatch total does not match submitted SQEs")
+        if dispatches.get("35") != 1:
+            raise ValueError("CXL evidence was captured before owner release completed")
+        for forbidden in (
+            "unsupported_serving_calls_after_cxl_ready",
+            "filesystem_tcp_requests_after_cxl_ready",
+            "legacy_tarpc_calls_after_cxl_ready",
+            "blob_tcp_bytes_after_cxl_ready",
+            "transport_fallbacks_after_cxl_ready",
+        ):
+            if item.get(forbidden) != 0:
+                raise ValueError(f"nonzero forbidden serving path counter: {forbidden}")
+    return len(evidence)
+
+
 def validate_posix_summaries(
     records: list[dict], client_count: int = DEFAULT_CLIENTS
 ) -> None:
     active_ranks = set()
+    authority_count = None
     for record in records:
-        if record.get("schema_version") != "badfs.posix.path-summary.v2":
-            raise ValueError("unexpected POSIX summary schema")
-        if record.get("intercept_enabled") is not True:
-            raise ValueError("POSIX summary does not prove syscall interception")
         rank = record.get("mpi_rank")
         endpoint = record.get("endpoint")
         if rank not in range(client_count) or endpoint != rank:
             raise ValueError(f"POSIX summary rank/endpoint mismatch: {record}")
+        authority_count = validate_cxl_path_summary(
+            record, endpoint, authority_count
+        )
         stats = record.get("stats", {})
-        classification = record.get("syscall_classification", {})
-        totals = classification.get("totals", {})
-        if totals.get("forbidden_badfs_forward") != 0:
-            raise ValueError("BadFS-owned syscall escaped to the guest kernel")
+        totals = record.get("syscall_classification", {}).get("totals", {})
         if sum(stats.get(name, 0) for name in ("open_ops", "read_ops", "write_ops")) > 0:
             if totals.get("handled", 0) <= 0:
                 raise ValueError("active POSIX summary handled no BadFS syscall")
@@ -796,6 +1317,42 @@ def validate_posix_summaries(
             f"active POSIX summaries do not cover ranks 0..{client_count - 1}: "
             f"{sorted(active_ranks)}"
         )
+
+
+def validate_post_run_exporter_summary(record: dict, client_count: int) -> None:
+    expected_endpoint = 2 * client_count + 1
+    if record.get("mpi_rank") is not None:
+        raise ValueError("post-run exporter retained an MPI rank identity")
+    if record.get("endpoint") != expected_endpoint:
+        raise ValueError(
+            "post-run exporter endpoint mismatch: "
+            f"expected {expected_endpoint}, got {record.get('endpoint')}"
+        )
+    validate_cxl_path_summary(record, expected_endpoint)
+    stats = record.get("stats", {})
+    totals = record.get("syscall_classification", {}).get("totals", {})
+    if stats.get("open_ops", 0) <= 0 or stats.get("read_ops", 0) <= 0:
+        raise ValueError("post-run exporter did not read the LegoFS result directory")
+    if totals.get("handled", 0) <= 0:
+        raise ValueError("post-run exporter handled no BadFS syscall")
+
+
+def parse_post_run_exporter_summary(output: str, client_count: int) -> dict:
+    matches = list(EXPORT_SUMMARY_RE.finditer(output))
+    if len(matches) != 1:
+        raise ValueError(
+            "IO500 did not produce exactly one exporter CXL path summary"
+        )
+    match = matches[0]
+    record = json.loads(match.group(3))
+    marker_endpoint = int(match.group(1))
+    embedded_endpoint = record.get("endpoint")
+    if embedded_endpoint is not None and embedded_endpoint != marker_endpoint:
+        raise ValueError("post-run exporter marker/record endpoint mismatch")
+    record["endpoint"] = marker_endpoint
+    record["file"] = match.group(2)
+    validate_post_run_exporter_summary(record, client_count)
+    return record
 
 
 def dump_summaries(
@@ -816,20 +1373,195 @@ def dump_summaries(
     return records
 
 
+def validate_authority_internal_fabric(fabric: dict, server_count: int) -> None:
+    if server_count <= 1:
+        return
+    submitted = fabric.get("authority_internal_submitted", 0)
+    completed = fabric.get("authority_internal_completed", 0)
+    if submitted <= 0 or completed != submitted:
+        raise ValueError(
+            "lifecycle inspection lacks completed authority-internal CXL traffic"
+        )
+    if fabric.get("authority_prepare_receipts", 0) <= 0:
+        raise ValueError(
+            "lifecycle inspection lacks durable cross-authority PREPARE receipts"
+        )
+    committed = fabric.get("authority_committed_transactions", 0)
+    if committed <= 0:
+        raise ValueError(
+            "lifecycle inspection lacks committed cross-authority transactions"
+        )
+    if fabric.get("authority_marker_publications", 0) < committed * 2:
+        raise ValueError(
+            "lifecycle inspection lacks PREPARED/COMMITTED marker publications"
+        )
+    if fabric.get("authority_durable_prefix", 0) < committed * 2:
+        raise ValueError(
+            "lifecycle inspection durable prefix does not cover committed transactions"
+        )
+    durable_prefix = fabric.get("authority_durable_prefix", 0)
+    record_persists = fabric.get("authority_journal_record_persists", 0)
+    anchor_persists = fabric.get("authority_journal_anchor_persists", 0)
+    if record_persists < durable_prefix:
+        raise ValueError(
+            "lifecycle inspection lacks CXL transaction-journal record persists"
+        )
+    if anchor_persists < record_persists + server_count:
+        raise ValueError(
+            "lifecycle inspection lacks CXL transaction-journal anchor persists"
+        )
+
+
+def validate_recovery_control_checkpoints(
+    records: list[dict], server_count: int, *, expected_active_client_lanes: int = 0
+) -> None:
+    if len(records) != server_count or {
+        record.get("server") for record in records
+    } != set(range(server_count)):
+        raise ValueError("recovery-control checkpoints do not cover every authority")
+    for record in records:
+        server = record["server"]
+        if record.get("schema_version") != "badfs.recovery-control.inspection.v1":
+            raise ValueError("unexpected recovery-control checkpoint schema")
+        retirement = record.get("retirement")
+        if not isinstance(retirement, dict):
+            raise ValueError("recovery-control clean retirement is missing")
+        retirement_identity = retirement.get("identity")
+        if (
+            not isinstance(retirement_identity, dict)
+            or retirement_identity.get("authority") != server
+            or not isinstance(retirement.get("retired_lanes"), int)
+            or retirement["retired_lanes"] <= 0
+            or retirement.get("active_client_lanes") != expected_active_client_lanes
+        ):
+            raise ValueError("recovery-control clean retirement is incomplete")
+        checkpoint = record.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            raise ValueError("recovery-control checkpoint body is missing")
+        identity = checkpoint.get("identity")
+        if (
+            not isinstance(identity, dict)
+            or identity.get("authority") != server
+            or not isinstance(identity.get("serving_incarnation"), int)
+            or identity["serving_incarnation"] <= 0
+        ):
+            raise ValueError("recovery-control checkpoint identity is invalid")
+        if retirement_identity != identity:
+            raise ValueError(
+                "recovery-control retirement/checkpoint identities do not match"
+            )
+        metadata_lsn = checkpoint.get("metadata_lsn")
+        lifecycle_lsn = checkpoint.get("lifecycle_lsn")
+        if (
+            checkpoint.get("data_domain") != "lifecycle"
+            or checkpoint.get("data_lsn") != 0
+            or not isinstance(metadata_lsn, int)
+            or metadata_lsn < 0
+            or not isinstance(lifecycle_lsn, int)
+            or lifecycle_lsn < metadata_lsn
+        ):
+            raise ValueError("recovery-control durable cursor set is inconsistent")
+
+        transport = record.get("transport")
+        if not isinstance(transport, dict):
+            raise ValueError("recovery-control transport evidence is missing")
+        if (
+            transport.get("authority_id") != server
+            or transport.get("lane_id") != RECOVERY_CONTROL_LANE_BASE + server
+            or transport.get("lane_role") != "recovery_control"
+        ):
+            raise ValueError("recovery-control lane identity is invalid")
+        if any(
+            not isinstance(transport.get(name), int) or transport[name] <= 0
+            for name in ("format_generation", "session_generation", "lane_generation")
+        ):
+            raise ValueError("recovery-control generation evidence is invalid")
+        if (
+            transport.get("bootstrap_tcp_connections") != 1
+            or transport.get("bootstrap_tcp_exchanges") != 1
+            or not isinstance(transport.get("bootstrap_tcp_bytes"), int)
+            or transport["bootstrap_tcp_bytes"] <= 0
+        ):
+            raise ValueError("recovery-control bootstrap evidence is invalid")
+        if transport.get("sqe_submitted") != 2 or transport.get("cqe_consumed") != 2:
+            raise ValueError("recovery-control local SQ/CQ counters are not balanced")
+        sequences = transport.get("shared_sequences")
+        if not isinstance(sequences, dict) or any(
+            sequences.get(name) != 2
+            for name in ("sq_produced", "sq_consumed", "cq_produced", "cq_consumed")
+        ):
+            raise ValueError("recovery-control shared SQ/CQ counters are not balanced")
+        authority_timing = transport.get("authority_timing")
+        if (
+            not isinstance(authority_timing, dict)
+            or authority_timing.get("sqe_consumed") != 2
+            or authority_timing.get("cqe_published") != 2
+            or not isinstance(authority_timing.get("dispatcher_backend_ns"), int)
+            or authority_timing["dispatcher_backend_ns"] <= 0
+        ):
+            raise ValueError("recovery-control authority evidence is incomplete")
+        client_timing = transport.get("client_timing")
+        if (
+            not isinstance(client_timing, dict)
+            or client_timing.get("calls") != 2
+            or not isinstance(client_timing.get("sq_publish_ns"), int)
+            or client_timing["sq_publish_ns"] <= 0
+            or not isinstance(client_timing.get("cq_wait_ns"), int)
+            or client_timing["cq_wait_ns"] <= 0
+        ):
+            raise ValueError("recovery-control client evidence is incomplete")
+        if transport.get("dispatches_by_opcode") != {"1": 1, "2": 1}:
+            raise ValueError(
+                "recovery-control checkpoint/retirement opcodes were not dispatched exactly once"
+            )
+        for forbidden in (
+            "unsupported_serving_calls_after_cxl_ready",
+            "filesystem_tcp_requests_after_cxl_ready",
+            "legacy_tarpc_calls_after_cxl_ready",
+            "blob_tcp_bytes_after_cxl_ready",
+            "transport_fallbacks_after_cxl_ready",
+        ):
+            if transport.get(forbidden) != 0:
+                raise ValueError(
+                    f"nonzero recovery-control forbidden path counter: {forbidden}"
+                )
+
+
 def inspect_servers(
     console: Console,
     server_count: int,
     *,
     require_direct_read: bool = True,
+    require_recovery_control: bool = True,
 ) -> dict:
     start = len(console.output)
     console.send("LEGOFS_INSPECT")
     console.wait("LEGOFS_IO500_INSPECT_EXIT index=0 rc=0", 120, start)
+    return parse_server_inspection(
+        console.output[start:],
+        server_count,
+        require_direct_read=require_direct_read,
+        require_recovery_control=require_recovery_control,
+    )
+
+
+def parse_server_inspection(
+    output: str,
+    server_count: int,
+    *,
+    require_direct_read: bool = True,
+    expected_active_client_lanes: int = 0,
+    require_recovery_control: bool = True,
+) -> dict:
     marker = "badfs_lifecycle_inspection "
+    recovery_marker = "badfs_recovery_control_checkpoint "
     records = []
-    for line in console.output[start:].splitlines():
+    recovery_records = []
+    for line in output.splitlines():
         if line.startswith(marker):
             records.append(json.loads(line[len(marker):]))
+        elif line.startswith(recovery_marker):
+            recovery_records.append(json.loads(line[len(recovery_marker):]))
     records.sort(key=lambda record: record.get("server", -1))
     if len(records) != server_count or [
         record.get("server") for record in records
@@ -840,6 +1572,17 @@ def inspect_servers(
         for record in records
     ):
         raise ValueError("unexpected lifecycle inspection schema")
+    recovery_records.sort(key=lambda record: record.get("server", -1))
+    if require_recovery_control:
+        validate_recovery_control_checkpoints(
+            recovery_records,
+            server_count,
+            expected_active_client_lanes=expected_active_client_lanes,
+        )
+    elif recovery_records:
+        raise ValueError(
+            "single-authority minimal inspection unexpectedly created recovery-control state"
+        )
     fabric = {
         key: sum(record.get("fabric", {}).get(key, 0) for record in records)
         for key in records[0].get("fabric", {})
@@ -859,13 +1602,141 @@ def inspect_servers(
     for name in forbidden_fabric:
         if fabric.get(name, 0) != 0:
             raise ValueError(f"lifecycle inspection reports {name}")
+    validate_authority_internal_fabric(fabric, server_count)
     for record in records:
+        audit = record.get("audit", {})
         for name in ("pending_operations", "quarantined_extents", "active_read_leases"):
-            if record.get("audit", {}).get(name, 0) != 0:
+            if audit.get(name, 0) != 0:
                 raise ValueError(
                     f"lifecycle server {record['server']} audit reports {name}"
                 )
+        for name in (
+            "metadata_wal_persist_barriers",
+            "metadata_wal_persist_records",
+            "metadata_wal_persist_bytes",
+            "metadata_wal_persist_ns",
+            "provider_persist_barriers",
+            "provider_persist_bytes",
+            "provider_persist_ns",
+            "provider_payload_barriers",
+            "provider_payload_bytes",
+            "provider_allocator_barriers",
+            "provider_allocator_bytes",
+            "foreground_checkpoint_waits",
+            "foreground_checkpoint_wait_ns",
+            "arena_acquire_calls",
+            "arena_acquire_slots",
+            "arena_acquire_lock_wait_ns",
+            "arena_acquire_state_clone_ns",
+            "arena_acquire_allocation_plan_ns",
+            "arena_acquire_backend_reserve_ns",
+            "arena_acquire_state_build_ns",
+            "arena_acquire_state_validate_ns",
+            "arena_acquire_grant_install_ns",
+            "arena_acquire_state_persist_ns",
+            "arena_acquire_trace_ns",
+            "arena_acquire_total_ns",
+        ):
+            if not isinstance(audit.get(name), int) or audit[name] < 0:
+                raise ValueError(
+                    f"lifecycle server {record['server']} lacks {name} evidence"
+                )
+        if audit["metadata_wal_persist_barriers"] <= 0:
+            raise ValueError(
+                f"lifecycle server {record['server']} observed no metadata WAL barrier"
+            )
+        if audit["metadata_wal_persist_records"] < audit["metadata_wal_persist_barriers"]:
+            raise ValueError(
+                f"lifecycle server {record['server']} has fewer WAL records than barriers"
+            )
+        if (
+            audit["provider_persist_barriers"] <= 0
+            or audit["provider_payload_barriers"] <= 0
+            or audit["provider_allocator_barriers"] <= 0
+        ):
+            raise ValueError(
+                f"lifecycle server {record['server']} lacks provider persistence evidence"
+            )
+        vd = audit.get("visibility_durability", {})
+        for name in (
+            "logical_mutations",
+            "published_v",
+            "durable_d",
+            "visible_sequence",
+            "durable_sequence",
+            "v_to_d_lag",
+            "max_v_to_d_lag",
+            "foreground_d_waits",
+            "foreground_d_wait_ns",
+            "semantic_batches",
+            "semantic_batch_operations",
+            "semantic_batch_bytes",
+            "dependency_closure_waits",
+            "dependency_closure_wait_ns",
+        ):
+            if not isinstance(vd.get(name), int) or vd[name] < 0:
+                raise ValueError(
+                    f"lifecycle server {record['server']} lacks V/D field {name}"
+                )
+        if vd.get("provider_profile") != "D_BEFORE_V":
+            raise ValueError(
+                f"lifecycle server {record['server']} did not retain D_BEFORE_V"
+            )
+        logical = vd["logical_mutations"]
+        if logical <= 0 or vd["semantic_batches"] <= 0 or vd["foreground_d_waits"] <= 0:
+            raise ValueError(
+                f"lifecycle server {record['server']} observed no syscall-first V/D evidence"
+            )
+        if not (
+            vd["published_v"]
+            == vd["durable_d"]
+            == vd["visible_sequence"]
+            == vd["durable_sequence"]
+            == vd["semantic_batch_operations"]
+            == logical
+        ):
+            raise ValueError(
+                f"lifecycle server {record['server']} has inconsistent D-before-V counters"
+            )
+        if vd["v_to_d_lag"] != 0 or vd["max_v_to_d_lag"] != 0:
+            raise ValueError(
+                f"lifecycle server {record['server']} accumulated V/D lag in D_BEFORE_V"
+            )
+        if (
+            vd["dependency_closure_waits"] != vd["foreground_d_waits"]
+            or vd["dependency_closure_wait_ns"] != vd["foreground_d_wait_ns"]
+        ):
+            raise ValueError(
+                f"lifecycle server {record['server']} has inconsistent dependency waits"
+            )
+        if audit["arena_acquire_calls"] <= 0 or audit["arena_acquire_slots"] <= 0:
+            raise ValueError(
+                f"lifecycle server {record['server']} observed no direct arena refill"
+            )
+        arena_stage_ns = sum(
+            audit[name]
+            for name in (
+                "arena_acquire_lock_wait_ns",
+                "arena_acquire_state_clone_ns",
+                "arena_acquire_allocation_plan_ns",
+                "arena_acquire_backend_reserve_ns",
+                "arena_acquire_state_build_ns",
+                "arena_acquire_state_validate_ns",
+                "arena_acquire_grant_install_ns",
+                "arena_acquire_state_persist_ns",
+                "arena_acquire_trace_ns",
+            )
+        )
+        if audit["arena_acquire_total_ns"] <= 0 or arena_stage_ns > audit["arena_acquire_total_ns"]:
+            raise ValueError(
+                f"lifecycle server {record['server']} has inconsistent arena timing evidence"
+            )
     if server_count == 1:
+        records[0]["recovery_control"] = (
+            recovery_records[0] if require_recovery_control else None
+        )
+        if not require_recovery_control:
+            records[0]["serving_profile"] = "single_authority_minimal"
         return records[0]
     audit = {}
     extent_states = {}
@@ -893,6 +1764,7 @@ def inspect_servers(
         "fabric": fabric,
         "audit": audit,
         "servers": records,
+        "recovery_control": recovery_records,
     }
 
 
@@ -912,6 +1784,29 @@ def read_event_records(path: pathlib.Path) -> list[dict]:
     return records
 
 
+def decode_selected_trace_event(
+    line: str, marker: str, selected_events: tuple[str, ...]
+) -> dict | None:
+    if marker not in line:
+        return None
+    payload = line.split(marker, 1)[1]
+    try:
+        # The functional platform multiplexes several guest processes through
+        # one hvc console. A complete proof record may therefore have unrelated
+        # serial text appended before the translated newline, or an individual
+        # record may be truncated. Accept only a complete JSON prefix and drop
+        # damaged samples; the proof below still fails closed unless other
+        # independently correlated samples establish the required ordering.
+        record, _ = json.JSONDecoder().raw_decode(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    if record.get("event") not in selected_events:
+        return None
+    return record
+
+
 def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: int) -> dict:
     owner_endpoint = {
         record["owner"]: record["endpoint"]
@@ -927,28 +1822,28 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
     server_events.sort(key=lambda event: event["host_capture_ns"])
     direct = []
     for event in client_events:
-        line = event["line"]
         marker = "BADFS_DIRECT_MAP_TRACE_JSON "
-        if marker not in line:
+        record = decode_selected_trace_event(
+            event["line"], marker, ("persisted", "drop", "unmap")
+        )
+        if record is None:
             continue
-        record = json.loads(line.split(marker, 1)[1])
         if (
             record.get("schema_version") == "badfs.direct-map-trace.v1"
-            and record.get("event") in ("persisted", "drop", "unmap")
             and record.get("access") in ("write", "read_write")
             and record.get("rc") == 0
         ):
             direct.append((record, event["host_capture_ns"]))
     lifecycle = []
     for event in server_events:
-        line = event["line"]
         marker = "BADFS_LIFECYCLE_TRACE_JSON "
-        if marker not in line:
+        record = decode_selected_trace_event(
+            event["line"], marker, ("store_direct_begin", "store_direct_success")
+        )
+        if record is None:
             continue
-        record = json.loads(line.split(marker, 1)[1])
         if (
             record.get("schema_version") == "badfs.lifecycle.v1"
-            and record.get("event") in ("store_direct_begin", "store_direct_success")
         ):
             lifecycle.append((record, event["host_capture_ns"]))
     coherence = parse_trace(paths.coherence)
@@ -1108,8 +2003,16 @@ def validate_tiny_provider_counters(final_stats: dict, proof: dict) -> None:
 
 
 def classify_io500_verifier(stage: str, rc: int, output: str) -> str:
-    invalid_ok = "[OK] But this is an invalid run!" in output and "ERROR:" not in output
-    clean_ok = re.search(r"(?m)^\[OK\]\r?$", output) is not None
+    # The QEMU serial console may expand one guest newline to `\r\r\n`.
+    # Strip carriage returns before matching whole verifier lines; keep the
+    # exact `[OK]` line requirement so an embedded or invalid-run marker is
+    # never accepted as a clean result.
+    normalized = output.replace("\r", "")
+    invalid_ok = (
+        "[OK] But this is an invalid run!" in normalized
+        and "ERROR:" not in normalized
+    )
+    clean_ok = re.search(r"(?m)^\[OK\]$", normalized) is not None
     if stage in SEMANTIC_SMOKE_STAGES:
         if rc == 1 and invalid_ok:
             return "PASS: integrity verified; expected INVALID smoke (verifier rc=1)"
@@ -1215,6 +2118,13 @@ def extract_results(paths: Paths) -> dict:
     shutil.copy2(result_path, paths.bundle / "result.txt")
     shutil.copy2(config_path, paths.bundle / "config.ini")
     text = result_path.read_text(encoding="utf-8", errors="replace")
+    find_section = re.search(
+        r"(?ms)^\[find\]\s*$.*?^found\s*=\s*(\d+)\s*$", text
+    )
+    if "[find]" in text and (
+        find_section is None or int(find_section.group(1)) <= 0
+    ):
+        raise ValueError("IO500 find phase did not match any file")
     invalid_lines = [line for line in text.splitlines() if "[INVALID]" in line]
     return {
         "result_path": str(paths.bundle / "result.txt"),
@@ -1246,6 +2156,17 @@ def finish_guest_processes(consoles: list[Console], grace_seconds: float = 5) ->
             future.result()
 
 
+def functional_model_evidence() -> dict:
+    return {
+        "functional_model_only": True,
+        "guest_visible_cxl_evidence": False,
+        "physical_hardware_evidence": False,
+        # Deprecated compatibility field. Functional-model traffic is not
+        # physical hardware evidence; new consumers use the two fields above.
+        "physical_cxl_evidence": False,
+    }
+
+
 def execute(
     paths: Paths,
     timeout: int,
@@ -1255,6 +2176,8 @@ def execute(
     ssd_cache_mib: int = DEFAULT_SSD_CACHE_MIB,
     server_read_exclusive: bool = False,
     full_coherence_trace: bool = False,
+    serving_transport: str = "legacy",
+    fault_profile: str = "none",
 ) -> dict:
     build = verify_manifest(paths)
     prepare_paths(paths)
@@ -1265,8 +2188,7 @@ def execute(
         "status": "failed",
         "stage": paths.stage,
         "first_failure": None,
-        "functional_model_only": True,
-        "physical_cxl_evidence": False,
+        **functional_model_evidence(),
         "owner_token": owner,
         "build": build,
         "topology": {
@@ -1287,6 +2209,8 @@ def execute(
             "ssd_cache_bytes": ssd_cache_mib * 1024**2,
             "server_read_exclusive": server_read_exclusive,
             "server_scope": f"{server_count} LegoFS server allocation partitions",
+            "legofs_serving_transport": serving_transport,
+            "fault_profile": fault_profile,
             "allocator_partitions": [
                 {
                     "server": server,
@@ -1303,7 +2227,9 @@ def execute(
     }
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    tcp.bind(("127.0.0.1", 0))
+    # CXLMemSim listens on INADDR_ANY. Reserve against the same address scope;
+    # probing only 127.0.0.1 can select a port already owned on 127.0.1.1.
+    tcp.bind(("0.0.0.0", 0))
     coherence_port = tcp.getsockname()[1]
     multicast = UdpPortReservation()
     server_owned = None
@@ -1383,6 +2309,7 @@ def execute(
                         paths.stage,
                         server_count,
                         client_count,
+                        serving_transport,
                         timeout,
                     )
                 )
@@ -1425,6 +2352,7 @@ def execute(
                         paths.stage,
                         server_count,
                         client_count,
+                        serving_transport,
                         timeout,
                     )
                 )
@@ -1455,9 +2383,34 @@ def execute(
         cost_started_ns = time.monotonic_ns()
         cost_before = sample_named_processes(metered_processes)
         try:
+            if fault_profile == "clean-server-restart":
+                result["fault_injection"] = run_clean_restart_fault(
+                    server_consoles[0], client_consoles, timeout
+                )
+            elif fault_profile == "reject-unauthorized-clean-restart":
+                result["fault_injection"] = run_unauthorized_clean_restart_probe(
+                    server_consoles[0], timeout
+                )
             result["commands"]["mpi"] = launch_mpi(
-                client_consoles, paths.stage, timeout, client_count
+                server_consoles,
+                client_consoles,
+                paths.stage,
+                timeout,
+                client_count,
+                serving_transport,
             )
+            if paths.stage in ("scc", "standard") and serving_transport == "cxl":
+                mpi_command = result["commands"]["mpi"]
+                mpi_output = client_consoles[0].output[
+                    mpi_command["output_start"]:mpi_command["output_end"]
+                ]
+                result["post_run_exporter_summary"] = (
+                    parse_post_run_exporter_summary(mpi_output, client_count)
+                )
+            if fault_profile == "reject-active-clean-retirement":
+                result["fault_injection"] = run_active_lane_retirement_probe(
+                    client_consoles, timeout
+                )
         except MpiStageError:
             diagnostics = {}
             try:
@@ -1474,7 +2427,12 @@ def execute(
                 diagnostics["posix_path_summary_error"] = str(error)
             try:
                 diagnostics["lifecycle_inspection"] = inspect_servers(
-                    client_consoles[0], server_count, require_direct_read=False
+                    client_consoles[0],
+                    server_count,
+                    require_direct_read=False,
+                    require_recovery_control=not (
+                        serving_transport == "cxl" and server_count == 1
+                    ),
                 )
             except Exception as error:
                 diagnostics["lifecycle_inspection_error"] = str(error)
@@ -1507,7 +2465,16 @@ def execute(
                 client_consoles, paths.stage, client_count
             )
             summaries = dump_summaries(client_consoles, client_count)
-            inspection = inspect_servers(client_consoles[0], server_count)
+            if fault_profile == "reject-active-clean-retirement":
+                inspection = result["fault_injection"]["lifecycle_inspection"]
+            else:
+                inspection = inspect_servers(
+                    client_consoles[0],
+                    server_count,
+                    require_recovery_control=not (
+                        serving_transport == "cxl" and server_count == 1
+                    ),
+                )
             verifier = verify_io500(client_consoles[0], paths.stage)
             result["rank_placement"] = rank_records
             result["posix_path_summaries"] = summaries
@@ -1592,7 +2559,7 @@ def execute(
                 validate_tiny_provider_counters(
                     final_stats, result["strict_persistency_proof"]
                 )
-            result["physical_cxl_evidence"] = True
+            result["guest_visible_cxl_evidence"] = True
         if paths.stage != "hello":
             if verifier["failure"] is not None:
                 raise RuntimeError(verifier["failure"])
@@ -1663,6 +2630,21 @@ def parse_args(argv=None):
         action="store_true",
         help="diagnostic mode: record every coherence event instead of counters",
     )
+    parser.add_argument(
+        "--serving-transport",
+        choices=("legacy", "cxl"),
+        default="legacy",
+    )
+    parser.add_argument(
+        "--fault-profile",
+        choices=(
+            "none",
+            "clean-server-restart",
+            "reject-unauthorized-clean-restart",
+            "reject-active-clean-retirement",
+        ),
+        default="none",
+    )
     return parser.parse_args(argv)
 
 
@@ -1676,6 +2658,20 @@ def main(argv=None) -> int:
         raise ValueError("coherence-cache-mib must be between 1 and 4095")
     if not 1 <= args.ssd_cache_mib <= 65536:
         raise ValueError("ssd-cache-mib must be between 1 and 65536")
+    if args.fault_profile in (
+        "clean-server-restart",
+        "reject-unauthorized-clean-restart",
+        "reject-active-clean-retirement",
+    ) and (
+        args.stage != "tiny"
+        or args.server_count != 1
+        or args.client_count != 2
+        or args.serving_transport != "cxl"
+    ):
+        raise ValueError(
+            f"{args.fault_profile} requires --stage tiny --server-count 1 "
+            "--client-count 2 --serving-transport cxl"
+        )
     if args.result_label is not None and not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]*", args.result_label
     ):
@@ -1692,6 +2688,8 @@ def main(argv=None) -> int:
             args.ssd_cache_mib,
             args.server_read_exclusive,
             args.full_coherence_trace,
+            args.serving_transport,
+            args.fault_profile,
         )
     except BaseException as error:
         print(f"error: {error}", file=sys.stderr)

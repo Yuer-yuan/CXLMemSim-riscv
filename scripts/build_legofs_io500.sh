@@ -491,8 +491,11 @@ install -m 0755 "$TARGET_ROOT/mpi-hello" "$PAYLOAD_ROOT/bin/mpi-hello"
 install -m 0755 "$TARGET_ROOT/export-io500-results" \
 	"$PAYLOAD_ROOT/bin/export-io500-results"
 install -m 0755 "$ROOT/guest/legofs_io500_rank.sh" "$PAYLOAD_ROOT/bin/run-io500-rank"
-install -m 0755 "$BASELINE/legofs-bin/badfs-server" "$PAYLOAD_ROOT/bin/badfs-server"
-install -m 0755 "$BASELINE/legofs-bin/badfs-bench" "$PAYLOAD_ROOT/bin/badfs-bench"
+install -m 0755 "$ROOT/guest/legofs_io500_init.sh" "$PAYLOAD_ROOT/bin/legofs-io500-init"
+install -m 0755 "$BASELINE/legofs-bin/badfs-server" "$PAYLOAD_ROOT/bin/badfs-server.real"
+install -m 0755 "$ROOT/guest/legofs_badfs_server.sh" "$PAYLOAD_ROOT/bin/badfs-server"
+install -m 0755 "$BASELINE/legofs-bin/badfs-bench" "$PAYLOAD_ROOT/bin/badfs-bench.real"
+install -m 0755 "$ROOT/guest/legofs_badfs_bench.sh" "$PAYLOAD_ROOT/bin/badfs-bench"
 install -m 0755 "$CARGO_TARGET/$RUST_MUSL_TARGET/release/libbadfs_intercept.so" \
 	"$PAYLOAD_ROOT/lib/libbadfs_intercept.so"
 cp -a "$MPICH_PREFIX/lib/"libmpi.so* "$PAYLOAD_ROOT/lib/"
@@ -517,7 +520,7 @@ for applet in sh mount mkdir mknod cat tr basename readlink sleep ip hostname \
 	kill sync poweroff reboot nc printf seq env chmod ls ps grep sed awk find; do
 	ln -s busybox "$INITRAMFS/bin/$applet"
 done
-install -m 0755 "$ROOT/guest/legofs_io500_init.sh" "$INITRAMFS/init"
+install -m 0755 "$ROOT/guest/legofs_io500_bootstrap_init.sh" "$INITRAMFS/init"
 install -m 0755 "$MUSL_PREFIX/lib/libc.so" "$INITRAMFS/lib/ld-musl-riscv64.so.1"
 ln -s ld-musl-riscv64.so.1 "$INITRAMFS/lib/libc.so"
 
@@ -543,8 +546,8 @@ install -m 0644 "$LINUX_BUILD/arch/riscv/boot/Image" "$PLATFORM/linux-io500-Imag
 for binary in "$PAYLOAD_ROOT/bin/io500" "$PAYLOAD_ROOT/bin/io500-verify" \
 	"$PAYLOAD_ROOT/bin/mpiexec.hydra" "$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_ROOT/bin/mpi-hello" "$PAYLOAD_ROOT/bin/export-io500-results" \
-	"$PAYLOAD_ROOT/bin/badfs-server" \
-	"$PAYLOAD_ROOT/bin/badfs-bench" "$PAYLOAD_ROOT/lib/libmpi.so" \
+	"$PAYLOAD_ROOT/bin/badfs-server.real" \
+	"$PAYLOAD_ROOT/bin/badfs-bench.real" "$PAYLOAD_ROOT/lib/libmpi.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so" \
 	"$PAYLOAD_ROOT/lib/libsyscall_intercept.so" \
 	"$PAYLOAD_ROOT/lib/libbadfs_intercept.so"; do
@@ -575,7 +578,7 @@ require_needed "$PAYLOAD_ROOT/lib/libunwind.so" libc.so
 require_needed "$PAYLOAD_ROOT/bin/export-io500-results" libc.so
 require_unwind_provider "$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so"
-for binary in "$PAYLOAD_ROOT/bin/badfs-server" "$PAYLOAD_ROOT/bin/badfs-bench"; do
+for binary in "$PAYLOAD_ROOT/bin/badfs-server.real" "$PAYLOAD_ROOT/bin/badfs-bench.real"; do
 	"${CROSS_COMPILE}readelf" -l "$binary" | grep -q INTERP &&
 		die "static LegoFS binary has an interpreter: $binary"
 done

@@ -35,33 +35,43 @@ set_guest_time()
 		return 1
 	}
 	observed="$(/bin/busybox date -u +%s)" || return 1
+	# The tiny-stage syscall preflight deliberately runs before IO500.  Its
+	# ranks remove this marker and wait for the runner to perform a fresh,
+	# topology-wide synchronization before entering the measured phases.
+	/bin/busybox touch /run/io500-clock-synced
 	echo "LEGOFS_IO500_TIME_SYNC role=$role index=$index requested=$requested observed=$observed"
 }
 
-mkdir -p /proc /sys /dev /run /tmp /payload /state /results /etc
-mount -t proc proc /proc || fail mount-proc
-mount -t sysfs sysfs /sys || fail mount-sys
-mount -t devtmpfs devtmpfs /dev || grep -q ' /dev devtmpfs ' /proc/mounts || fail mount-dev
-exec </dev/console >/dev/console 2>&1
-mount -t tmpfs tmpfs /run || fail mount-run
-mount -t tmpfs tmpfs /tmp || fail mount-tmp
-mkdir -p /tmp/posix /dev/pts
-mount -t devpts devpts /dev/pts || fail mount-devpts
+if [ "${LEGOFS_PAYLOAD_RUNTIME:-0}" != 1 ]; then
+	mkdir -p /proc /sys /dev /run /tmp /payload /state /results /etc
+	mount -t proc proc /proc || fail mount-proc
+	mount -t sysfs sysfs /sys || fail mount-sys
+	mount -t devtmpfs devtmpfs /dev || grep -q ' /dev devtmpfs ' /proc/mounts || fail mount-dev
+	exec </dev/console >/dev/console 2>&1
+	mount -t tmpfs tmpfs /run || fail mount-run
+	mount -t tmpfs tmpfs /tmp || fail mount-tmp
+	mkdir -p /tmp/posix /dev/pts
+	mount -t devpts devpts /dev/pts || fail mount-devpts
+	mount -t ext2 -o ro /dev/vda /payload || fail mount-payload
+else
+	mkdir -p /tmp/posix /state /results /etc
+fi
 
 role="$(cmdline_value io500.role=)" || fail missing-role
 index="$(cmdline_value io500.index=)" || fail missing-index
 stage="$(cmdline_value io500.stage=)" || fail missing-stage
 server_count="$(cmdline_value io500.server_count=)" || fail missing-server-count
 client_count="$(cmdline_value io500.client_count=)" || fail missing-client-count
+serving_transport="$(cmdline_value io500.serving_transport=)" || fail missing-serving-transport
 case "$role" in server|client) ;; *) fail invalid-role ;; esac
 case "$index" in ''|*[!0-9]*) fail invalid-index ;; esac
 case "$server_count" in 1|2) ;; *) fail invalid-server-count ;; esac
+case "$serving_transport" in legacy|cxl) ;; *) fail invalid-serving-transport ;; esac
 case "$client_count" in 1|2|3|4|5|6|7|8|9|10) ;; *) fail invalid-client-count ;; esac
 if [ "$role" = server ] && [ "$index" -ge "$server_count" ]; then
 	fail invalid-server-index
 fi
 
-mount -t ext2 -o ro /dev/vda /payload || fail mount-payload
 if [ "$role" = server ]; then
 	# Product WAL/state writers issue their own fsyncs.  A synchronous mount also
 	# serializes every diagnostic trace append and hides the product cost behind
@@ -104,6 +114,7 @@ printf '%s\n' "$dax_path" > /run/dax-path
 printf '%s\n' "$dax_align" > /run/dax-align
 printf '%s\n' "$index" > /run/endpoint-id
 printf '%s\n' "$server_count" > /run/server-count
+printf '%s\n' "$serving_transport" > /run/serving-transport
 printf '%s\n' "$client_count" > /run/client-count
 
 server_addresses=
@@ -164,7 +175,7 @@ export BADFS_CXL_MAP_ALIGNMENT="$dax_align"
 export BADFS_BASE_PATH=/badfs
 export BADFS_DISTRIBUTOR=consistent
 export BADFS_FSYNC_ON_CLOSE=1
-export BADFS_TRACK_OPEN_SET=0
+export BADFS_TRACK_OPEN_SET=1
 export BADFS_FABRIC_STAGED_IO=0
 export BADFS_DISABLE_FABRIC_MMAP=0
 export BADFS_LIFECYCLE_COHERENT_PUBLICATION=1
@@ -172,6 +183,13 @@ export BADFS_LIFECYCLE_COHERENT_READ_CACHE=1
 export BADFS_LIFECYCLE_READ_CACHE_ENTRIES=2048
 export BADFS_LIFECYCLE_WRITE_ARENA_SLOTS=64
 export BADFS_CLIENT_ENDPOINT_ID="$index"
+export BADFS_SERVING_TRANSPORT="$serving_transport"
+export BADFS_SERVING_MAX_CLIENTS=64
+export BADFS_LIFECYCLE_REGION_SIZE=68719476736
+export BADFS_SERVER_COUNT="$server_count"
+export BADFS_LIFECYCLE_DEVICES="$lifecycle_devices"
+export BADFS_CLUSTER_GENERATION=1
+export BADFS_LOG_STREAM_GENERATION=1
 if [ "$stage" = tiny ]; then
 	export RUST_LOG=info,tarpc=error
 else
@@ -182,9 +200,9 @@ if [ "$role" = server ]; then
 	partition_size=$((68719476736 / server_count))
 	partition_offset=$((index * partition_size))
 	export BADFS_LIFECYCLE_DEVICE="$dax_path"
-	export BADFS_LIFECYCLE_REGION_SIZE=68719476736
 	export BADFS_LIFECYCLE_POOL_OFFSET="$partition_offset"
 	export BADFS_LIFECYCLE_POOL_SIZE="$partition_size"
+	export BADFS_SERVER_INDEX="$index"
 	export BADFS_LIFECYCLE_MAX_EXTENTS="$((32760 / server_count))"
 	export BADFS_SERVER_ADDR=0.0.0.0:3345
 	export BADFS_DATA_DIR=/state/badfs-data
@@ -200,8 +218,11 @@ if [ "$role" = server ]; then
 	fi
 	/payload/bin/badfs-server &
 	server_pid=$!
-	attempt=0
-	while [ "$attempt" -lt 240 ]; do
+	server_generation="$BADFS_CLUSTER_GENERATION"
+	# The host runner owns the bounded readiness deadline. Under TCG a valid
+	# CXL persistence operation can consume more than 60 guest seconds, so PID 1
+	# must not invent a second, shorter timeout while the server is still alive.
+	while :; do
 		if ! kill -0 "$server_pid" 2>/dev/null; then
 			wait "$server_pid"
 			fail server-exit "$?"
@@ -220,19 +241,74 @@ if [ "$role" = server ]; then
 					sync
 					poweroff -f
 					;;
+				LEGOFS_SERVER_CLEAN_RESTART\ *)
+					target_generation="${server_line#LEGOFS_SERVER_CLEAN_RESTART }"
+					case "$target_generation" in
+					''|*[!0-9]*) echo "LEGOFS_IO500_SERVER_RESTART_ERROR reason=invalid-generation"; continue ;;
+					esac
+					if [ "$target_generation" -le "$server_generation" ]; then
+						echo "LEGOFS_IO500_SERVER_RESTART_ERROR reason=non-forward-generation"
+						continue
+					fi
+					old_pid="$server_pid"
+					echo "LEGOFS_IO500_SERVER_RESTART_BEGIN index=$index old_pid=$old_pid old_generation=$server_generation target_generation=$target_generation"
+					kill "$old_pid" 2>/dev/null || true
+					wait "$old_pid" 2>/dev/null
+					old_rc=$?
+					echo "LEGOFS_IO500_SERVER_OLD_EXIT index=$index old_pid=$old_pid rc=$old_rc"
+					export BADFS_CLUSTER_GENERATION="$target_generation"
+					export BADFS_START_MODE=clean_restart
+					/payload/bin/badfs-server &
+					server_pid=$!
+					server_generation="$target_generation"
+					while :; do
+						if ! kill -0 "$server_pid" 2>/dev/null; then
+							wait "$server_pid" 2>/dev/null
+							echo "LEGOFS_IO500_SERVER_RESTART_ERROR reason=successor-exit rc=$?"
+							break
+						fi
+						if /bin/busybox nc -z -w 1 127.0.0.1 3345 2>/dev/null; then
+							echo "LEGOFS_IO500_SERVER_RESTARTED index=$index old_pid=$old_pid new_pid=$server_pid generation=$server_generation"
+							break
+						fi
+						sleep 0.25
+					done
+					;;
+				LEGOFS_SERVER_UNAUTHORIZED_RESTART_PROBE\ *)
+					target_generation="${server_line#LEGOFS_SERVER_UNAUTHORIZED_RESTART_PROBE }"
+					case "$target_generation" in
+					''|*[!0-9]*) echo "LEGOFS_IO500_UNAUTHORIZED_RESTART_ERROR reason=invalid-generation"; continue ;;
+					esac
+					if [ "$target_generation" -le "$server_generation" ]; then
+						echo "LEGOFS_IO500_UNAUTHORIZED_RESTART_ERROR reason=non-forward-generation"
+						continue
+					fi
+					if (
+						export BADFS_CLUSTER_GENERATION="$target_generation"
+						export BADFS_START_MODE=clean_restart
+						export BADFS_SERVER_ADDR=127.0.0.1:3346
+						/payload/bin/badfs-server
+					); then
+						probe_rc=0
+					else
+						probe_rc=$?
+					fi
+					if /bin/busybox nc -z -w 1 127.0.0.1 3346 2>/dev/null; then
+						echo "LEGOFS_IO500_UNAUTHORIZED_RESTART_ERROR reason=listener-open rc=$probe_rc"
+					else
+						echo "LEGOFS_IO500_UNAUTHORIZED_RESTART_REJECTED index=$index target_generation=$target_generation listener_open=0 rc=$probe_rc"
+					fi
+					;;
 				*) echo "LEGOFS_IO500_COMMAND_ERROR index=$index" ;;
 				esac
 			done
 			fail console-eof
 		fi
-		attempt=$((attempt + 1))
 		sleep 0.25
 	done
-	fail server-ready-timeout
 fi
 
 export BADFS_SERVERS="$server_addresses"
-export BADFS_LIFECYCLE_DEVICES="$lifecycle_devices"
 echo "LEGOFS_IO500_CLIENT_READY index=$index"
 
 while IFS= read -r line; do
@@ -284,6 +360,58 @@ while IFS= read -r line; do
 		BADFS_BENCH_MODE=inspect /payload/bin/badfs-bench
 		rc=$?
 		echo "LEGOFS_IO500_INSPECT_EXIT index=$index rc=$rc"
+		;;
+	LEGOFS_INSPECT_ENDPOINT\ *)
+		inspect_endpoint="${line#LEGOFS_INSPECT_ENDPOINT }"
+		case "$inspect_endpoint" in
+		''|*[!0-9]*) echo "LEGOFS_IO500_INSPECT_ENDPOINT_ERROR index=$index"; continue ;;
+		esac
+		if [ "$inspect_endpoint" -ge 44 ]; then
+			echo "LEGOFS_IO500_INSPECT_ENDPOINT_ERROR index=$index reason=role-reserved"
+			continue
+		fi
+		BADFS_CLIENT_ENDPOINT_ID="$inspect_endpoint" \
+		BADFS_BENCH_MODE=inspect /payload/bin/badfs-bench.real
+		rc=$?
+		echo "LEGOFS_IO500_INSPECT_ENDPOINT_EXIT index=$index endpoint=$inspect_endpoint rc=$rc"
+		;;
+	LEGOFS_CLEAN_RESTART_CONTROL\ *)
+		set -- ${line#LEGOFS_CLEAN_RESTART_CONTROL }
+		if [ "$#" -ne 2 ]; then
+			echo "LEGOFS_IO500_CLEAN_RESTART_CONTROL_ERROR index=$index reason=arguments"
+			continue
+		fi
+		target_generation="$1"
+		nonce="$2"
+		BADFS_BENCH_MODE=clean-restart-control \
+		BADFS_CLEAN_RESTART_TARGET_GENERATION="$target_generation" \
+		BADFS_CLEAN_RESTART_NONCE="$nonce" \
+		/payload/bin/badfs-bench.real
+		rc=$?
+		echo "LEGOFS_IO500_CLEAN_RESTART_CONTROL_EXIT index=$index target_generation=$target_generation rc=$rc"
+		;;
+	LEGOFS_CLIENT_GENERATION\ *)
+		target_generation="${line#LEGOFS_CLIENT_GENERATION }"
+		case "$target_generation" in
+		''|*[!0-9]*) echo "LEGOFS_IO500_CLIENT_GENERATION_ERROR index=$index"; continue ;;
+		esac
+		export BADFS_CLUSTER_GENERATION="$target_generation"
+		echo "LEGOFS_IO500_CLIENT_GENERATION_SET index=$index generation=$BADFS_CLUSTER_GENERATION"
+		;;
+	LEGOFS_CLEAN_RESTART_COHORT\ *)
+		set -- ${line#LEGOFS_CLEAN_RESTART_COHORT }
+		if [ "$#" -ne 2 ]; then
+			echo "LEGOFS_IO500_CLEAN_RESTART_COHORT_ERROR index=$index reason=arguments"
+			continue
+		fi
+		cohort_action="$1"
+		cohort_endpoint="$2"
+		BADFS_BENCH_MODE=clean-restart-cohort \
+		BADFS_CLEAN_RESTART_COHORT_ACTION="$cohort_action" \
+		BADFS_CLIENT_ENDPOINT_ID="$cohort_endpoint" \
+		/payload/bin/badfs-bench.real
+		rc=$?
+		echo "LEGOFS_IO500_CLEAN_RESTART_COHORT_EXIT index=$index action=$cohort_action endpoint=$cohort_endpoint generation=$BADFS_CLUSTER_GENERATION rc=$rc"
 		;;
 	LEGOFS_DUMP_SUMMARIES)
 		for summary in /tmp/posix/*.json; do

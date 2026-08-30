@@ -7,11 +7,16 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+TOP_LEVEL_RUNNER = ROOT / "run-legofs-io500.sh"
 RUNNER = ROOT / "scripts" / "legofs_io500.py"
 BUILD_SCRIPT = ROOT / "scripts" / "build_legofs_io500.sh"
+PAYLOAD_REBUILD_SCRIPT = ROOT / "scripts" / "rebuild_legofs_io500_payload.sh"
+BOOTSTRAP_REBUILD_SCRIPT = ROOT / "scripts" / "rebuild_legofs_io500_bootstrap.sh"
 NOV_GCC = ROOT / "scripts" / "riscv64-nov-gcc"
 RANK_SCRIPT = ROOT / "guest" / "legofs_io500_rank.sh"
+BENCH_WRAPPER = ROOT / "guest" / "legofs_badfs_bench.sh"
 INIT_SCRIPT = ROOT / "guest" / "legofs_io500_init.sh"
+BOOTSTRAP_INIT_SCRIPT = ROOT / "guest" / "legofs_io500_bootstrap_init.sh"
 
 
 def load_runner():
@@ -19,6 +24,117 @@ def load_runner():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def cxl_serving_evidence(endpoint, submitted=1):
+    return [{
+        "authority_id": 0,
+        "lane_id": endpoint,
+        "lane_role": "client_fs",
+        "format_generation": 1,
+        "session_generation": 2,
+        "lane_generation": 3,
+        "bootstrap_tcp_connections": 1,
+        "bootstrap_tcp_exchanges": 1,
+        "bootstrap_tcp_bytes": 128,
+        "sqe_submitted": submitted,
+        "cqe_consumed": submitted,
+        "shared_sequences": {
+            "sq_produced": submitted,
+            "sq_consumed": submitted,
+            "cq_produced": submitted,
+            "cq_consumed": submitted,
+        },
+        "authority_timing": {
+            "sqe_consumed": submitted,
+            "cqe_published": submitted,
+            "authority_queue_wait_ns": submitted,
+            "dispatcher_backend_ns": submitted,
+            "cqe_publish_ns": submitted,
+        },
+        "client_timing": {
+            "calls": submitted,
+            "call_gate_wait_ns": submitted,
+            "syscall_prepare_ns": submitted,
+            "sq_credit_wait_ns": 0,
+            "sq_publish_ns": submitted,
+            "cq_wait_ns": submitted,
+        },
+        "dispatches_by_opcode": {"35": 1} if submitted == 1 else {
+            "1": submitted - 1,
+            "35": 1,
+        },
+        "unsupported_serving_calls_after_cxl_ready": 0,
+        "filesystem_tcp_requests_after_cxl_ready": 0,
+        "legacy_tarpc_calls_after_cxl_ready": 0,
+        "blob_tcp_bytes_after_cxl_ready": 0,
+        "transport_fallbacks_after_cxl_ready": 0,
+    }]
+
+
+def recovery_checkpoint(server=0):
+    return {
+        "schema_version": "badfs.recovery-control.inspection.v1",
+        "server": server,
+        "retirement": {
+            "identity": {
+                "authority": server,
+                "serving_incarnation": (1 << 32) | (server + 1),
+            },
+            "retired_lanes": 4,
+            "active_client_lanes": 0,
+        },
+        "checkpoint": {
+            "identity": {
+                "authority": server,
+                "serving_incarnation": (1 << 32) | server + 1,
+            },
+            "data_domain": "lifecycle",
+            "metadata_lsn": 7,
+            "data_lsn": 0,
+            "lifecycle_lsn": 7,
+        },
+        "transport": {
+            "authority_id": server,
+            "lane_id": 60 + server,
+            "lane_role": "recovery_control",
+            "format_generation": 1,
+            "session_generation": 2,
+            "lane_generation": 3,
+            "bootstrap_tcp_connections": 1,
+            "bootstrap_tcp_exchanges": 1,
+            "bootstrap_tcp_bytes": 128,
+            "sqe_submitted": 2,
+            "cqe_consumed": 2,
+            "shared_sequences": {
+                "sq_produced": 2,
+                "sq_consumed": 2,
+                "cq_produced": 2,
+                "cq_consumed": 2,
+            },
+            "authority_timing": {
+                "sqe_consumed": 2,
+                "cqe_published": 2,
+                "authority_queue_wait_ns": 1,
+                "dispatcher_backend_ns": 1,
+                "cqe_publish_ns": 0,
+            },
+            "client_timing": {
+                "calls": 2,
+                "call_gate_wait_ns": 1,
+                "syscall_prepare_ns": 1,
+                "sq_credit_wait_ns": 0,
+                "sq_publish_ns": 1,
+                "cq_wait_ns": 1,
+            },
+            "dispatches_by_opcode": {"1": 1, "2": 1},
+            "unsupported_serving_calls_after_cxl_ready": 0,
+            "filesystem_tcp_requests_after_cxl_ready": 0,
+            "legacy_tarpc_calls_after_cxl_ready": 0,
+            "blob_tcp_bytes_after_cxl_ready": 0,
+            "transport_fallbacks_after_cxl_ready": 0,
+        },
+    }
 
 
 class Io500RuntimeTest(unittest.TestCase):
@@ -32,6 +148,60 @@ class Io500RuntimeTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_functional_model_never_claims_physical_hardware_evidence(self):
+        evidence = self.runner.functional_model_evidence()
+        self.assertTrue(evidence["functional_model_only"])
+        self.assertFalse(evidence["guest_visible_cxl_evidence"])
+        self.assertFalse(evidence["physical_hardware_evidence"])
+        self.assertFalse(evidence["physical_cxl_evidence"])
+
+    def test_multi_authority_fabric_requires_completed_durable_transaction(self):
+        fabric = {
+            "authority_internal_submitted": 8,
+            "authority_internal_completed": 8,
+            "authority_prepare_receipts": 4,
+            "authority_committed_transactions": 4,
+            "authority_marker_publications": 8,
+            "authority_durable_prefix": 8,
+            "authority_journal_record_persists": 8,
+            "authority_journal_anchor_persists": 10,
+        }
+        self.runner.validate_authority_internal_fabric(fabric, 2)
+        self.runner.validate_authority_internal_fabric({}, 1)
+
+        for key, value in (
+            ("authority_internal_completed", 7),
+            ("authority_prepare_receipts", 0),
+            ("authority_committed_transactions", 0),
+            ("authority_marker_publications", 7),
+            ("authority_durable_prefix", 7),
+            ("authority_journal_record_persists", 7),
+            ("authority_journal_anchor_persists", 8),
+        ):
+            broken = dict(fabric)
+            broken[key] = value
+            with self.assertRaises(ValueError, msg=key):
+                self.runner.validate_authority_internal_fabric(broken, 2)
+
+    def test_recovery_control_checkpoint_requires_exact_cxl_lane_evidence(self):
+        records = [recovery_checkpoint(0), recovery_checkpoint(1)]
+        self.runner.validate_recovery_control_checkpoints(records, 2)
+
+        broken = json.loads(json.dumps(records))
+        broken[1]["transport"]["filesystem_tcp_requests_after_cxl_ready"] = 1
+        with self.assertRaisesRegex(ValueError, "filesystem_tcp_requests"):
+            self.runner.validate_recovery_control_checkpoints(broken, 2)
+
+        broken = json.loads(json.dumps(records))
+        broken[0]["checkpoint"]["lifecycle_lsn"] = 6
+        with self.assertRaisesRegex(ValueError, "durable cursor"):
+            self.runner.validate_recovery_control_checkpoints(broken, 2)
+
+        broken = json.loads(json.dumps(records))
+        broken[0]["transport"]["lane_id"] = 59
+        with self.assertRaisesRegex(ValueError, "lane identity"):
+            self.runner.validate_recovery_control_checkpoints(broken, 2)
 
     def test_variable_client_count_and_result_label_are_explicit(self):
         args = self.runner.parse_args(
@@ -48,6 +218,7 @@ class Io500RuntimeTest(unittest.TestCase):
         )
         self.assertEqual(args.client_count, 2)
         self.assertEqual(args.server_count, 2)
+        self.assertEqual(args.serving_transport, "legacy")
         self.assertFalse(args.server_read_exclusive)
         paths = self.runner.Paths(
             pathlib.Path(self.temporary.name), args.stage, args.result_label
@@ -61,9 +232,178 @@ class Io500RuntimeTest(unittest.TestCase):
         )
         self.assertTrue(negative_control.server_read_exclusive)
 
+        cxl = self.runner.parse_args(
+            ["--stage", "tiny", "--serving-transport", "cxl"]
+        )
+        self.assertEqual(cxl.serving_transport, "cxl")
+
         init = INIT_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("io500.client_count=", RUNNER.read_text(encoding="utf-8"))
         self.assertIn('-n "$client_count"', init)
+
+    def test_clean_restart_fault_is_cxl_only_and_guest_commands_are_explicit(self):
+        args = self.runner.parse_args([
+            "--stage", "tiny",
+            "--server-count", "1",
+            "--client-count", "2",
+            "--serving-transport", "cxl",
+            "--fault-profile", "clean-server-restart",
+        ])
+        self.assertEqual(args.fault_profile, "clean-server-restart")
+        init = INIT_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("LEGOFS_SERVER_CLEAN_RESTART", init)
+        self.assertIn("BADFS_START_MODE=clean_restart", init)
+        self.assertIn("LEGOFS_CLEAN_RESTART_CONTROL", init)
+        self.assertIn("LEGOFS_CLIENT_GENERATION", init)
+        self.assertIn("LEGOFS_CLEAN_RESTART_COHORT", init)
+        self.assertNotIn("server-ready-timeout", init)
+        self.assertIn("host runner owns the bounded readiness deadline", init)
+
+    def test_unauthorized_clean_successor_probe_is_an_explicit_tiny_cxl_gate(self):
+        args = self.runner.parse_args([
+            "--stage", "tiny",
+            "--server-count", "1",
+            "--client-count", "2",
+            "--serving-transport", "cxl",
+            "--fault-profile", "reject-unauthorized-clean-restart",
+        ])
+        self.assertEqual(args.fault_profile, "reject-unauthorized-clean-restart")
+        init = INIT_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("LEGOFS_SERVER_UNAUTHORIZED_RESTART_PROBE", init)
+        self.assertIn("LEGOFS_IO500_UNAUTHORIZED_RESTART_REJECTED", init)
+        self.assertIn("listener_open=0", init)
+
+    def test_active_lane_retirement_probe_is_an_explicit_tiny_cxl_gate(self):
+        args = self.runner.parse_args([
+            "--stage", "tiny",
+            "--server-count", "1",
+            "--client-count", "2",
+            "--serving-transport", "cxl",
+            "--fault-profile", "reject-active-clean-retirement",
+        ])
+        self.assertEqual(args.fault_profile, "reject-active-clean-retirement")
+        bench = (ROOT / "components/legofs/badfs-bench/src/main.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"hold" =>', bench)
+        self.assertIn("badfs_clean_restart_hold_ready", bench)
+
+        record = {
+            "retirement": {"active_client_lanes": 1, "retired_lanes": 3},
+            "transport": {
+                "filesystem_tcp_requests_after_cxl_ready": 0,
+                "legacy_tarpc_calls_after_cxl_ready": 0,
+                "blob_tcp_bytes_after_cxl_ready": 0,
+                "transport_fallbacks_after_cxl_ready": 0,
+            },
+        }
+
+        class FakeConsole:
+            def __init__(self, index):
+                self.index = index
+                self.output = ""
+
+            def send(self, command):
+                if command == "LEGOFS_CLEAN_RESTART_COHORT hold 42":
+                    self.output += "badfs_clean_restart_hold_ready hold_ms=30000\n"
+                    self.output += (
+                        "LEGOFS_IO500_CLEAN_RESTART_COHORT_EXIT index=0 "
+                        "action=hold endpoint=42 generation=1 rc=0\n"
+                    )
+                elif command == "LEGOFS_INSPECT_ENDPOINT 41":
+                    self.output += (
+                        "badfs_recovery_control_checkpoint "
+                        + json.dumps(record)
+                        + "\nLEGOFS_IO500_INSPECT_ENDPOINT_EXIT "
+                        "index=1 endpoint=41 rc=0\n"
+                    )
+
+            def wait(self, marker, timeout, start=0):
+                if marker not in self.output[start:]:
+                    raise AssertionError(f"missing marker {marker!r}")
+
+        original_parser = self.runner.parse_server_inspection
+        self.runner.parse_server_inspection = lambda *args, **kwargs: {
+            "recovery_control": record
+        }
+        try:
+            evidence = self.runner.run_active_lane_retirement_probe(
+                [FakeConsole(0), FakeConsole(1)], 1
+            )
+        finally:
+            self.runner.parse_server_inspection = original_parser
+        self.assertEqual(
+            evidence["lifecycle_inspection"]["recovery_control"]
+            ["retirement"]["active_client_lanes"],
+            1,
+        )
+
+    def test_cxlmemsim_tcp_port_is_reserved_with_listener_address_scope(self):
+        runner = RUNNER.read_text(encoding="utf-8")
+        self.assertIn('tcp.bind(("0.0.0.0", 0))', runner)
+
+    def test_clean_restart_fault_orders_cohorts_and_requires_exact_cxl_opcodes(self):
+        control = {
+            "transport": {
+                "filesystem_tcp_requests_after_cxl_ready": 0,
+                "legacy_tarpc_calls_after_cxl_ready": 0,
+                "blob_tcp_bytes_after_cxl_ready": 0,
+                "transport_fallbacks_after_cxl_ready": 0,
+                "dispatches_by_opcode": {"2": 1, "3": 1, "4": 1},
+            }
+        }
+
+        class FakeConsole:
+            def __init__(self, index):
+                self.index = index
+                self.output = ""
+                self.commands = []
+
+            def send(self, command):
+                self.commands.append(command)
+                if command.startswith("LEGOFS_CLEAN_RESTART_COHORT"):
+                    _, action, endpoint = command.split()
+                    generation = 1 if action in ("produce", "observe") else 2
+                    self.output += (
+                        "LEGOFS_IO500_CLEAN_RESTART_COHORT_EXIT "
+                        f"index={self.index} action={action} endpoint={endpoint} "
+                        f"generation={generation} rc=0\n"
+                    )
+                elif command.startswith("LEGOFS_CLEAN_RESTART_CONTROL"):
+                    self.output += "badfs_clean_restart_control " + json.dumps(control) + "\n"
+                    self.output += (
+                        "LEGOFS_IO500_CLEAN_RESTART_CONTROL_EXIT "
+                        "index=0 target_generation=2 rc=0\n"
+                    )
+                elif command == "LEGOFS_SERVER_CLEAN_RESTART 2":
+                    self.output += "LEGOFS_IO500_SERVER_RESTARTED index=0 generation=2\n"
+                elif command == "LEGOFS_CLIENT_GENERATION 2":
+                    self.output += (
+                        "LEGOFS_IO500_CLIENT_GENERATION_SET "
+                        f"index={self.index} generation=2\n"
+                    )
+
+            def wait(self, marker, timeout, start=0):
+                if marker not in self.output[start:]:
+                    raise AssertionError(f"missing marker {marker!r}")
+
+        server = FakeConsole(0)
+        clients = [FakeConsole(0), FakeConsole(1)]
+        evidence = self.runner.run_clean_restart_fault(server, clients, 1)
+        self.assertTrue(evidence["functional_model_only"])
+        self.assertFalse(evidence["physical_hardware_evidence"])
+        self.assertEqual(evidence["cohort_a"], ["produce", "observe"])
+        self.assertEqual(evidence["cohort_b"], ["recover", "delete"])
+        self.assertEqual(server.commands, ["LEGOFS_SERVER_CLEAN_RESTART 2"])
+        self.assertEqual(
+            clients[0].commands,
+            [
+                "LEGOFS_CLEAN_RESTART_COHORT produce 42",
+                "LEGOFS_CLEAN_RESTART_CONTROL 2 7640891576956012809",
+                "LEGOFS_CLIENT_GENERATION 2",
+                "LEGOFS_CLEAN_RESTART_COHORT recover 42",
+            ],
+        )
 
     def test_topology_has_unique_hosts_on_one_shared_device_dram(self):
         commands = [
@@ -201,6 +541,10 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn('BADFS_LIFECYCLE_DEVICES="$(cat /run/lifecycle-devices)"', rank)
         self.assertIn("BADFS_LIFECYCLE_POOL_OFFSET", init)
         self.assertIn("BADFS_LIFECYCLE_REGION_SIZE=68719476736", init)
+        self.assertIn('BADFS_SERVING_TRANSPORT="$serving_transport"', init)
+        self.assertIn('BADFS_SERVER_INDEX="$index"', init)
+        self.assertIn('export BADFS_SERVING_TRANSPORT="$serving_transport"', rank)
+        self.assertIn("BADFS_LIFECYCLE_REGION_SIZE=68719476736", rank)
         self.assertNotIn('BADFS_FABRIC_REGION_ID=', init + rank)
 
     def test_sifive_u_payload_build_has_strict_isa_and_intercept_abi(self):
@@ -241,7 +585,193 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("/lib/ld-musl-riscv64.so.1", build)
         self.assertNotIn("/usr/riscv64-linux-gnu/lib/*.so", build)
 
-    def test_manifest_checks_live_artifacts_without_hash_or_head_gate(self):
+    def test_payload_only_mode_is_explicit_and_mutually_exclusive(self):
+        runner = TOP_LEVEL_RUNNER.read_text(encoding="utf-8")
+        self.assertIn("PAYLOAD_ONLY=0", runner)
+        self.assertIn("--payload-only", runner)
+        self.assertIn(
+            "((BUILD_ONLY + RUN_ONLY + PAYLOAD_ONLY <= 1))",
+            runner,
+        )
+        self.assertIn(
+            '"$ROOT/scripts/rebuild_legofs_io500_payload.sh" --jobs "$JOBS"',
+            runner,
+        )
+
+    def test_payload_only_rebuild_cannot_rebuild_platform(self):
+        rebuild = PAYLOAD_REBUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("build_legofs_type3.sh", rebuild)
+        self.assertNotIn("components/qemu", rebuild)
+        self.assertNotIn("components/linux", rebuild)
+        self.assertNotIn("components/cxlmemsim", rebuild)
+        for artifact in (
+            "$PLATFORM/qemu-system-riscv64",
+            "$PLATFORM/cxlmemsim_server",
+            "$PLATFORM/fw_dynamic.bin",
+            "$PLATFORM/u-boot.bin",
+            "$PLATFORM/linux-io500-Image",
+        ):
+            self.assertIn(f'require_file "{artifact}"', rebuild)
+        self.assertIn("platform_hashes_before=", rebuild)
+        self.assertIn("platform artifacts changed during payload-only rebuild", rebuild)
+
+    def test_mutable_guest_control_loop_lives_in_payload(self):
+        bootstrap = BOOTSTRAP_INIT_SCRIPT.read_text(encoding="utf-8")
+        full_build = BUILD_SCRIPT.read_text(encoding="utf-8")
+        payload_build = PAYLOAD_REBUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("/payload/bin/legofs-io500-init", bootstrap)
+        self.assertIn("legofs_io500_bootstrap_init.sh", full_build)
+        self.assertIn(
+            '"$PAYLOAD_TREE/bin/legofs-io500-init"', payload_build
+        )
+        self.assertNotIn("LEGOFS_SERVER_CLEAN_RESTART", bootstrap)
+        bootstrap_rebuild = BOOTSTRAP_REBUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("legofs_io500_bootstrap_init.sh", bootstrap_rebuild)
+        self.assertIn("non-Linux platform artifacts changed", bootstrap_rebuild)
+        self.assertNotIn("cxlmemsim_server --", bootstrap_rebuild)
+
+    def test_payload_only_rebuild_reuses_dependencies_and_builds_legofs(self):
+        rebuild = PAYLOAD_REBUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('RUST_SYSROOT="$(rustc --print sysroot)"', rebuild)
+        self.assertIn('$RUST_SYSROOT/lib/rustlib/$RUST_TARGET/lib', rebuild)
+        self.assertNotIn("rustup target list --installed", rebuild)
+        for reused in (
+            "$SOURCES/io500/io500",
+            "$SOURCES/io500/io500-verify",
+            "$MPICH_PREFIX/bin/mpiexec.hydra",
+            "$MPICH_PREFIX/bin/hydra_pmi_proxy",
+            "$SYSINT_BUILD_ROOT/build/libsyscall_intercept.so.0",
+            "$LIBUNWIND_PREFIX/lib/libunwind.so.1",
+        ):
+            self.assertIn(f'require_file "{reused}"', rebuild)
+        self.assertIn("-p badfs-server -p badfs-bench", rebuild)
+        self.assertIn("-p badfs-intercept", rebuild)
+        self.assertIn("--features syscall-intercept-backend", rebuild)
+        self.assertIn('"${CROSS_COMPILE}strip" --strip-debug', rebuild)
+        self.assertIn("require_sifive_u_isa", rebuild)
+        self.assertIn("require_syscall_intercept_abi", rebuild)
+        self.assertIn("reject_glibc_versions", rebuild)
+
+    def test_payload_only_image_and_manifest_are_atomic_and_hashed(self):
+        rebuild = PAYLOAD_REBUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('mktemp -d "$TARGET_ROOT/.payload-build.XXXXXX"', rebuild)
+        self.assertIn('mktemp "$IMAGES/.io500-payload.ext2.XXXXXX"', rebuild)
+        self.assertIn(
+            'mv -f -- "$PAYLOAD_IMAGE_TMP" "$PAYLOAD_IMAGE"',
+            rebuild,
+        )
+        self.assertNotIn('rm -rf -- "$PAYLOAD_ROOT"', rebuild)
+        self.assertIn('--source "legofs=$LEGOFS_ROOT"', rebuild)
+        self.assertNotIn("--no-artifact-hashes", rebuild)
+        for artifact in (
+            '"qemu=$PLATFORM/qemu-system-riscv64"',
+            '"cxlmemsim_server=$PLATFORM/cxlmemsim_server"',
+            '"linux=$PLATFORM/linux-io500-Image"',
+            '"payload=$PAYLOAD_IMAGE"',
+            '"badfs_server=$PAYLOAD_ROOT/bin/badfs-server.real"',
+            '"badfs_bench=$PAYLOAD_ROOT/bin/badfs-bench.real"',
+            '"badfs_intercept=$PAYLOAD_ROOT/lib/libbadfs_intercept.so"',
+        ):
+            self.assertIn(f'--artifact {artifact}', rebuild)
+
+    def test_cxl_inspection_uses_a_fresh_shared_region_lane(self):
+        wrapper = BENCH_WRAPPER.read_text(encoding="utf-8")
+        rebuild = PAYLOAD_REBUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("io500.serving_transport=", wrapper)
+        self.assertIn("io500.client_count=", wrapper)
+        self.assertIn('BADFS_CLIENT_ENDPOINT_ID="$client_count"', wrapper)
+        self.assertIn("BADFS_SERVING_TRANSPORT=cxl", wrapper)
+        self.assertIn("/payload/bin/badfs-bench.real", wrapper)
+        self.assertIn('badfs-bench.real"', rebuild)
+        self.assertIn('legofs_badfs_bench.sh"', rebuild)
+
+    def test_cxl_result_export_uses_a_disjoint_post_run_lane(self):
+        rank = RANK_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('exporter_endpoint="$((2 * client_count + 1))"', rank)
+        self.assertIn('BADFS_CLIENT_ENDPOINT_ID="$exporter_endpoint"', rank)
+        self.assertIn('BADFS_POSIX_TRACE_DIR=/tmp/posix-export', rank)
+        self.assertIn('PMI_RANK= PMIX_RANK= OMPI_COMM_WORLD_RANK=', rank)
+        self.assertIn("LEGOFS_IO500_EXPORT_POSIX_SUMMARY", rank)
+
+    def test_post_run_exporter_summary_accepts_supported_client_counts(self):
+        for client_count in (2, 4, 6, 10):
+            endpoint = 2 * client_count + 1
+            record = {
+                "schema_version": "badfs.posix.path-summary.v4",
+                "mpi_rank": None,
+                "endpoint": endpoint,
+                "intercept_enabled": True,
+                "stats": {"open_ops": 1, "read_ops": 1, "write_ops": 0},
+                "syscall_classification": {
+                    "totals": {
+                        "handled": 2,
+                        "rejected": 0,
+                        "non_badfs_forward": 1,
+                        "forbidden_badfs_forward": 0,
+                    },
+                    "syscalls": [],
+                },
+                "cxl_serving_evidence": cxl_serving_evidence(endpoint, 2),
+            }
+            parsed = self.runner.parse_post_run_exporter_summary(
+                "LEGOFS_IO500_EXPORT_POSIX_SUMMARY "
+                f"endpoint={endpoint} file=posix-export.json "
+                + json.dumps(record, separators=(",", ":"))
+                + "\n",
+                client_count,
+            )
+            self.assertEqual(parsed["endpoint"], endpoint)
+            self.assertIsNone(parsed["mpi_rank"])
+
+    def test_post_run_exporter_summary_rejects_missing_duplicate_and_wrong_identity(self):
+        client_count = 10
+        endpoint = 2 * client_count + 1
+        record = {
+            "schema_version": "badfs.posix.path-summary.v4",
+            "mpi_rank": None,
+            "endpoint": endpoint,
+            "intercept_enabled": True,
+            "stats": {"open_ops": 1, "read_ops": 1, "write_ops": 0},
+            "syscall_classification": {
+                "totals": {
+                    "handled": 2,
+                    "rejected": 0,
+                    "non_badfs_forward": 1,
+                    "forbidden_badfs_forward": 0,
+                },
+                "syscalls": [],
+            },
+            "cxl_serving_evidence": cxl_serving_evidence(endpoint, 2),
+        }
+        line = (
+            "LEGOFS_IO500_EXPORT_POSIX_SUMMARY "
+            f"endpoint={endpoint} file=posix-export.json "
+            + json.dumps(record, separators=(",", ":"))
+            + "\n"
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one exporter"):
+            self.runner.parse_post_run_exporter_summary("", client_count)
+        with self.assertRaisesRegex(ValueError, "exactly one exporter"):
+            self.runner.parse_post_run_exporter_summary(line + line, client_count)
+
+        ranked = json.loads(json.dumps(record))
+        ranked["mpi_rank"] = 0
+        with self.assertRaisesRegex(ValueError, "MPI rank identity"):
+            self.runner.validate_post_run_exporter_summary(ranked, client_count)
+
+        stale = json.loads(json.dumps(record))
+        stale["endpoint"] -= 1
+        with self.assertRaisesRegex(ValueError, "endpoint mismatch"):
+            self.runner.validate_post_run_exporter_summary(stale, client_count)
+
+        fallback = json.loads(json.dumps(record))
+        fallback["cxl_serving_evidence"][0][
+            "transport_fallbacks_after_cxl_ready"
+        ] = 1
+        with self.assertRaisesRegex(ValueError, "nonzero forbidden"):
+            self.runner.validate_post_run_exporter_summary(fallback, client_count)
+
+    def test_manifest_checks_paths_sizes_and_optional_hashes_without_head_gate(self):
         artifacts = {
             "qemu": self.paths.qemu,
             "cxlmemsim_server": self.paths.cxlmemsim,
@@ -270,6 +800,12 @@ class Io500RuntimeTest(unittest.TestCase):
         build = self.runner.verify_manifest(self.paths)
         self.assertNotIn("sha256", json.dumps(build))
 
+        manifest = json.loads(self.paths.manifest.read_text(encoding="utf-8"))
+        manifest["artifacts"]["cxlmemsim_server"]["sha256"] = "0" * 64
+        self.paths.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
+            self.runner.verify_manifest(self.paths)
+
     def test_registration_gate_requires_exact_host_and_session_sets(self):
         records = [
             {
@@ -284,6 +820,19 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertEqual([record["src_host"] for record in accepted], list(range(11)))
         with self.assertRaisesRegex(ValueError, "expected host IDs"):
             self.runner.registrations(records[:-1], 11)
+
+    def test_live_coherence_snapshot_ignores_only_unterminated_tail(self):
+        trace = pathlib.Path(self.temporary.name) / "coherence.jsonl"
+        complete = {"schema_version": 1, "event": "registration"}
+        trace.write_bytes(
+            (json.dumps(complete) + "\n").encode("utf-8")
+            + b'{"schema_version":1,"event":"request"'
+        )
+        self.assertEqual(self.runner.parse_trace(trace), [complete])
+
+        trace.write_bytes(b'{"schema_version":1,"event":}\n')
+        with self.assertRaisesRegex(ValueError, "invalid coherence JSONL"):
+            self.runner.parse_trace(trace)
 
     def test_hello_gate_requires_rank_host_mapping_and_overlap(self):
         class FakeConsole:
@@ -502,6 +1051,10 @@ class Io500RuntimeTest(unittest.TestCase):
 
         scc = self.runner.classify_io500_verifier("scc", 0, "[OK]\r\n")
         self.assertIn("rc=0", scc)
+        serial_scc = self.runner.classify_io500_verifier(
+            "scc", 0, "Verbosity: 1\r\r\n[OK]\r\r\n"
+        )
+        self.assertIn("rc=0", serial_scc)
         with self.assertRaisesRegex(RuntimeError, "failed clean verification"):
             self.runner.classify_io500_verifier(
                 "standard", 1, "[OK] But this is an invalid run!\r\n"
@@ -523,6 +1076,22 @@ class Io500RuntimeTest(unittest.TestCase):
             source.index('result["coherence_final_stats"] = json.loads'),
             source.index('if verifier["failure"] is not None'),
         )
+
+    def test_result_extraction_rejects_empty_find_even_for_tiny(self):
+        source = RUNNER.read_text()
+        self.assertIn('raise ValueError("IO500 find phase did not match any file")', source)
+        self.assertIn('if "[find]" in text', source)
+
+    def test_tiny_hard_mdtest_completes_an_io500_find_candidate(self):
+        config = (ROOT / "configs" / "io500-tiny.ini").read_text()
+        hard = config.split("[mdtest-hard]\n", 1)[1].split(
+            "[mdtest-hard-write]\n", 1
+        )[0]
+        # pfind's official pattern is `*01*`; mdtest's first deterministic
+        # matching basename is file.mdtest.<rank>.101.
+        self.assertIn("n = 102\n", hard)
+        self.assertIn("files-per-dir = 102\n", hard)
+        self.assertIn("[find]\nrun = TRUE\n", config)
 
     def test_hard_smoke_is_measurement_only_and_runs_both_shared_file_phases(self):
         config = (ROOT / "configs" / "io500-hard-smoke.ini").read_text()
@@ -567,10 +1136,11 @@ class Io500RuntimeTest(unittest.TestCase):
         records = []
         for rank in range(10):
             base = {
-                "schema_version": "badfs.posix.path-summary.v2",
+                "schema_version": "badfs.posix.path-summary.v4",
                 "mpi_rank": rank,
                 "endpoint": rank,
                 "intercept_enabled": True,
+                "cxl_serving_evidence": cxl_serving_evidence(rank),
                 "syscall_classification": {
                     "totals": {
                         "handled": 1,
@@ -592,10 +1162,11 @@ class Io500RuntimeTest(unittest.TestCase):
     def test_posix_summary_gate_rejects_rank_endpoint_mismatch(self):
         records = [
             {
-                "schema_version": "badfs.posix.path-summary.v2",
+                "schema_version": "badfs.posix.path-summary.v4",
                 "mpi_rank": rank,
                 "endpoint": rank,
                 "intercept_enabled": True,
+                "cxl_serving_evidence": cxl_serving_evidence(rank),
                 "stats": {"open_ops": 1},
                 "syscall_classification": {
                     "totals": {
@@ -611,6 +1182,50 @@ class Io500RuntimeTest(unittest.TestCase):
         ]
         records[4]["endpoint"] = 5
         with self.assertRaisesRegex(ValueError, "rank/endpoint mismatch"):
+            self.runner.validate_posix_summaries(records)
+
+    def test_posix_summary_gate_rejects_unbalanced_cxl_lane_and_fallback(self):
+        records = []
+        for rank in range(10):
+            records.append({
+                "schema_version": "badfs.posix.path-summary.v4",
+                "mpi_rank": rank,
+                "endpoint": rank,
+                "intercept_enabled": True,
+                "stats": {"open_ops": 1},
+                "syscall_classification": {
+                    "totals": {
+                        "handled": 1,
+                        "rejected": 0,
+                        "non_badfs_forward": 0,
+                        "forbidden_badfs_forward": 0,
+                    },
+                    "syscalls": [],
+                },
+                "cxl_serving_evidence": cxl_serving_evidence(rank, 2),
+            })
+
+        records[3]["cxl_serving_evidence"][0]["shared_sequences"]["sq_consumed"] = 1
+        with self.assertRaisesRegex(ValueError, "shared CXL SQ/CQ"):
+            self.runner.validate_posix_summaries(records)
+        records[3]["cxl_serving_evidence"] = cxl_serving_evidence(3, 2)
+        records[3]["cxl_serving_evidence"][0]["transport_fallbacks_after_cxl_ready"] = 1
+        with self.assertRaisesRegex(ValueError, "nonzero forbidden"):
+            self.runner.validate_posix_summaries(records)
+
+        records[3]["cxl_serving_evidence"] = cxl_serving_evidence(3, 2)
+        del records[3]["cxl_serving_evidence"][0]["authority_timing"]
+        with self.assertRaisesRegex(ValueError, "authority timing evidence"):
+            self.runner.validate_posix_summaries(records)
+
+        records[3]["cxl_serving_evidence"] = cxl_serving_evidence(3, 2)
+        del records[3]["cxl_serving_evidence"][0]["bootstrap_tcp_bytes"]
+        with self.assertRaisesRegex(ValueError, "bootstrap byte evidence"):
+            self.runner.validate_posix_summaries(records)
+
+        records[3]["cxl_serving_evidence"] = cxl_serving_evidence(3, 2)
+        records[3]["cxl_serving_evidence"][0]["lane_role"] = "authority_internal"
+        with self.assertRaisesRegex(ValueError, "not CLIENT_FS"):
             self.runner.validate_posix_summaries(records)
 
     def test_fixed_stage_roots_refuse_overwrite(self):
@@ -696,6 +1311,11 @@ hash = DCBA4321
                     "state_deferred_updates": 7,
                     "state_validation_ops": 3,
                     "state_validation_ns": 10,
+                    "arena_acquire_calls": 2,
+                    "arena_acquire_slots": 128,
+                    "arena_acquire_backend_reserve_ns": 40,
+                    "arena_acquire_state_persist_ns": 30,
+                    "arena_acquire_total_ns": 90,
                 }
             },
             wall_ns=100,
@@ -708,6 +1328,11 @@ hash = DCBA4321
         self.assertEqual(timing["server_state_validation_ops"], 3)
         self.assertEqual(timing["server_state_validation_ns"], 10)
         self.assertEqual(timing["server_state_validation_share_of_rank_wall"], 0.05)
+        self.assertEqual(timing["arena_acquire"]["arena_acquire_calls"], 2)
+        self.assertEqual(
+            timing["arena_acquire"]["arena_acquire_backend_reserve_ns"], 40
+        )
+        self.assertEqual(timing["arena_acquire"]["arena_acquire_total_ns"], 90)
         self.assertIn("nested", timing["interpretation"])
 
     def test_strict_bi_proof_correlates_owner_range_and_host_order(self):
@@ -784,12 +1409,20 @@ hash = DCBA4321
             "offset": 4096,
             "length": 4096,
         }
-        self.paths.event_log("client0").write_text(
-            json.dumps({
+        unrelated_serial_noise = json.dumps({
+            "host_capture_ns": 90,
+            "line": (
+                'BADFS_DIRECT_MAP_TRACE_JSON {"event":"mmap","op_'
+                '[   62.908134] hrtimer: interrupt took 93077000 ns'
+            ),
+        })
+        persisted_event = json.dumps({
                 "host_capture_ns": 100,
                 "line": "BADFS_DIRECT_MAP_TRACE_JSON "
                 + json.dumps(direct, separators=(",", ":")),
-            }) + "\n",
+            })
+        self.paths.event_log("client0").write_text(
+            unrelated_serial_noise + "\n" + persisted_event + "\n",
             encoding="utf-8",
         )
         server_lines = []
@@ -818,6 +1451,78 @@ hash = DCBA4321
         self.assertEqual(proof["count"], 1)
         self.assertEqual(proof["writer_persisted"]["count"], 1)
         self.assertEqual(proof["backinvalidation"]["count"], 0)
+
+    def test_strict_persistency_proof_rejects_malformed_candidate_event(self):
+        self.paths.bundle.mkdir(parents=True)
+        self.paths.event_log("client0").write_text(
+            json.dumps({
+                "host_capture_ns": 100,
+                "line": (
+                    'BADFS_DIRECT_MAP_TRACE_JSON {"event":"persisted","op_'
+                    '[   62.908134] hrtimer: interrupt took 93077000 ns'
+                ),
+            }) + "\n",
+            encoding="utf-8",
+        )
+        self.paths.event_log("server0").write_text("", encoding="utf-8")
+        self.paths.coherence.write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "no exact writer-persisted"):
+            self.runner.strict_persistency_proof(
+                self.paths, [{"owner": 77, "endpoint": 3}], 1
+            )
+
+    def test_strict_persistency_proof_drops_corrupt_redundant_candidate(self):
+        self.paths.bundle.mkdir(parents=True)
+        direct = {
+            "schema_version": "badfs.direct-map-trace.v1",
+            "event": "persisted",
+            "access": "write",
+            "rc": 0,
+            "owner": 77,
+            "op_id": 9,
+            "offset": 4096,
+            "length": 4096,
+        }
+        client_lines = [
+            json.dumps({
+                "host_capture_ns": 90,
+                "line": 'BADFS_DIRECT_MAP_TRACE_JSON {"event":"persisted","op_',
+            }),
+            json.dumps({
+                "host_capture_ns": 100,
+                "line": "BADFS_DIRECT_MAP_TRACE_JSON "
+                + json.dumps(direct, separators=(",", ":"))
+                + "LEGOFS_SET_TIME 123",
+            }),
+        ]
+        self.paths.event_log("client0").write_text(
+            "\n".join(client_lines) + "\n", encoding="utf-8"
+        )
+        server_lines = []
+        for capture, event in ((200, "store_direct_begin"), (300, "store_direct_success")):
+            record = {
+                "schema_version": "badfs.lifecycle.v1",
+                "event": event,
+                "owner": 77,
+                "op_id": 9,
+                "mapping_offset": 4096,
+                "mapping_length": 4096,
+                "fault_point": "writer_persisted",
+            }
+            server_lines.append(json.dumps({
+                "host_capture_ns": capture,
+                "line": "BADFS_LIFECYCLE_TRACE_JSON "
+                + json.dumps(record, separators=(",", ":")),
+            }))
+        self.paths.event_log("server0").write_text(
+            "\n".join(server_lines) + "\n", encoding="utf-8"
+        )
+        self.paths.coherence.write_text("", encoding="utf-8")
+
+        proof = self.runner.strict_persistency_proof(
+            self.paths, [{"owner": 77, "endpoint": 3}], 1
+        )
+        self.assertEqual(proof["writer_persisted"]["count"], 1)
 
     def test_tiny_provider_counters_follow_the_selected_persistence_path(self):
         writer = {
