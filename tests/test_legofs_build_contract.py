@@ -85,6 +85,12 @@ class LegofsBuildContractTest(unittest.TestCase):
             )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
+    def test_run_uses_process_path_without_repository_tool_probe(self):
+        source = RUN.read_text(encoding="utf-8")
+        self.assertNotIn(".cxl-bi-tools", source)
+        self.assertNotIn("LEGOFS_TYPE3_TOOL_ROOT", source)
+        self.assertNotIn("LOCAL_TOOL_ROOT", source)
+
     def test_build_script_names_complete_manifest(self):
         self.assertTrue(BUILD.is_file(), "scripts/build_legofs_type3.sh is missing")
         source = BUILD.read_text(encoding="utf-8")

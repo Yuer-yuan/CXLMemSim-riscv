@@ -25,6 +25,15 @@ RUST_TARGET=riscv64gc-unknown-linux-musl
 PAYLOAD_IMAGE="$IMAGES/io500-payload.ext2"
 DEPENDENCY_VERSIONS="$RESULTS/dependency-versions.txt"
 ISA_REPORT="$RESULTS/isa-gate.txt"
+source "$ROOT/scripts/legofs_toolchain_path.sh"
+legofs_toolchain_activate io500-payload \
+	bash sh cargo rustc getconf \
+	"${CROSS_COMPILE}gcc" "${CROSS_COMPILE}ar" \
+	"${CROSS_COMPILE}ld" "${CROSS_COMPILE}objdump" \
+	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
+	"${CROSS_COMPILE}strip" "$LLVM_MC" \
+	cc ar ld mke2fs debugfs truncate file install rsync \
+	sha256sum mktemp cmp python3 awk grep sed sort seq cp mv rm mkdir
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 PAYLOAD_STAGE=
 PAYLOAD_IMAGE_TMP=
@@ -87,11 +96,6 @@ require_executable()
 	[[ -x "$1" ]] || die "missing prerequisite executable: $1"
 }
 
-for command in cargo rustc mke2fs debugfs truncate file install rsync \
-	sha256sum mktemp cmp python3 "${CROSS_COMPILE}objdump" \
-	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" "$LLVM_MC"; do
-	command -v "$command" >/dev/null || die "required command is missing: $command"
-done
 RUST_SYSROOT="$(rustc --print sysroot)"
 [[ -d "$RUST_SYSROOT/lib/rustlib/$RUST_TARGET/lib" ]] ||
 	die "Rust sysroot lacks target libraries: $RUST_TARGET"

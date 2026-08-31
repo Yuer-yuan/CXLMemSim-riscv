@@ -21,6 +21,20 @@ MUSL_TARBALL="${MUSL_SOURCE_ROOT}/musl-${MUSL_VERSION}.tar.gz"
 MUSL_BUILD="${BUILD}/musl-rv64gc"
 MUSL_PREFIX="${OUT}/toolchain/musl-rv64gc"
 MUSL_CC="${MUSL_PREFIX}/bin/musl-gcc"
+source "$ROOT/scripts/legofs_toolchain_path.sh"
+legofs_toolchain_activate type3-build \
+	bash sh git cargo rustc rustup getconf \
+	"${CROSS_COMPILE}gcc" "${CROSS_COMPILE}g++" \
+	"${CROSS_COMPILE}as" "${CROSS_COMPILE}ar" \
+	"${CROSS_COMPILE}ld" "${CROSS_COMPILE}nm" \
+	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
+	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
+	"${CROSS_COMPILE}strip" \
+	cc gcc g++ ar ld nm objcopy ranlib readelf strip \
+	cmake ninja meson make pkg-config \
+	mke2fs debugfs truncate python3 wget sha256sum tar install stat cmp file \
+	tee awk sed grep sort find xargs dtc flex bison bc cpio swig perl openssl \
+	patch gzip mkdir chmod mv
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 die()
@@ -51,11 +65,6 @@ legofs_git_root="$(git -C "${LEGOFS_SOURCE_ROOT}" rev-parse --show-toplevel 2>/d
 [[ "$(cd -- "${legofs_git_root}" && pwd -P)" == "${LEGOFS_SOURCE_ROOT}" ]] ||
 	die "LegoFS component path is not its Git worktree root: ${LEGOFS_SOURCE_ROOT}"
 
-for command in cargo rustc rustup "${CROSS_COMPILE}gcc" \
-	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" cmake ninja make mke2fs \
-	debugfs truncate python3 wget sha256sum tar install stat cmp; do
-	command -v "${command}" >/dev/null || die "required command is missing: ${command}"
-done
 if ! rustup target list --installed | grep -qx "${RUST_TARGET}"; then
 	printf '%s\n' "error: Rust target ${RUST_TARGET} is not installed" >&2
 	printf '%s\n' "remediation: rustup target add ${RUST_TARGET}" >&2

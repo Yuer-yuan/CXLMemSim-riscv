@@ -2,8 +2,12 @@
 """Run one or two LegoFS servers and independent RISC-V IO500 clients."""
 
 import argparse
+import base64
+import binascii
+import configparser
 import hashlib
 import concurrent.futures
+import datetime
 import json
 import os
 import pathlib
@@ -11,6 +15,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -24,6 +29,13 @@ from legofs_type3_2node import Console, OwnedProcess, qemu_environment
 DEFAULT_CLIENTS = 10
 DEFAULT_COHERENCE_CACHE_MIB = 32
 DEFAULT_SSD_CACHE_MIB = 512
+DEFAULT_OBSERVATION_SAMPLE_SHIFT = 4
+DEFAULT_OBSERVATION_ARENA_MIB = 12
+OBSERVATION_SCHEMA_DIGEST = "b5640c61c8e38775"
+OBSERVATION_SCHEMA_MAJOR = 1
+OBSERVATION_SCHEMA_MINOR = 0
+OBSERVATION_EVENT_BYTES = 64
+OBSERVATION_MAX_BYTES = 64 * 1024**2
 ENDPOINT_BYTES = 64 * 1024**3
 FMW_SIZE = "64G"
 SERVING_MAX_LANES = 64
@@ -61,9 +73,34 @@ EXPORT_SUMMARY_RE = re.compile(
     r"LEGOFS_IO500_EXPORT_POSIX_SUMMARY endpoint=(\d+) file=(\S+) "
     r"(\{[^\n]+\})"
 )
+OBSERVATION_BEGIN_RE = re.compile(
+    r"^LEGOFS_OBSERVATION_BEGIN role=(client-rank|server|diagnostic-client) "
+    r"endpoint=(\d+) file=([^\s/]+) bytes=(\d+) sha256=([0-9a-f]{64})$"
+)
+OBSERVATION_END_RE = re.compile(
+    r"^LEGOFS_OBSERVATION_END role=(client-rank|server|diagnostic-client) "
+    r"endpoint=(\d+) file=([^\s/]+)$"
+)
 MPI_FATAL_MARKERS = (
     "BADFS_STRICT_LIFECYCLE_DIRECT_INIT_FAILED",
     "LEGOFS_IO500_FATAL",
+)
+PERFORMANCE_INVALIDATING_GUEST_MARKERS = (
+    "rcu_sched detected stalls",
+    "rcu_preempt detected stalls",
+    "kthread starved for",
+    "BUG: soft lockup",
+    "Out of memory:",
+)
+GUEST_PROCESS_FAULT_MARKERS = (
+    "Segmentation fault",
+    "Bus error",
+    "Illegal instruction",
+    # RISC-V synchronous load and store/AMO access faults.  Linux prints the
+    # register frame even when QEMU itself remains alive, so process polling
+    # alone cannot detect this otherwise terminal MPI failure.
+    "cause: 0000000000000005",
+    "cause: 0000000000000007",
 )
 SEMANTIC_SMOKE_STAGES = (
     "tiny",
@@ -98,6 +135,37 @@ CLIENT_TIMING_GROUPS = {
     ),
 }
 
+DIRECT_METADATA_FORMAT_GENERATION = 10
+DIRECT_METADATA_CLIENT_COUNTERS = (
+    "direct_metadata_attempts",
+    "direct_metadata_hits",
+    "direct_metadata_not_found_hits",
+    "direct_metadata_no_hint",
+    "direct_metadata_stale",
+    "direct_metadata_cold_attempts",
+    "direct_metadata_cold_hits",
+    "direct_metadata_cold_not_found_hits",
+    "direct_metadata_cold_fallbacks",
+    "direct_metadata_fallback_commands",
+    "direct_metadata_commands_elided",
+    "direct_metadata_read_ns",
+    "direct_metadata_gate_loads",
+    "direct_metadata_root_loads",
+    "direct_metadata_dentry_cell_loads",
+    "direct_metadata_inode_record_loads",
+)
+DIRECT_METADATA_AUTHORITY_COUNTERS = (
+    "publication_batches",
+    "dentry_writes",
+    "inode_writes",
+    "registered_hints",
+    "capacity_failures",
+    "publication_failures",
+    "dentry_high_water",
+    "dentry_capacity",
+    "inode_capacity",
+)
+
 
 class Paths:
     def __init__(self, root: pathlib.Path, stage: str, result_label: str | None = None):
@@ -125,6 +193,8 @@ class Paths:
         self.device_dram = self.run / "cxlmemsim-device-dram.raw"
         self.client_result = self.run / "client0-results.ext2"
         self.result = self.bundle / "result.json"
+        self.observation = self.bundle / "observation"
+        self.observation_raw = self.observation / "raw"
 
     def lsa(self, host_id: int) -> pathlib.Path:
         return self.run / f"endpoint-{host_id}-lsa.raw"
@@ -166,6 +236,109 @@ def atomic_json(path: pathlib.Path, value) -> None:
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
+
+
+def _canonical_json_bytes(value: dict) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+
+
+def observation_profile_digest(profile: dict) -> str:
+    unsigned = dict(profile)
+    unsigned.pop("profile_sha256", None)
+    return hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+
+
+def load_observation_profile(path: pathlib.Path) -> dict:
+    try:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read observation profile {path}: {error}") from error
+    if not isinstance(profile, dict):
+        raise ValueError("observation profile must be a JSON object")
+    if profile.get("schema_version") != "legofs.observation.profile.v1":
+        raise ValueError("unsupported observation profile schema")
+    recorded_hash = profile.get("profile_sha256")
+    if not isinstance(recorded_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", recorded_hash):
+        raise ValueError("observation profile lacks a valid profile_sha256")
+    if observation_profile_digest(profile) != recorded_hash:
+        raise ValueError("observation profile hash mismatch")
+    schema = profile.get("observation_schema")
+    if schema != {
+        "major": OBSERVATION_SCHEMA_MAJOR,
+        "minor": OBSERVATION_SCHEMA_MINOR,
+        "event_record_bytes": OBSERVATION_EVENT_BYTES,
+        "digest": OBSERVATION_SCHEMA_DIGEST,
+    }:
+        raise ValueError("observation profile schema digest/layout mismatch")
+    mode = profile.get("mode")
+    shift = profile.get("sample_shift")
+    arena_mib = profile.get("arena_mib")
+    producer_slots = profile.get("producer_slots")
+    if mode not in ("off", "aggregate", "sampled"):
+        raise ValueError("observation profile mode must be off, aggregate, or sampled")
+    if type(shift) is not int or not 0 <= shift <= 20:
+        raise ValueError("observation profile sample_shift must be in 0..20")
+    if type(arena_mib) is not int or not 8 <= arena_mib <= 64:
+        raise ValueError("observation profile arena_mib must be in 8..64")
+    if type(producer_slots) is not int or not 1 <= producer_slots <= 8:
+        raise ValueError("observation profile producer_slots must be in 1..8")
+    return profile
+
+
+def resolve_observation_config(args, root: pathlib.Path, run_id: str) -> dict:
+    manual = (
+        args.observation_mode is not None
+        or args.observation_sample_shift is not None
+        or args.observation_arena_mib is not None
+    )
+    if args.observation_profile_manifest is not None and manual:
+        raise ValueError(
+            "--observation-profile-manifest is mutually exclusive with manual observation options"
+        )
+    profile = None
+    profile_path = None
+    if args.observation_profile_manifest is not None:
+        profile_path = pathlib.Path(args.observation_profile_manifest)
+        if not profile_path.is_absolute():
+            profile_path = root / profile_path
+        profile_path = profile_path.resolve()
+        profile = load_observation_profile(profile_path)
+        mode = profile["mode"]
+        sample_shift = profile["sample_shift"]
+        arena_mib = profile["arena_mib"]
+        producer_slots = profile["producer_slots"]
+    else:
+        mode = args.observation_mode or "default"
+        sample_shift = (
+            DEFAULT_OBSERVATION_SAMPLE_SHIFT
+            if args.observation_sample_shift is None
+            else args.observation_sample_shift
+        )
+        arena_mib = (
+            DEFAULT_OBSERVATION_ARENA_MIB
+            if args.observation_arena_mib is None
+            else args.observation_arena_mib
+        )
+        producer_slots = 8
+    if mode not in ("default", "off", "aggregate", "sampled"):
+        raise ValueError("invalid observation mode")
+    if not 0 <= sample_shift <= 20:
+        raise ValueError("observation-sample-shift must be between 0 and 20")
+    if not 8 <= arena_mib <= 64:
+        raise ValueError("observation-arena-mib must be between 8 and 64")
+    return {
+        "mode": mode,
+        "sample_shift": sample_shift,
+        "arena_mib": arena_mib,
+        "arena_bytes": arena_mib * 1024**2,
+        "producer_slots": producer_slots,
+        "run_id": run_id,
+        "profile_manifest": str(profile_path) if profile_path is not None else None,
+        "profile_sha256": profile.get("profile_sha256") if profile is not None else None,
+        "schema_digest": OBSERVATION_SCHEMA_DIGEST,
+    }
 
 
 def process_resource_sample(process: subprocess.Popen) -> dict | None:
@@ -300,9 +473,50 @@ def legofs_timing_breakdown(
             "sqe_consumed",
             "cqe_published",
             "authority_queue_wait_ns",
+            "successful_request_poll_ns",
             "dispatcher_backend_ns",
+            "completion_publication_wait_ns",
             "cqe_publish_ns",
         )
+    }
+    cq_wait_ns = transport_client["cq_wait_ns"]
+    cq_inner_fields = (
+        "successful_request_poll_ns",
+        "authority_queue_wait_ns",
+        "dispatcher_backend_ns",
+        "completion_publication_wait_ns",
+        "cqe_publish_ns",
+    )
+    cq_inner_ns = sum(transport_authority[field] for field in cq_inner_fields)
+    cq_residual_ns = cq_wait_ns - cq_inner_ns
+    cq_attribution = {
+        "outer_cq_wait_ns": cq_wait_ns,
+        "inner_authority_ns": cq_inner_ns,
+        "residual_ns": cq_residual_ns,
+        "calls": transport_client["calls"],
+        "cq_wait_ns_per_call": (
+            cq_wait_ns / transport_client["calls"]
+            if transport_client["calls"]
+            else 0.0
+        ),
+        "components": {
+            field: {
+                "ns": transport_authority[field],
+                "share_of_outer": (
+                    transport_authority[field] / cq_wait_ns if cq_wait_ns else 0.0
+                ),
+            }
+            for field in cq_inner_fields
+        },
+        "residual_share_of_outer": (
+            cq_residual_ns / cq_wait_ns if cq_wait_ns else 0.0
+        ),
+        "interpretation": (
+            "CQ wait is the outer SQE-visible to CQE-consumed envelope. Authority "
+            "components are nested inside it; residual contains request/completion "
+            "discovery, scheduling and uninstrumented serialization. SQ publish is "
+            "outside this envelope. Values summed across ranks are not IO500 wall time."
+        ),
     }
     audit = inspection.get("audit", {})
     metadata_wal_persist_ns = int(audit.get("metadata_wal_persist_ns", 0))
@@ -351,6 +565,7 @@ def legofs_timing_breakdown(
         ),
         "transport_client": transport_client,
         "transport_authority": transport_authority,
+        "transport_cq_attribution": cq_attribution,
         "arena_acquire": arena_acquire,
         "persistence": {
             "metadata_wal_persist_ns": metadata_wal_persist_ns,
@@ -379,6 +594,12 @@ def legofs_timing_breakdown(
             "provider_payload_bytes": int(
                 audit.get("provider_payload_bytes", 0)
             ),
+            "writer_persisted_direct_items": int(
+                audit.get("writer_persisted_direct_items", 0)
+            ),
+            "writer_persisted_direct_bytes": int(
+                audit.get("writer_persisted_direct_bytes", 0)
+            ),
             "provider_allocator_barriers": int(
                 audit.get("provider_allocator_barriers", 0)
             ),
@@ -398,6 +619,73 @@ def legofs_timing_breakdown(
             "transport and persistence intervals are separately accumulated and may be "
             "nested or overlap across ranks, so they are not additive wall-time shares; "
             "none of these counters is CPU time"
+        ),
+    }
+
+
+def direct_metadata_breakdown(
+    summaries: list[dict], inspection: dict, mode: str
+) -> dict:
+    client = {
+        field: sum(
+            int(item.get(field, 0))
+            for record in summaries
+            for item in record.get("cxl_serving_evidence", [])
+        )
+        for field in DIRECT_METADATA_CLIENT_COUNTERS
+    }
+    capability_lanes = sum(
+        item.get("direct_metadata_capability") is True
+        for record in summaries
+        for item in record.get("cxl_serving_evidence", [])
+    )
+    lane_count = sum(
+        len(record.get("cxl_serving_evidence", [])) for record in summaries
+    )
+    read_metadata_commands = sum(
+        int(item.get("dispatches_by_opcode", {}).get("2", 0))
+        for record in summaries
+        for item in record.get("cxl_serving_evidence", [])
+    )
+    sqe_submitted = sum(
+        int(item.get("sqe_submitted", 0))
+        for record in summaries
+        for item in record.get("cxl_serving_evidence", [])
+    )
+    cq_wait_ns = sum(
+        int(item.get("client_timing", {}).get("cq_wait_ns", 0))
+        for record in summaries
+        for item in record.get("cxl_serving_evidence", [])
+    )
+    authority = {
+        field: int(
+            inspection.get("audit", {}).get("direct_metadata", {}).get(field, 0)
+        )
+        for field in DIRECT_METADATA_AUTHORITY_COUNTERS
+    }
+    attempts = client["direct_metadata_attempts"]
+    commands_elided = client["direct_metadata_commands_elided"]
+    return {
+        "schema_version": "legofs.direct-metadata.v1",
+        "mode": mode,
+        "client": client,
+        "authority": authority,
+        "lane_count": lane_count,
+        "capability_lanes": capability_lanes,
+        "hit_ratio": commands_elided / attempts if attempts else 0.0,
+        "read_metadata_commands": read_metadata_commands,
+        "baseline_equivalent_read_metadata_demand": (
+            read_metadata_commands + commands_elided
+        ),
+        "all_sqe_submitted": sqe_submitted,
+        "cq_wait_ns": cq_wait_ns,
+        "cq_wait_ns_per_submitted_command": (
+            cq_wait_ns / sqe_submitted if sqe_submitted else 0.0
+        ),
+        "interpretation": (
+            "A direct hit consumes no request id, SQE or CQE. Baseline-equivalent "
+            "demand is READ_METADATA commands plus proven commands elided; it is "
+            "not a workload-normalization substitute for paired IO500 results."
         ),
     }
 
@@ -449,6 +737,385 @@ def verify_manifest(paths: Paths) -> dict:
             if digest.hexdigest() != recorded_digest:
                 raise ValueError(f"build artifact hash mismatch: {name}")
     return {"manifest": manifest}
+
+
+def _u16(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<H", data, offset)[0]
+
+
+def _u32(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<I", data, offset)[0]
+
+
+def _u64(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<Q", data, offset)[0]
+
+
+def _mix64(value: int) -> int:
+    mask = (1 << 64) - 1
+    value &= mask
+    value ^= value >> 30
+    value = (value * 0xBF58476D1CE4E5B9) & mask
+    value ^= value >> 27
+    value = (value * 0x94D049BB133111EB) & mask
+    return (value ^ (value >> 31)) & mask
+
+
+def observation_run_hash(run_id: str) -> int:
+    mask = (1 << 64) - 1
+    value = 0x32BD89A94F0CD619
+    for byte in run_id.encode("ascii"):
+        value ^= byte
+        value = (value * 0x100000001B3) & mask
+    return _mix64(value)
+
+
+def observation_run_id_for_label(result_label: str) -> str:
+    return "r" + hashlib.sha256(result_label.encode("ascii")).hexdigest()[:24]
+
+
+def observation_boot_token(config: dict) -> str:
+    mode = {"default": "d", "off": "o", "aggregate": "a", "sampled": "s"}[
+        config["mode"]
+    ]
+    token = (
+        f"o={mode},{config['sample_shift']},{config['arena_mib']},"
+        f"{config['run_id']}"
+    )
+    if not re.fullmatch(r"o=[doas],[0-9]{1,2},[0-9]{1,2},r[0-9a-f]{24}", token):
+        raise ValueError("observation boot token is not in its fixed bounded format")
+    return token
+
+
+def guest_bootargs(
+    role: str,
+    index: int,
+    stage: str,
+    server_count: int,
+    client_count: int,
+    serving_transport: str,
+    cursor_mode: str,
+    cq_wait_mode: str,
+    observation: dict,
+) -> str:
+    cursor_token = {"legacy_shared": "l", "owned": "o"}[cursor_mode]
+    cq_wait_token = {
+        "timer_sleep": "s",
+        "cooperative_yield": "y",
+    }[cq_wait_mode]
+    value = (
+        "earlycon=sbi console=hvc0 loglevel=5 cxl_core.pmem_as_dax=1 "
+        f"io500.role={role} io500.index={index} io500.stage={stage} "
+        f"io500.server_count={server_count} io500.client_count={client_count} "
+        f"io500.serving_transport={serving_transport} "
+        f"c={cursor_token} "
+        f"w={cq_wait_token} "
+        f"{observation_boot_token(observation)}"
+    )
+    command_bytes = len("setenv bootargs ''") + len(value)
+    if command_bytes > 255:
+        raise ValueError(
+            f"U-Boot bootargs command exceeds its 255-byte input bound: {command_bytes}"
+        )
+    return value
+
+
+def decode_observation_header(data: bytes) -> dict:
+    if len(data) < 4096:
+        raise ValueError("observation arena is shorter than its fixed header")
+    if data[:8] != b"LEGOFSO1":
+        raise ValueError("observation arena magic mismatch")
+    header_bytes = _u16(data, 12)
+    event_record_bytes = _u16(data, 14)
+    if _u16(data, 8) != OBSERVATION_SCHEMA_MAJOR:
+        raise ValueError("observation arena schema major mismatch")
+    if _u16(data, 10) > OBSERVATION_SCHEMA_MINOR:
+        if event_record_bytes < OBSERVATION_EVENT_BYTES:
+            raise ValueError("new observation minor has an unskippable event record")
+    if header_bytes != 4096 or event_record_bytes < OBSERVATION_EVENT_BYTES:
+        raise ValueError("observation arena record layout mismatch")
+    identity = 4096
+    return {
+        "schema_major": _u16(data, 8),
+        "schema_minor": _u16(data, 10),
+        "header_bytes": header_bytes,
+        "event_record_bytes": event_record_bytes,
+        "arena_bytes": _u64(data, 16),
+        "requested_mode": data[24],
+        "effective_mode": data[25],
+        "role": data[26],
+        "sample_shift": data[27],
+        "producer_slots": _u16(data, 28),
+        "metric_slots": _u16(data, 30),
+        "endpoint_id": _u32(data, 32),
+        "pid": _u32(data, 36),
+        "exec_incarnation": _u64(data, 40),
+        "serving_generation": _u64(data, 48),
+        "workload_endpoint_mask": _u64(data, 56),
+        "run_hash": _u64(data, 64),
+        "realtime_anchor_ns": _u64(data, 72),
+        "monotonic_anchor_ns": _u64(data, 80),
+        "anchor_span_ns": _u64(data, 88),
+        "clock_p50_ns": _u64(data, 96),
+        "clock_p99_ns": _u64(data, 104),
+        "clock_backend": _u32(data, 112),
+        "producer_stride": _u32(data, 116),
+        "producer_base": _u64(data, 120),
+        "event_base": _u64(data, 128),
+        "event_capacity_per_producer": _u64(data, 136),
+        "flags": _u64(data, 144),
+        "event_count": _u64(data, 152),
+        "producer_slots_claimed": _u64(data, 160),
+        "producer_overflow": _u64(data, 168),
+        "identity_overflow": _u64(data, 176),
+        "event_overflow": _u64(data, 184),
+        "histogram_saturation": _u64(data, 192),
+        "active_scopes": _u64(data, 200),
+        "active_requests": _u64(data, 208),
+        "pending_persistence": _u64(data, 216),
+        "abandoned_scopes": _u64(data, 224),
+        "initialization_error": _u64(data, 232),
+        "export_error": _u64(data, 240),
+        "clock_reads": _u64(data, 248),
+        "schema_digest": f"{_u64(data, 416):016x}",
+        "identity": {
+            "role": data[identity],
+            "endpoint_id": _u32(data, identity + 4),
+            "pid": _u32(data, identity + 8),
+            "mpi_rank": _u32(data, identity + 12),
+            "exec_incarnation": _u64(data, identity + 16),
+            "serving_generation": _u64(data, identity + 24),
+        },
+    }
+
+
+def parse_observation_frames(output: str) -> list[dict]:
+    frames = []
+    current = None
+    encoded_chars = 0
+    max_encoded_chars = ((OBSERVATION_MAX_BYTES + 2) // 3) * 4
+    for raw_line in output.replace("\r", "").splitlines():
+        line = raw_line.strip()
+        begin = OBSERVATION_BEGIN_RE.fullmatch(line)
+        end = OBSERVATION_END_RE.fullmatch(line)
+        if begin is not None:
+            if current is not None:
+                raise ValueError("nested observation begin marker")
+            size = int(begin.group(4))
+            if size > OBSERVATION_MAX_BYTES:
+                raise ValueError("observation marker declares an oversized arena")
+            current = {
+                "role": begin.group(1),
+                "endpoint": int(begin.group(2)),
+                "file": begin.group(3),
+                "bytes": size,
+                "sha256": begin.group(5),
+                "base64": [],
+            }
+            encoded_chars = 0
+            continue
+        if end is not None:
+            if current is None:
+                raise ValueError("observation end marker lacks a begin marker")
+            identity = (end.group(1), int(end.group(2)), end.group(3))
+            if identity != (current["role"], current["endpoint"], current["file"]):
+                raise ValueError("observation begin/end identity mismatch")
+            try:
+                payload = base64.b64decode(
+                    "".join(current.pop("base64")), validate=True
+                )
+            except (binascii.Error, ValueError) as error:
+                raise ValueError(f"invalid observation base64: {error}") from error
+            if len(payload) != current["bytes"]:
+                raise ValueError("observation decoded length mismatch")
+            if hashlib.sha256(payload).hexdigest() != current["sha256"]:
+                raise ValueError("observation payload digest mismatch")
+            current["payload"] = payload
+            frames.append(current)
+            current = None
+            continue
+        if current is not None:
+            if not line:
+                continue
+            encoded_chars += len(line)
+            if encoded_chars > max_encoded_chars:
+                raise ValueError("observation base64 exceeds the bounded arena size")
+            current["base64"].append(line)
+    if current is not None:
+        raise ValueError("truncated observation frame")
+    return frames
+
+
+def validate_observation_frame(
+    frame: dict,
+    *,
+    expected_role: str,
+    expected_endpoint: int,
+    config: dict,
+    client_count: int,
+) -> dict:
+    if frame["role"] != expected_role or frame["endpoint"] != expected_endpoint:
+        raise ValueError("observation marker role/endpoint mismatch")
+    filename_pattern = re.compile(
+        rf"observation-v1-{re.escape(config['run_id'])}-"
+        rf"{re.escape(expected_role)}-{expected_endpoint}-(\d+)\.bin"
+    )
+    filename = filename_pattern.fullmatch(frame["file"])
+    if filename is None:
+        raise ValueError("observation filename identity mismatch")
+    header = decode_observation_header(frame["payload"])
+    role_id = {"client-rank": 1, "server": 2, "diagnostic-client": 3}[expected_role]
+    mode_id = {"aggregate": 1, "sampled": 2}.get(config["mode"])
+    if mode_id is None:
+        raise ValueError("an arena was exported while observation was off")
+    expected_mask = (1 << client_count) - 1
+    if header["arena_bytes"] != len(frame["payload"]):
+        raise ValueError("observation header/file arena length mismatch")
+    if len(frame["payload"]) != config["arena_bytes"]:
+        raise ValueError("observation arena does not match runner configuration")
+    if header["requested_mode"] != mode_id or header["effective_mode"] != mode_id:
+        raise ValueError("observation requested/effective mode mismatch")
+    if header["sample_shift"] != config["sample_shift"]:
+        raise ValueError("observation sample shift mismatch")
+    if header["producer_slots"] != config["producer_slots"]:
+        raise ValueError("observation producer slot count mismatch")
+    if header["role"] != role_id or header["endpoint_id"] != expected_endpoint:
+        raise ValueError("observation header process role/endpoint mismatch")
+    if header["pid"] != int(filename.group(1)):
+        raise ValueError("observation filename/header pid mismatch")
+    if header["run_hash"] != observation_run_hash(config["run_id"]):
+        raise ValueError("observation run identity hash mismatch")
+    if header["workload_endpoint_mask"] != expected_mask:
+        raise ValueError("observation workload endpoint mask mismatch")
+    if header["schema_digest"] != OBSERVATION_SCHEMA_DIGEST:
+        raise ValueError("observation arena schema digest mismatch")
+    identity = header["identity"]
+    if (
+        identity["role"] != role_id
+        or identity["endpoint_id"] != expected_endpoint
+        or identity["pid"] != header["pid"]
+        or identity["exec_incarnation"] != header["exec_incarnation"]
+        or identity["serving_generation"] != header["serving_generation"]
+    ):
+        raise ValueError("observation identity table/header mismatch")
+    expected_rank = expected_endpoint if expected_role == "client-rank" else 0xFFFFFFFF
+    if identity["mpi_rank"] != expected_rank:
+        raise ValueError("observation MPI rank identity mismatch")
+    incomplete = any(
+        header[name] != 0
+        for name in ("active_scopes", "active_requests", "pending_persistence")
+    )
+    runtime_invalid = any(
+        header[name] != 0
+        for name in (
+            "flags",
+            "producer_overflow",
+            "identity_overflow",
+            "event_overflow",
+            "histogram_saturation",
+            "abandoned_scopes",
+            "initialization_error",
+            "export_error",
+        )
+    )
+    header["snapshot_complete"] = not incomplete
+    header["runtime_valid"] = not runtime_invalid
+    return header
+
+
+def dump_observations(
+    paths: Paths,
+    server_consoles: list[Console],
+    client_consoles: list[Console],
+    config: dict,
+    client_count: int,
+    stage: str,
+    timeout: int,
+) -> dict:
+    paths.observation_raw.mkdir(parents=True, exist_ok=False)
+    participants = [
+        ("client-rank", index, console)
+        for index, console in enumerate(client_consoles)
+    ] + [
+        ("server", index, console)
+        for index, console in enumerate(server_consoles)
+    ]
+    starts = [len(console.output) for _, _, console in participants]
+    for _, _, console in participants:
+        console.send("LEGOFS_DUMP_OBSERVATION")
+    records = []
+    enabled = config["mode"] in ("aggregate", "sampled")
+    for (role, endpoint, console), start in zip(participants, starts):
+        console.wait(
+            f"LEGOFS_IO500_OBSERVATION_DONE role={role} index={endpoint}",
+            min(timeout, 1800),
+            start,
+        )
+        frames = parse_observation_frames(console.output[start:])
+        expected_files = 1 if enabled and (role == "server" or stage != "hello") else 0
+        if len(frames) != expected_files:
+            raise ValueError(
+                f"expected {expected_files} observation arena(s) for {role}{endpoint}, "
+                f"got {len(frames)}"
+            )
+        for frame in frames:
+            header = validate_observation_frame(
+                frame,
+                expected_role=role,
+                expected_endpoint=endpoint,
+                config=config,
+                client_count=client_count,
+            )
+            destination = paths.observation_raw / frame["file"]
+            with destination.open("xb") as output:
+                output.write(frame["payload"])
+            records.append({
+                "role": role,
+                "endpoint": endpoint,
+                "file": str(destination.relative_to(paths.bundle)),
+                "bytes": frame["bytes"],
+                "sha256": frame["sha256"],
+                "header": header,
+            })
+    valid = all(
+        record["header"]["snapshot_complete"]
+        and record["header"]["runtime_valid"]
+        for record in records
+    )
+    if not enabled:
+        valid = not records
+    from legofs_observe import analyze_observation_files
+
+    analysis = analyze_observation_files(
+        [paths.bundle / record["file"] for record in records],
+        paths.observation,
+        config=config,
+    )
+    return {
+        "schema_version": "legofs.observation.export.v1",
+        "config": config,
+        "files": records,
+        "analysis": analysis,
+        "observation_valid": valid and analysis["observation_valid"],
+        "observation_error": None,
+        "export_after_mpi_completion": True,
+    }
+
+
+def dump_observations_safely(*args, **kwargs) -> dict:
+    config = kwargs.get("config")
+    try:
+        return dump_observations(*args, **kwargs)
+    except BaseException as error:
+        return {
+            "schema_version": "legofs.observation.export.v1",
+            "config": config,
+            "files": [],
+            "analysis": None,
+            "observation_valid": False,
+            "observation_error": str(error),
+            "export_after_mpi_completion": True,
+        }
 
 
 def sparse_file(path: pathlib.Path, size: int) -> None:
@@ -598,6 +1265,9 @@ def boot_guest(
     server_count: int,
     client_count: int,
     serving_transport: str,
+    cursor_mode: str,
+    cq_wait_mode: str,
+    observation: dict,
     timeout: int,
 ) -> None:
     console.wait("Hit any key to stop autoboot", timeout)
@@ -614,14 +1284,18 @@ def boot_guest(
     initialized = console.command_until_prompt("cxl init", timeout)
     if HOST_DECODER not in initialized or TYPE3_DECODER not in initialized:
         raise ValueError(f"{role}{index} decoder initialization is incomplete")
-    console.command_until_prompt(
-        "setenv bootargs 'earlycon=sbi console=hvc0 loglevel=5 "
-        "cxl_core.pmem_as_dax=1 "
-        f"io500.role={role} io500.index={index} io500.stage={stage} "
-        f"io500.server_count={server_count} io500.client_count={client_count} "
-        f"io500.serving_transport={serving_transport}'",
-        timeout,
+    bootargs = guest_bootargs(
+        role,
+        index,
+        stage,
+        server_count,
+        client_count,
+        serving_transport,
+        cursor_mode,
+        cq_wait_mode,
+        observation,
     )
+    console.command_until_prompt(f"setenv bootargs '{bootargs}'", timeout)
     console.send(f"bootefi 90000000:{paths.linux.stat().st_size:x} ${{fdtcontroladdr}}")
 
 
@@ -670,19 +1344,41 @@ def registrations(records: list[dict], host_count: int) -> list[dict]:
     return [by_host[index] for index in range(host_count)]
 
 
-def wait_mpi_exit(console: Console, stage: str, timeout: int, start: int) -> int:
+def wait_mpi_exit(
+    console: Console,
+    stage: str,
+    timeout: int,
+    start: int,
+    monitored_guests: list[tuple[str, Console, int]] | None = None,
+) -> int:
     pattern = re.compile(
         rf"LEGOFS_IO500_MPI_EXIT stage={re.escape(stage)} rc=(-?\d+)(?=[^0-9])"
     )
     deadline = time.monotonic() + timeout
+    if monitored_guests is None:
+        monitored_guests = [("coordinator", console, start)]
     with console.condition:
         while True:
-            stage_output = console.output[start:]
-            for marker in MPI_FATAL_MARKERS:
-                if marker in stage_output:
-                    raise RuntimeError(
-                        f"MPI stage {stage} reported fatal marker: {marker}"
-                    )
+            for guest, monitored, guest_start in monitored_guests:
+                stage_output = monitored.output[guest_start:]
+                for marker in MPI_FATAL_MARKERS:
+                    if marker in stage_output:
+                        raise RuntimeError(
+                            f"MPI stage {stage} guest {guest} reported fatal marker: "
+                            f"{marker}"
+                        )
+                for marker in GUEST_PROCESS_FAULT_MARKERS:
+                    if marker in stage_output:
+                        raise RuntimeError(
+                            f"MPI stage {stage} guest {guest} reported fatal "
+                            f"process fault: {marker}"
+                        )
+                for marker in PERFORMANCE_INVALIDATING_GUEST_MARKERS:
+                    if marker in stage_output:
+                        raise RuntimeError(
+                            f"INCONCLUSIVE_RACE: MPI stage {stage} guest {guest} "
+                            f"reported kernel scheduling stall: {marker}"
+                        )
             match = pattern.search(console.output, start)
             if match is not None:
                 rc = int(match.group(1))
@@ -1016,6 +1712,13 @@ def launch_mpi(
     serving_transport: str = "legacy",
 ) -> dict:
     coordinator = client_consoles[0]
+    monitored_guests = [
+        (f"server{index}", console, len(console.output))
+        for index, console in enumerate(server_consoles)
+    ] + [
+        (f"client{index}", console, len(console.output))
+        for index, console in enumerate(client_consoles)
+    ]
     start = len(coordinator.output)
     coordinator.send(f"LEGOFS_MPI {stage}")
     coordinator.wait(f"LEGOFS_IO500_MPI_STARTED stage={stage}", 30, start)
@@ -1081,7 +1784,13 @@ def launch_mpi(
         )
         clock_thread.start()
     try:
-        rc = wait_mpi_exit(coordinator, stage, timeout, start)
+        rc = wait_mpi_exit(
+            coordinator,
+            stage,
+            timeout,
+            start,
+            monitored_guests=monitored_guests,
+        )
     finally:
         if clock_thread is not None:
             clock_stop.set()
@@ -1166,6 +1875,9 @@ def validate_cxl_path_summary(
     record: dict,
     endpoint: int,
     authority_count: int | None = None,
+    expected_cursor_mode: str | None = None,
+    expected_cq_wait_mode: str | None = None,
+    expected_direct_metadata_mode: str | None = None,
 ) -> int:
     if record.get("schema_version") != "badfs.posix.path-summary.v4":
         raise ValueError("unexpected POSIX summary schema")
@@ -1202,6 +1914,11 @@ def validate_cxl_path_summary(
             )
         ):
             raise ValueError("CXL serving evidence has an invalid generation")
+        if (
+            expected_direct_metadata_mode is not None
+            and item["format_generation"] != DIRECT_METADATA_FORMAT_GENERATION
+        ):
+            raise ValueError("direct metadata layout/format generation mismatch")
         if item.get("bootstrap_tcp_exchanges") != 1:
             raise ValueError("CXL bootstrap exchange count is not exactly one")
         if item.get("bootstrap_tcp_connections") != 1:
@@ -1233,7 +1950,9 @@ def validate_cxl_path_summary(
                 "sqe_consumed",
                 "cqe_published",
                 "authority_queue_wait_ns",
+                "successful_request_poll_ns",
                 "dispatcher_backend_ns",
+                "completion_publication_wait_ns",
                 "cqe_publish_ns",
             )
         ):
@@ -1241,6 +1960,7 @@ def validate_cxl_path_summary(
         if (
             authority_timing["sqe_consumed"] != submitted
             or authority_timing["cqe_published"] != submitted
+            or authority_timing["successful_request_poll_ns"] <= 0
             or authority_timing["dispatcher_backend_ns"] <= 0
         ):
             raise ValueError("CXL authority evidence does not cover every request")
@@ -1254,6 +1974,10 @@ def validate_cxl_path_summary(
                 "sq_credit_wait_ns",
                 "sq_publish_ns",
                 "cq_wait_ns",
+                "cq_empty_polls",
+                "cq_spin_polls",
+                "cq_cooperative_yields",
+                "cq_timer_sleeps",
             )
         ):
             raise ValueError("CXL client timing evidence is incomplete")
@@ -1263,6 +1987,138 @@ def validate_cxl_path_summary(
             or client_timing["cq_wait_ns"] <= 0
         ):
             raise ValueError("CXL client timing evidence does not cover every request")
+        cursor_mode = item.get("cursor_mode")
+        if cursor_mode not in ("legacy_shared", "owned"):
+            raise ValueError("CXL serving evidence has an invalid cursor mode")
+        if expected_cursor_mode is not None and cursor_mode != expected_cursor_mode:
+            raise ValueError(
+                "CXL serving evidence cursor mode differs from the requested mode"
+            )
+        cq_wait_mode = item.get("cq_wait_mode")
+        if cq_wait_mode not in ("timer_sleep", "cooperative_yield"):
+            raise ValueError("CXL serving evidence has an invalid CQ wait mode")
+        if (
+            expected_cq_wait_mode is not None
+            and cq_wait_mode != expected_cq_wait_mode
+        ):
+            raise ValueError(
+                "CXL serving evidence CQ wait mode differs from the requested mode"
+            )
+        open_mode = item.get("open_mode")
+        if open_mode != "fused_pin":
+            raise ValueError("retired split-open selector reappeared")
+        fused_attempts = item.get("fused_open_attempts")
+        fused_pins = item.get("fused_open_pins")
+        fused_fallbacks = item.get("fused_open_fallbacks")
+        fused_close_attempts = item.get("fused_close_attempts")
+        fused_close_snapshot_releases = item.get(
+            "fused_close_snapshot_releases"
+        )
+        if any(
+            not isinstance(value, int) or value < 0
+            for value in (
+                fused_attempts,
+                fused_pins,
+                fused_fallbacks,
+                fused_close_attempts,
+                fused_close_snapshot_releases,
+            )
+        ) or fused_pins + fused_fallbacks > fused_attempts:
+            raise ValueError("CXL fused-open evidence is inconsistent")
+        if fused_close_snapshot_releases > fused_close_attempts:
+            raise ValueError("CXL fused-close evidence is inconsistent")
+        lane_access = item.get("client_lane_access")
+        access_fields = (
+            "submit_calls",
+            "completion_polls",
+            "request_polls",
+            "completions",
+            "ready_loads",
+            "peer_publication_loads",
+            "self_cursor_shared_loads",
+            "capacity_refreshes",
+            "shared_identity_rereads",
+        )
+        if not isinstance(lane_access, dict) or any(
+            not isinstance(lane_access.get(name), int) or lane_access[name] < 0
+            for name in access_fields
+        ):
+            raise ValueError("CXL client lane-access evidence is incomplete")
+        if (
+            lane_access["submit_calls"] != submitted
+            or lane_access["completion_polls"] < submitted
+            or lane_access["peer_publication_loads"]
+            < lane_access["completion_polls"]
+            or lane_access["completion_polls"]
+            != client_timing["cq_empty_polls"] + submitted
+            or client_timing["cq_empty_polls"]
+            != client_timing["cq_spin_polls"]
+            + client_timing["cq_cooperative_yields"]
+            + client_timing["cq_timer_sleeps"]
+        ):
+            raise ValueError("CXL client lane-access evidence is inconsistent")
+        if cq_wait_mode == "cooperative_yield" and client_timing["cq_timer_sleeps"] != 0:
+            raise ValueError("cooperative CQ wait performed a timer sleep")
+        if cq_wait_mode == "timer_sleep" and client_timing["cq_cooperative_yields"] != 0:
+            raise ValueError("timer CQ wait performed a cooperative yield")
+        if cursor_mode == "owned" and (
+            lane_access["self_cursor_shared_loads"] != 0
+            or lane_access["shared_identity_rereads"] != 0
+        ):
+            raise ValueError("owned cursor mode performed a forbidden shared reread")
+        if cursor_mode == "legacy_shared" and (
+            lane_access["self_cursor_shared_loads"] < 2 * submitted
+            or lane_access["shared_identity_rereads"] != submitted
+        ):
+            raise ValueError("legacy cursor evidence does not cover shared rereads")
+        direct_capability = item.get("direct_metadata_capability")
+        if not isinstance(direct_capability, bool):
+            raise ValueError("CXL serving evidence lacks direct metadata capability")
+        if any(
+            not isinstance(item.get(name), int) or item[name] < 0
+            for name in DIRECT_METADATA_CLIENT_COUNTERS
+        ):
+            raise ValueError("CXL direct metadata evidence is incomplete")
+        direct_attempts = item["direct_metadata_attempts"]
+        direct_hits = item["direct_metadata_hits"]
+        direct_not_found = item["direct_metadata_not_found_hits"]
+        direct_fallbacks = item["direct_metadata_fallback_commands"]
+        if direct_attempts != direct_hits + direct_not_found + direct_fallbacks:
+            raise ValueError("direct metadata attempt accounting is inconsistent")
+        if item["direct_metadata_commands_elided"] != direct_hits + direct_not_found:
+            raise ValueError("direct metadata command-elision accounting is inconsistent")
+        cold_attempts = item["direct_metadata_cold_attempts"]
+        cold_hits = item["direct_metadata_cold_hits"]
+        cold_not_found = item["direct_metadata_cold_not_found_hits"]
+        cold_fallbacks = item["direct_metadata_cold_fallbacks"]
+        if cold_attempts != (
+            item["direct_metadata_no_hint"] + item["direct_metadata_stale"]
+        ):
+            raise ValueError("direct metadata cold-admission accounting is inconsistent")
+        if cold_attempts != cold_hits + cold_not_found + cold_fallbacks:
+            raise ValueError("direct metadata cold-outcome accounting is inconsistent")
+        if cold_hits > direct_hits or cold_not_found > direct_not_found:
+            raise ValueError("direct metadata cold outcomes exceed logical outcomes")
+        if direct_fallbacks != cold_fallbacks:
+            raise ValueError("direct metadata fallback accounting is inconsistent")
+        if direct_attempts == 0 and any(
+            item[name] != 0
+            for name in (
+                "direct_metadata_read_ns",
+                "direct_metadata_gate_loads",
+                "direct_metadata_root_loads",
+                "direct_metadata_dentry_cell_loads",
+                "direct_metadata_inode_record_loads",
+            )
+        ):
+            raise ValueError("idle direct metadata reader reports memory accesses")
+        if expected_direct_metadata_mode == "rpc":
+            if direct_capability or any(
+                item[name] != 0 for name in DIRECT_METADATA_CLIENT_COUNTERS
+            ):
+                raise ValueError("rpc metadata mode executed the direct CXL reader")
+        elif expected_direct_metadata_mode == "cxl" and not direct_capability:
+            raise ValueError("direct metadata capability absent in cxl mode")
         dispatches = item.get("dispatches_by_opcode")
         if not isinstance(dispatches, dict) or not dispatches:
             raise ValueError("CXL serving evidence lacks opcode dispatches")
@@ -1281,6 +2137,13 @@ def validate_cxl_path_summary(
             raise ValueError("CXL opcode dispatch total does not match submitted SQEs")
         if dispatches.get("35") != 1:
             raise ValueError("CXL evidence was captured before owner release completed")
+        if (
+            expected_direct_metadata_mode == "cxl"
+            and dispatches.get("2", 0) != direct_fallbacks
+        ):
+            raise ValueError(
+                "READ_METADATA opcode count differs from direct fallback commands"
+            )
         for forbidden in (
             "unsupported_serving_calls_after_cxl_ready",
             "filesystem_tcp_requests_after_cxl_ready",
@@ -1294,18 +2157,43 @@ def validate_cxl_path_summary(
 
 
 def validate_posix_summaries(
-    records: list[dict], client_count: int = DEFAULT_CLIENTS
+    records: list[dict],
+    client_count: int = DEFAULT_CLIENTS,
+    expected_cursor_mode: str | None = None,
+    expected_cq_wait_mode: str | None = None,
+    expected_direct_metadata_mode: str | None = None,
 ) -> None:
     active_ranks = set()
     authority_count = None
+    fused_open_attempts = 0
+    fused_open_pins = 0
+    fused_close_attempts = 0
+    fused_close_snapshot_releases = 0
+    direct_attempts = 0
+    direct_hits = 0
     for record in records:
         rank = record.get("mpi_rank")
         endpoint = record.get("endpoint")
         if rank not in range(client_count) or endpoint != rank:
             raise ValueError(f"POSIX summary rank/endpoint mismatch: {record}")
         authority_count = validate_cxl_path_summary(
-            record, endpoint, authority_count
+            record,
+            endpoint,
+            authority_count,
+            expected_cursor_mode,
+            expected_cq_wait_mode,
+            expected_direct_metadata_mode,
         )
+        for evidence in record["cxl_serving_evidence"]:
+            fused_open_attempts += evidence["fused_open_attempts"]
+            fused_open_pins += evidence["fused_open_pins"]
+            fused_close_attempts += evidence["fused_close_attempts"]
+            fused_close_snapshot_releases += evidence[
+                "fused_close_snapshot_releases"
+            ]
+            direct_attempts += evidence["direct_metadata_attempts"]
+            direct_hits += evidence["direct_metadata_hits"]
+            direct_hits += evidence["direct_metadata_not_found_hits"]
         stats = record.get("stats", {})
         totals = record.get("syscall_classification", {}).get("totals", {})
         if sum(stats.get(name, 0) for name in ("open_ops", "read_ops", "write_ops")) > 0:
@@ -1317,9 +2205,28 @@ def validate_posix_summaries(
             f"active POSIX summaries do not cover ranks 0..{client_count - 1}: "
             f"{sorted(active_ranks)}"
         )
+    if (
+        fused_open_attempts == 0
+        or fused_open_pins == 0
+        or fused_close_attempts == 0
+        or fused_close_snapshot_releases == 0
+    ):
+        raise ValueError(
+            "fused lifecycle mode did not pin and retire an existing regular file"
+        )
+    if expected_direct_metadata_mode == "cxl" and (
+        direct_attempts <= 0 or direct_hits <= 0
+    ):
+        raise ValueError("cxl metadata mode produced no direct metadata hit")
 
 
-def validate_post_run_exporter_summary(record: dict, client_count: int) -> None:
+def validate_post_run_exporter_summary(
+    record: dict,
+    client_count: int,
+    expected_cursor_mode: str | None = None,
+    expected_cq_wait_mode: str | None = None,
+    expected_direct_metadata_mode: str | None = None,
+) -> None:
     expected_endpoint = 2 * client_count + 1
     if record.get("mpi_rank") is not None:
         raise ValueError("post-run exporter retained an MPI rank identity")
@@ -1328,7 +2235,13 @@ def validate_post_run_exporter_summary(record: dict, client_count: int) -> None:
             "post-run exporter endpoint mismatch: "
             f"expected {expected_endpoint}, got {record.get('endpoint')}"
         )
-    validate_cxl_path_summary(record, expected_endpoint)
+    validate_cxl_path_summary(
+        record,
+        expected_endpoint,
+        expected_cursor_mode=expected_cursor_mode,
+        expected_cq_wait_mode=expected_cq_wait_mode,
+        expected_direct_metadata_mode=expected_direct_metadata_mode,
+    )
     stats = record.get("stats", {})
     totals = record.get("syscall_classification", {}).get("totals", {})
     if stats.get("open_ops", 0) <= 0 or stats.get("read_ops", 0) <= 0:
@@ -1337,7 +2250,13 @@ def validate_post_run_exporter_summary(record: dict, client_count: int) -> None:
         raise ValueError("post-run exporter handled no BadFS syscall")
 
 
-def parse_post_run_exporter_summary(output: str, client_count: int) -> dict:
+def parse_post_run_exporter_summary(
+    output: str,
+    client_count: int,
+    expected_cursor_mode: str | None = None,
+    expected_cq_wait_mode: str | None = None,
+    expected_direct_metadata_mode: str | None = None,
+) -> dict:
     matches = list(EXPORT_SUMMARY_RE.finditer(output))
     if len(matches) != 1:
         raise ValueError(
@@ -1351,12 +2270,22 @@ def parse_post_run_exporter_summary(output: str, client_count: int) -> dict:
         raise ValueError("post-run exporter marker/record endpoint mismatch")
     record["endpoint"] = marker_endpoint
     record["file"] = match.group(2)
-    validate_post_run_exporter_summary(record, client_count)
+    validate_post_run_exporter_summary(
+        record,
+        client_count,
+        expected_cursor_mode,
+        expected_cq_wait_mode,
+        expected_direct_metadata_mode,
+    )
     return record
 
 
 def dump_summaries(
-    consoles: list[Console], client_count: int = DEFAULT_CLIENTS
+    consoles: list[Console],
+    client_count: int = DEFAULT_CLIENTS,
+    expected_cursor_mode: str | None = None,
+    expected_cq_wait_mode: str | None = None,
+    expected_direct_metadata_mode: str | None = None,
 ) -> list[dict]:
     starts = [len(console.output) for console in consoles]
     for console in consoles:
@@ -1369,7 +2298,13 @@ def dump_summaries(
             record["endpoint"] = int(match.group(1))
             record["file"] = match.group(2)
             records.append(record)
-    validate_posix_summaries(records, client_count)
+    validate_posix_summaries(
+        records,
+        client_count,
+        expected_cursor_mode,
+        expected_cq_wait_mode,
+        expected_direct_metadata_mode,
+    )
     return records
 
 
@@ -1496,8 +2431,14 @@ def validate_recovery_control_checkpoints(
             not isinstance(authority_timing, dict)
             or authority_timing.get("sqe_consumed") != 2
             or authority_timing.get("cqe_published") != 2
+            or not isinstance(authority_timing.get("successful_request_poll_ns"), int)
+            or authority_timing["successful_request_poll_ns"] <= 0
             or not isinstance(authority_timing.get("dispatcher_backend_ns"), int)
             or authority_timing["dispatcher_backend_ns"] <= 0
+            or not isinstance(
+                authority_timing.get("completion_publication_wait_ns"), int
+            )
+            or authority_timing["completion_publication_wait_ns"] < 0
         ):
             raise ValueError("recovery-control authority evidence is incomplete")
         client_timing = transport.get("client_timing")
@@ -1533,6 +2474,7 @@ def inspect_servers(
     *,
     require_direct_read: bool = True,
     require_recovery_control: bool = True,
+    expected_direct_metadata_mode: str | None = None,
 ) -> dict:
     start = len(console.output)
     console.send("LEGOFS_INSPECT")
@@ -1542,7 +2484,54 @@ def inspect_servers(
         server_count,
         require_direct_read=require_direct_read,
         require_recovery_control=require_recovery_control,
+        expected_direct_metadata_mode=expected_direct_metadata_mode,
     )
+
+
+def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
+    """Validate the two legal payload-durability paths without conflating them."""
+    direct_items = audit["direct_write_commit_items"]
+    writer_items = audit["writer_persisted_direct_items"]
+    writer_bytes = audit["writer_persisted_direct_bytes"]
+    if writer_items > direct_items:
+        raise ValueError(
+            f"lifecycle server {server} reports more writer-persisted items "
+            "than committed direct-write items"
+        )
+    if writer_items == 0 and writer_bytes != 0:
+        raise ValueError(
+            f"lifecycle server {server} reports writer-persisted bytes without items"
+        )
+    if writer_items > 0 and writer_bytes <= 0:
+        raise ValueError(
+            f"lifecycle server {server} lacks writer-persisted byte evidence"
+        )
+
+    provider = (
+        audit["provider_payload_barriers"] > 0
+        and audit["provider_payload_bytes"] > 0
+    )
+    writer_complete = (
+        direct_items > 0
+        and writer_items == direct_items
+        and writer_bytes > 0
+    )
+    if direct_items > writer_items and not provider:
+        raise ValueError(
+            f"lifecycle server {server} has direct-write items without payload "
+            "persistence evidence"
+        )
+    if direct_items > 0 and not (provider or writer_complete):
+        raise ValueError(
+            f"lifecycle server {server} lacks payload persistence evidence"
+        )
+    return {
+        "provider_payload_barrier": provider,
+        "writer_persisted_complete": writer_complete,
+        "direct_write_commit_items": direct_items,
+        "writer_persisted_direct_items": writer_items,
+        "writer_persisted_direct_bytes": writer_bytes,
+    }
 
 
 def parse_server_inspection(
@@ -1552,6 +2541,7 @@ def parse_server_inspection(
     require_direct_read: bool = True,
     expected_active_client_lanes: int = 0,
     require_recovery_control: bool = True,
+    expected_direct_metadata_mode: str | None = None,
 ) -> dict:
     marker = "badfs_lifecycle_inspection "
     recovery_marker = "badfs_recovery_control_checkpoint "
@@ -1610,6 +2600,37 @@ def parse_server_inspection(
                 raise ValueError(
                     f"lifecycle server {record['server']} audit reports {name}"
                 )
+        direct_metadata = audit.get("direct_metadata")
+        if not isinstance(direct_metadata, dict) or any(
+            not isinstance(direct_metadata.get(name), int)
+            or direct_metadata[name] < 0
+            for name in DIRECT_METADATA_AUTHORITY_COUNTERS
+        ):
+            raise ValueError(
+                f"lifecycle server {record['server']} lacks direct metadata audit"
+            )
+        if direct_metadata["dentry_high_water"] > direct_metadata["dentry_capacity"]:
+            raise ValueError(
+                f"lifecycle server {record['server']} direct metadata high-water exceeds capacity"
+            )
+        if expected_direct_metadata_mode == "rpc":
+            if any(direct_metadata[name] != 0 for name in DIRECT_METADATA_AUTHORITY_COUNTERS):
+                raise ValueError("rpc metadata mode published direct CXL metadata")
+        elif expected_direct_metadata_mode == "cxl":
+            if (
+                direct_metadata["publication_batches"] <= 0
+                or direct_metadata["dentry_writes"] <= 0
+                or direct_metadata["inode_writes"] <= 0
+                or direct_metadata["registered_hints"] <= 0
+                or direct_metadata["dentry_capacity"] <= 0
+                or direct_metadata["inode_capacity"] <= 0
+            ):
+                raise ValueError("cxl metadata mode lacks direct publication activity")
+            if (
+                direct_metadata["capacity_failures"] != 0
+                or direct_metadata["publication_failures"] != 0
+            ):
+                raise ValueError("cxl metadata publication reported a fail-closed error")
         for name in (
             "metadata_wal_persist_barriers",
             "metadata_wal_persist_records",
@@ -1620,6 +2641,9 @@ def parse_server_inspection(
             "provider_persist_ns",
             "provider_payload_barriers",
             "provider_payload_bytes",
+            "direct_write_commit_items",
+            "writer_persisted_direct_items",
+            "writer_persisted_direct_bytes",
             "provider_allocator_barriers",
             "provider_allocator_bytes",
             "foreground_checkpoint_waits",
@@ -1651,12 +2675,16 @@ def parse_server_inspection(
             )
         if (
             audit["provider_persist_barriers"] <= 0
-            or audit["provider_payload_barriers"] <= 0
+            or audit["provider_persist_bytes"] <= 0
             or audit["provider_allocator_barriers"] <= 0
+            or audit["provider_allocator_bytes"] <= 0
         ):
             raise ValueError(
                 f"lifecycle server {record['server']} lacks provider persistence evidence"
             )
+        record["payload_persistence_evidence"] = (
+            lifecycle_payload_persistence_evidence(audit, record["server"])
+        )
         vd = audit.get("visibility_durability", {})
         for name in (
             "logical_mutations",
@@ -1757,6 +2785,13 @@ def parse_server_inspection(
                     audit[key] = max(audit.get(key, 0), value)
                 else:
                     audit[key] = audit.get(key, 0) + value
+    audit["direct_metadata"] = {
+        key: sum(
+            record["audit"]["direct_metadata"][key]
+            for record in records
+        )
+        for key in DIRECT_METADATA_AUTHORITY_COUNTERS
+    }
     audit["extent_states"] = extent_states
     return {
         "schema_version": "badfs.lifecycle.inspection.aggregate.v1",
@@ -2002,6 +3037,19 @@ def validate_tiny_provider_counters(final_stats: dict, proof: dict) -> None:
                 )
 
 
+def validate_inspection_provider_counters(final_stats: dict, inspection: dict) -> None:
+    writer_items = int(
+        inspection.get("audit", {}).get("writer_persisted_direct_items", 0)
+    )
+    if writer_items <= 0:
+        return
+    for name in ("request_fence", "persistence_fence_completions"):
+        if final_stats.get(name, 0) <= 0:
+            raise ValueError(
+                f"writer-persisted inspection lacks provider counter: {name}"
+            )
+
+
 def classify_io500_verifier(stage: str, rc: int, output: str) -> str:
     # The QEMU serial console may expand one guest newline to `\r\r\n`.
     # Strip carriage returns before matching whole verifier lines; keep the
@@ -2077,6 +3125,10 @@ def parse_io500_metrics(text: str) -> dict:
             "score": score,
             "unit": "GiB/s" if name.startswith("ior-") else "kIOPS",
             "seconds": seconds,
+            "t_start": values.get("t_start"),
+            "t_end": values.get("t_end"),
+            "start_realtime_ns": parse_io500_utc_timestamp(values.get("t_start")),
+            "end_realtime_ns": parse_io500_utc_timestamp(values.get("t_end")),
         })
 
     def score(name: str) -> dict | None:
@@ -2100,6 +3152,77 @@ def parse_io500_metrics(text: str) -> dict:
     }
 
 
+def parse_io500_utc_timestamp(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        timestamp = datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    timestamp = timestamp.replace(tzinfo=datetime.timezone.utc)
+    return int(timestamp.timestamp()) * 1_000_000_000
+
+
+def project_observation_timestamp_to_phase(
+    event_monotonic_ns: int,
+    header: dict,
+    phases: list[dict],
+    *,
+    guest_sync_error_ns: int,
+    io500_timestamp_resolution_ns: int = 1_000_000_000,
+) -> dict:
+    """Project a rank-local monotonic event without inventing boundary precision."""
+    estimate = (
+        int(header["realtime_anchor_ns"])
+        + int(event_monotonic_ns)
+        - int(header["monotonic_anchor_ns"])
+    )
+    error = (
+        max(0, int(header.get("anchor_span_ns", 0)))
+        + max(0, int(guest_sync_error_ns))
+        + max(0, int(io500_timestamp_resolution_ns))
+    )
+    lower = estimate - error
+    upper = estimate + error
+    overlaps = []
+    contained = []
+    for phase in phases:
+        start = phase.get("start_realtime_ns")
+        end = phase.get("end_realtime_ns")
+        if not isinstance(start, int) or not isinstance(end, int) or end < start:
+            continue
+        if lower <= end and upper >= start:
+            overlaps.append(phase["name"])
+        if start <= lower and upper <= end:
+            contained.append(phase["name"])
+    if len(contained) == 1 and overlaps == contained:
+        assignment = contained[0]
+        ambiguous = False
+    else:
+        assignment = None
+        ambiguous = bool(overlaps)
+    return {
+        "estimated_realtime_ns": estimate,
+        "error_bound_ns": error,
+        "interval_start_ns": lower,
+        "interval_end_ns": upper,
+        "phase": assignment,
+        "phase_ambiguous": ambiguous,
+        "overlapping_phases": overlaps,
+    }
+
+
+def io500_phase_enabled(config_text: str, phase: str) -> bool:
+    config = configparser.ConfigParser(interpolation=None)
+    config.read_string(config_text)
+    if not config.has_section(phase):
+        return False
+    try:
+        return config.getboolean(phase, "run", fallback=False)
+    except ValueError as error:
+        raise ValueError(f"IO500 phase {phase} has an invalid run value") from error
+
+
 def extract_results(paths: Paths) -> dict:
     extracted = paths.bundle / "result-disk"
     extracted.mkdir()
@@ -2118,10 +3241,12 @@ def extract_results(paths: Paths) -> dict:
     shutil.copy2(result_path, paths.bundle / "result.txt")
     shutil.copy2(config_path, paths.bundle / "config.ini")
     text = result_path.read_text(encoding="utf-8", errors="replace")
+    config_text = config_path.read_text(encoding="utf-8", errors="strict")
+    find_enabled = io500_phase_enabled(config_text, "find")
     find_section = re.search(
         r"(?ms)^\[find\]\s*$.*?^found\s*=\s*(\d+)\s*$", text
     )
-    if "[find]" in text and (
+    if find_enabled and (
         find_section is None or int(find_section.group(1)) <= 0
     ):
         raise ValueError("IO500 find phase did not match any file")
@@ -2177,8 +3302,25 @@ def execute(
     server_read_exclusive: bool = False,
     full_coherence_trace: bool = False,
     serving_transport: str = "legacy",
+    cursor_mode: str = "owned",
+    cq_wait_mode: str = "timer_sleep",
     fault_profile: str = "none",
+    observation_config: dict | None = None,
+    host_profiler: str = "off",
 ) -> dict:
+    direct_metadata_validation_mode = "cxl" if serving_transport == "cxl" else None
+    if observation_config is None:
+        observation_config = {
+            "mode": "default",
+            "sample_shift": DEFAULT_OBSERVATION_SAMPLE_SHIFT,
+            "arena_mib": DEFAULT_OBSERVATION_ARENA_MIB,
+            "arena_bytes": DEFAULT_OBSERVATION_ARENA_MIB * 1024**2,
+            "producer_slots": 8,
+            "run_id": observation_run_id_for_label(paths.result_label),
+            "profile_manifest": None,
+            "profile_sha256": None,
+            "schema_digest": OBSERVATION_SCHEMA_DIGEST,
+        }
     build = verify_manifest(paths)
     prepare_paths(paths)
     owner = str(uuid.uuid4())
@@ -2188,6 +3330,10 @@ def execute(
         "status": "failed",
         "stage": paths.stage,
         "first_failure": None,
+        "filesystem_valid": False,
+        "io500_validity": None,
+        "observation_valid": False,
+        "observation_error": None,
         **functional_model_evidence(),
         "owner_token": owner,
         "build": build,
@@ -2210,6 +3356,12 @@ def execute(
             "server_read_exclusive": server_read_exclusive,
             "server_scope": f"{server_count} LegoFS server allocation partitions",
             "legofs_serving_transport": serving_transport,
+            "legofs_direct_metadata_mode": (
+                "cxl" if serving_transport == "cxl" else "unavailable"
+            ),
+            "legofs_cursor_mode": cursor_mode,
+            "legofs_cq_wait_mode": cq_wait_mode,
+            "legofs_open_mode": "fused_pin",
             "fault_profile": fault_profile,
             "allocator_partitions": [
                 {
@@ -2222,6 +3374,11 @@ def execute(
         },
         "validity": {},
         "commands": {},
+        "observation_config": observation_config,
+        "host_profiler": {
+            "requested": host_profiler,
+            "effective": "off" if host_profiler == "off" else "deferred_until_o5",
+        },
         "processes": {},
         "cleanup": {},
     }
@@ -2310,6 +3467,9 @@ def execute(
                         server_count,
                         client_count,
                         serving_transport,
+                        cursor_mode,
+                        cq_wait_mode,
+                        observation_config,
                         timeout,
                     )
                 )
@@ -2353,6 +3513,9 @@ def execute(
                         server_count,
                         client_count,
                         serving_transport,
+                        cursor_mode,
+                        cq_wait_mode,
+                        observation_config,
                         timeout,
                     )
                 )
@@ -2405,14 +3568,43 @@ def execute(
                     mpi_command["output_start"]:mpi_command["output_end"]
                 ]
                 result["post_run_exporter_summary"] = (
-                    parse_post_run_exporter_summary(mpi_output, client_count)
+                    parse_post_run_exporter_summary(
+                        mpi_output,
+                        client_count,
+                        cursor_mode,
+                        cq_wait_mode,
+                        "cxl",
+                    )
                 )
+            result["observation"] = dump_observations_safely(
+                paths,
+                server_consoles,
+                client_consoles,
+                config=observation_config,
+                client_count=client_count,
+                stage=paths.stage,
+                timeout=timeout,
+            )
+            result["observation_valid"] = result["observation"]["observation_valid"]
+            result["observation_error"] = result["observation"]["observation_error"]
             if fault_profile == "reject-active-clean-retirement":
                 result["fault_injection"] = run_active_lane_retirement_probe(
                     client_consoles, timeout
                 )
         except MpiStageError:
             diagnostics = {}
+            if "observation" not in result:
+                result["observation"] = dump_observations_safely(
+                    paths,
+                    server_consoles,
+                    client_consoles,
+                    config=observation_config,
+                    client_count=client_count,
+                    stage=paths.stage,
+                    timeout=timeout,
+                )
+                result["observation_valid"] = result["observation"]["observation_valid"]
+                result["observation_error"] = result["observation"]["observation_error"]
             try:
                 diagnostics["rank_placement"] = parse_rank_markers(
                     client_consoles, paths.stage, client_count
@@ -2421,7 +3613,11 @@ def execute(
                 diagnostics["rank_placement_error"] = str(error)
             try:
                 diagnostics["posix_path_summaries"] = dump_summaries(
-                    client_consoles, client_count
+                    client_consoles,
+                    client_count,
+                    cursor_mode,
+                    cq_wait_mode,
+                    direct_metadata_validation_mode,
                 )
             except Exception as error:
                 diagnostics["posix_path_summary_error"] = str(error)
@@ -2433,6 +3629,7 @@ def execute(
                     require_recovery_control=not (
                         serving_transport == "cxl" and server_count == 1
                     ),
+                    expected_direct_metadata_mode=direct_metadata_validation_mode,
                 )
             except Exception as error:
                 diagnostics["lifecycle_inspection_error"] = str(error)
@@ -2464,7 +3661,13 @@ def execute(
             rank_records = parse_rank_markers(
                 client_consoles, paths.stage, client_count
             )
-            summaries = dump_summaries(client_consoles, client_count)
+            summaries = dump_summaries(
+                client_consoles,
+                client_count,
+                cursor_mode,
+                cq_wait_mode,
+                direct_metadata_validation_mode,
+            )
             if fault_profile == "reject-active-clean-retirement":
                 inspection = result["fault_injection"]["lifecycle_inspection"]
             else:
@@ -2474,11 +3677,16 @@ def execute(
                     require_recovery_control=not (
                         serving_transport == "cxl" and server_count == 1
                     ),
+                    expected_direct_metadata_mode=direct_metadata_validation_mode,
                 )
             verifier = verify_io500(client_consoles[0], paths.stage)
             result["rank_placement"] = rank_records
             result["posix_path_summaries"] = summaries
             result["lifecycle_inspection"] = inspection
+            if direct_metadata_validation_mode is not None:
+                result["direct_metadata"] = direct_metadata_breakdown(
+                    summaries, inspection, direct_metadata_validation_mode
+                )
             result["verifier"] = verifier
             result["legofs_timing"] = legofs_timing_breakdown(
                 summaries,
@@ -2555,6 +3763,8 @@ def execute(
                     raise ValueError(f"CXLMemSim final error counter is nonzero: {name}")
             if final_stats.get("gets", 0) + final_stats.get("getm", 0) <= 0:
                 raise ValueError("CXLMemSim final stats lack coherent data traffic")
+            if paths.stage != "hello":
+                validate_inspection_provider_counters(final_stats, inspection)
             if paths.stage == "tiny":
                 validate_tiny_provider_counters(
                     final_stats, result["strict_persistency_proof"]
@@ -2565,6 +3775,8 @@ def execute(
                 raise RuntimeError(verifier["failure"])
             if expected_no_invalid and not no_invalid:
                 raise ValueError(f"{paths.stage} result contains [INVALID]")
+        result["filesystem_valid"] = True
+        result["io500_validity"] = result["validity"]
         result["status"] = "passed"
         return result
     except BaseException as error:
@@ -2636,6 +3848,16 @@ def parse_args(argv=None):
         default="legacy",
     )
     parser.add_argument(
+        "--cursor-mode",
+        choices=("legacy_shared", "owned"),
+        default="owned",
+    )
+    parser.add_argument(
+        "--cq-wait-mode",
+        choices=("timer_sleep", "cooperative_yield"),
+        default="timer_sleep",
+    )
+    parser.add_argument(
         "--fault-profile",
         choices=(
             "none",
@@ -2644,6 +3866,17 @@ def parse_args(argv=None):
             "reject-active-clean-retirement",
         ),
         default="none",
+    )
+    parser.add_argument(
+        "--observation-mode",
+        choices=("default", "off", "aggregate", "sampled"),
+        default=None,
+    )
+    parser.add_argument("--observation-sample-shift", type=int, default=None)
+    parser.add_argument("--observation-arena-mib", type=int, default=None)
+    parser.add_argument("--observation-profile-manifest")
+    parser.add_argument(
+        "--host-profiler", choices=("off", "stat", "record"), default="off"
     )
     return parser.parse_args(argv)
 
@@ -2658,6 +3891,16 @@ def main(argv=None) -> int:
         raise ValueError("coherence-cache-mib must be between 1 and 4095")
     if not 1 <= args.ssd_cache_mib <= 65536:
         raise ValueError("ssd-cache-mib must be between 1 and 65536")
+    if (
+        args.observation_sample_shift is not None
+        and not 0 <= args.observation_sample_shift <= 20
+    ):
+        raise ValueError("observation-sample-shift must be between 0 and 20")
+    if (
+        args.observation_arena_mib is not None
+        and not 8 <= args.observation_arena_mib <= 64
+    ):
+        raise ValueError("observation-arena-mib must be between 8 and 64")
     if args.fault_profile in (
         "clean-server-restart",
         "reject-unauthorized-clean-restart",
@@ -2676,8 +3919,13 @@ def main(argv=None) -> int:
         r"[A-Za-z0-9][A-Za-z0-9._-]*", args.result_label
     ):
         raise ValueError("result-label contains unsupported characters")
+    if args.result_label is not None and len(args.result_label) > 96:
+        raise ValueError("result-label is longer than 96 characters")
     root = pathlib.Path(__file__).resolve().parents[1]
     paths = Paths(root, args.stage, args.result_label)
+    observation_config = resolve_observation_config(
+        args, root, observation_run_id_for_label(paths.result_label)
+    )
     try:
         result = execute(
             paths,
@@ -2689,7 +3937,11 @@ def main(argv=None) -> int:
             args.server_read_exclusive,
             args.full_coherence_trace,
             args.serving_transport,
+            args.cursor_mode,
+            args.cq_wait_mode,
             args.fault_profile,
+            observation_config,
+            args.host_profiler,
         )
     except BaseException as error:
         print(f"error: {error}", file=sys.stderr)

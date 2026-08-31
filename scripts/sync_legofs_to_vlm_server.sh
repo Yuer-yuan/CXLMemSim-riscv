@@ -10,7 +10,6 @@ REMOTE="${LEGOFS_VLM_REMOTE:-vlm-server:/home/guokc/mypro/gnn-mount-sda1/CXLMemS
 exec rsync -az \
 	--exclude='.git' \
 	--exclude='/.agents/' \
-	--exclude='/.cxl-bi-tools/' \
 	--exclude='/target/' \
 	--exclude='/out/' \
 	--exclude='/build/' \

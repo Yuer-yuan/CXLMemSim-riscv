@@ -5,6 +5,9 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$ROOT/out/legofs-type3/build/cxlmemsim"
 PLATFORM="$ROOT/target/build/riscv-io500/platform"
 MANIFEST="$ROOT/target/results/legofs-io500/build-manifest.json"
+source "$ROOT/scripts/legofs_toolchain_path.sh"
+legofs_toolchain_activate io500-cxlmemsim \
+	bash getconf cmake ctest ninja make mktemp install mv rm python3
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 usage()

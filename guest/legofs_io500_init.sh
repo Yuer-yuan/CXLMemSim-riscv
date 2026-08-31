@@ -63,10 +63,49 @@ stage="$(cmdline_value io500.stage=)" || fail missing-stage
 server_count="$(cmdline_value io500.server_count=)" || fail missing-server-count
 client_count="$(cmdline_value io500.client_count=)" || fail missing-client-count
 serving_transport="$(cmdline_value io500.serving_transport=)" || fail missing-serving-transport
+cursor_token="$(cmdline_value c=)" || fail missing-cursor-mode
+cq_wait_token="$(cmdline_value w=)" || fail missing-cq-wait-mode
+observation_spec="$(cmdline_value o=)" || fail missing-observation-spec
+saved_ifs="$IFS"
+IFS=,
+set -- $observation_spec
+IFS="$saved_ifs"
+[ "$#" -eq 4 ] || fail invalid-observation-spec
+case "$1" in
+d) observation_mode=default ;;
+o) observation_mode=off ;;
+a) observation_mode=aggregate ;;
+s) observation_mode=sampled ;;
+*) fail invalid-observation-mode ;;
+esac
+observation_sample_shift="$2"
+observation_arena_mib="$3"
+observation_run_id="$4"
 case "$role" in server|client) ;; *) fail invalid-role ;; esac
 case "$index" in ''|*[!0-9]*) fail invalid-index ;; esac
 case "$server_count" in 1|2) ;; *) fail invalid-server-count ;; esac
 case "$serving_transport" in legacy|cxl) ;; *) fail invalid-serving-transport ;; esac
+case "$cursor_token" in
+l) cursor_mode=legacy_shared ;;
+o) cursor_mode=owned ;;
+*) fail invalid-cursor-mode ;;
+esac
+case "$cq_wait_token" in
+s) cq_wait_mode=timer_sleep ;;
+y) cq_wait_mode=cooperative_yield ;;
+*) fail invalid-cq-wait-mode ;;
+esac
+case "$observation_mode" in default|off|aggregate|sampled) ;; *) fail invalid-observation-mode ;; esac
+case "$observation_sample_shift" in ''|*[!0-9]*) fail invalid-observation-sample-shift ;; esac
+[ "$observation_sample_shift" -le 20 ] || fail invalid-observation-sample-shift
+case "$observation_arena_mib" in ''|*[!0-9]*) fail invalid-observation-arena-bytes ;; esac
+[ "$observation_arena_mib" -ge 8 ] && [ "$observation_arena_mib" -le 64 ] ||
+	fail invalid-observation-arena-bytes
+observation_arena_bytes="$((observation_arena_mib * 1024 * 1024))"
+case "$observation_run_id" in
+''|*[!A-Za-z0-9._-]*) fail invalid-observation-run-id ;;
+esac
+[ "${#observation_run_id}" -le 96 ] || fail invalid-observation-run-id
 case "$client_count" in 1|2|3|4|5|6|7|8|9|10) ;; *) fail invalid-client-count ;; esac
 if [ "$role" = server ] && [ "$index" -ge "$server_count" ]; then
 	fail invalid-server-index
@@ -115,7 +154,70 @@ printf '%s\n' "$dax_align" > /run/dax-align
 printf '%s\n' "$index" > /run/endpoint-id
 printf '%s\n' "$server_count" > /run/server-count
 printf '%s\n' "$serving_transport" > /run/serving-transport
+printf '%s\n' "$cursor_mode" > /run/cursor-mode
+printf '%s\n' "$cq_wait_mode" > /run/cq-wait-mode
 printf '%s\n' "$client_count" > /run/client-count
+
+# Observation arenas are process-local DRAM snapshots.  Configuration is
+# fixed by the host runner and is identical in every guest.  In default mode
+# the mode variable is deliberately absent, proving the normal path remains
+# equivalent to ObserverHandle::off().
+mkdir -p /tmp/legofs-observation || fail observation-directory
+chmod 700 /tmp/legofs-observation || fail observation-directory-mode
+export BADFS_OBSERVATION_SAMPLE_SHIFT="$observation_sample_shift"
+export BADFS_OBSERVATION_ARENA_BYTES="$observation_arena_bytes"
+export BADFS_OBSERVATION_RUN_ID="$observation_run_id"
+export BADFS_OBSERVATION_DIR=/tmp/legofs-observation
+workload_endpoints=
+workload_endpoint=0
+while [ "$workload_endpoint" -lt "$client_count" ]; do
+	if [ -n "$workload_endpoints" ]; then
+		workload_endpoints="$workload_endpoints,$workload_endpoint"
+	else
+		workload_endpoints="$workload_endpoint"
+	fi
+	workload_endpoint=$((workload_endpoint + 1))
+done
+export BADFS_OBSERVATION_WORKLOAD_ENDPOINTS="$workload_endpoints"
+if [ "$observation_mode" = default ]; then
+	unset BADFS_OBSERVATION_MODE
+else
+	export BADFS_OBSERVATION_MODE="$observation_mode"
+fi
+
+dump_observation()
+{
+	expected_file_role="$1"
+	expected_endpoint="$2"
+	file_count=0
+	for observation_file in /tmp/legofs-observation/*.bin; do
+		[ -f "$observation_file" ] || continue
+		observation_base="${observation_file##*/}"
+		case "$observation_base" in
+		"observation-v1-$observation_run_id-$expected_file_role-$expected_endpoint-"*.bin) ;;
+		*)
+			echo "LEGOFS_IO500_OBSERVATION_EXPORT_ERROR role=$expected_file_role endpoint=$expected_endpoint reason=unexpected-filename file=$observation_base"
+			continue
+			;;
+		esac
+		observation_bytes="$(/bin/busybox wc -c < "$observation_file")" || continue
+		case "$observation_bytes" in ''|*[!0-9]*) continue ;; esac
+		if [ "$observation_bytes" -gt 67108864 ]; then
+			echo "LEGOFS_IO500_OBSERVATION_EXPORT_ERROR role=$expected_file_role endpoint=$expected_endpoint reason=oversize file=$observation_base bytes=$observation_bytes"
+			continue
+		fi
+		set -- $(/bin/busybox sha256sum "$observation_file")
+		observation_sha256="$1"
+		echo "LEGOFS_OBSERVATION_BEGIN role=$expected_file_role endpoint=$expected_endpoint file=$observation_base bytes=$observation_bytes sha256=$observation_sha256"
+		/bin/busybox base64 -w 76 "$observation_file"
+		echo "LEGOFS_OBSERVATION_END role=$expected_file_role endpoint=$expected_endpoint file=$observation_base"
+		file_count=$((file_count + 1))
+	done
+	if [ "$file_count" -eq 0 ]; then
+		echo "LEGOFS_IO500_OBSERVATION_EXPORT_ERROR role=$expected_file_role endpoint=$expected_endpoint reason=no-arena-visible"
+	fi
+	echo "LEGOFS_IO500_OBSERVATION_DONE role=$expected_file_role index=$expected_endpoint files=$file_count"
+}
 
 server_addresses=
 lifecycle_devices=
@@ -184,6 +286,8 @@ export BADFS_LIFECYCLE_READ_CACHE_ENTRIES=2048
 export BADFS_LIFECYCLE_WRITE_ARENA_SLOTS=64
 export BADFS_CLIENT_ENDPOINT_ID="$index"
 export BADFS_SERVING_TRANSPORT="$serving_transport"
+export BADFS_SERVING_CURSOR_MODE="$cursor_mode"
+export BADFS_SERVING_CQ_WAIT_MODE="$cq_wait_mode"
 export BADFS_SERVING_MAX_CLIENTS=64
 export BADFS_LIFECYCLE_REGION_SIZE=68719476736
 export BADFS_SERVER_COUNT="$server_count"
@@ -240,6 +344,9 @@ if [ "$role" = server ]; then
 					wait "$server_pid" 2>/dev/null || true
 					sync
 					poweroff -f
+					;;
+				LEGOFS_DUMP_OBSERVATION)
+					dump_observation server "$index"
 					;;
 				LEGOFS_SERVER_CLEAN_RESTART\ *)
 					target_generation="${server_line#LEGOFS_SERVER_CLEAN_RESTART }"
@@ -357,7 +464,7 @@ while IFS= read -r line; do
 		echo "LEGOFS_IO500_VERIFY_EXIT stage=$verify_stage rc=$rc"
 		;;
 	LEGOFS_INSPECT)
-		BADFS_BENCH_MODE=inspect /payload/bin/badfs-bench
+		BADFS_OBSERVATION_MODE=off BADFS_BENCH_MODE=inspect /payload/bin/badfs-bench
 		rc=$?
 		echo "LEGOFS_IO500_INSPECT_EXIT index=$index rc=$rc"
 		;;
@@ -370,6 +477,7 @@ while IFS= read -r line; do
 			echo "LEGOFS_IO500_INSPECT_ENDPOINT_ERROR index=$index reason=role-reserved"
 			continue
 		fi
+		BADFS_OBSERVATION_MODE=off \
 		BADFS_CLIENT_ENDPOINT_ID="$inspect_endpoint" \
 		BADFS_BENCH_MODE=inspect /payload/bin/badfs-bench.real
 		rc=$?
@@ -383,6 +491,7 @@ while IFS= read -r line; do
 		fi
 		target_generation="$1"
 		nonce="$2"
+		BADFS_OBSERVATION_MODE=off \
 		BADFS_BENCH_MODE=clean-restart-control \
 		BADFS_CLEAN_RESTART_TARGET_GENERATION="$target_generation" \
 		BADFS_CLEAN_RESTART_NONCE="$nonce" \
@@ -406,6 +515,7 @@ while IFS= read -r line; do
 		fi
 		cohort_action="$1"
 		cohort_endpoint="$2"
+		BADFS_OBSERVATION_MODE=off \
 		BADFS_BENCH_MODE=clean-restart-cohort \
 		BADFS_CLEAN_RESTART_COHORT_ACTION="$cohort_action" \
 		BADFS_CLIENT_ENDPOINT_ID="$cohort_endpoint" \
@@ -420,6 +530,9 @@ while IFS= read -r line; do
 			cat "$summary"
 		done
 		echo "LEGOFS_IO500_SUMMARIES_DONE index=$index"
+		;;
+	LEGOFS_DUMP_OBSERVATION)
+		dump_observation client-rank "$index"
 		;;
 	LEGOFS_POWEROFF)
 		echo "LEGOFS_IO500_POWEROFF index=$index"

@@ -25,7 +25,6 @@ MUSL_VERSION=1.2.5
 LLVM_REPOSITORY=https://github.com/llvm/llvm-project.git
 LLVM_TAG=llvmorg-20.1.8
 LLVM_COMMIT=87f0227cb60147a26a1eeb4fb06e3b505e9c7261
-JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 MPICH_REPOSITORY=https://github.com/pmodels/mpich.git
 MPICH_COMMIT=15f59ab2b740539472dfd130f7fe01b61c28bba4
@@ -41,6 +40,24 @@ SYSINT_REPOSITORY=https://github.com/alpha-unito/syscall_intercept.git
 SYSINT_COMMIT=7dbdf6ab9c576f96843ef2553b7efc7d15cf66b4
 CAPSTONE_REPOSITORY=https://github.com/capstone-engine/capstone.git
 CAPSTONE_COMMIT=accf4df62f1fba6f92cae692985d27063552601c
+
+source "$ROOT/scripts/legofs_toolchain_path.sh"
+legofs_toolchain_activate io500-build \
+	bash sh git cargo rustc rustup getconf \
+	"${CROSS_COMPILE}gcc" "${CROSS_COMPILE}g++" \
+	"${CROSS_COMPILE}as" "${CROSS_COMPILE}ar" \
+	"${CROSS_COMPILE}ld" "${CROSS_COMPILE}nm" \
+	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
+	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
+	"${CROSS_COMPILE}strip" \
+	"$CLANG" "$LLVM_AR" "$LLVM_MC" "$LLVM_RANLIB" \
+	cc gcc g++ ar ld nm objcopy ranlib readelf strip \
+	cmake ctest ninja meson make pkg-config \
+	mke2fs debugfs truncate file install rsync python3 \
+	wget sha256sum tar mktemp cmp tee awk sed grep sort find xargs \
+	dtc flex bison bc cpio swig perl openssl patch gzip \
+	mkdir chmod cp mv rm ln touch head tr
+JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 die()
 {
@@ -60,15 +77,6 @@ while (($#)); do
 done
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "jobs must be a positive integer"
 
-for command in git make cmake ninja cargo rustup mke2fs debugfs truncate \
-	file install rsync "${CROSS_COMPILE}gcc" \
-	"${CROSS_COMPILE}ar" "${CROSS_COMPILE}ld" \
-	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
-	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
-	"${CROSS_COMPILE}strip" "$CLANG" "$LLVM_AR" "$LLVM_MC" \
-	"$LLVM_RANLIB"; do
-	command -v "$command" >/dev/null || die "required command is missing: $command"
-done
 rustup target list --installed | grep -qx "$RUST_MUSL_TARGET" ||
 	die "Rust target is not installed: $RUST_MUSL_TARGET"
 [ -x "$NOV_GCC" ] || die "missing no-RVV compiler wrapper: $NOV_GCC"

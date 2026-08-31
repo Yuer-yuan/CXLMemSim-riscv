@@ -1,6 +1,9 @@
 import importlib.util
+import base64
+import hashlib
 import json
 import pathlib
+import struct
 import tempfile
 import threading
 import unittest
@@ -18,6 +21,7 @@ RANK_SCRIPT = ROOT / "guest" / "legofs_io500_rank.sh"
 BENCH_WRAPPER = ROOT / "guest" / "legofs_badfs_bench.sh"
 INIT_SCRIPT = ROOT / "guest" / "legofs_io500_init.sh"
 BOOTSTRAP_INIT_SCRIPT = ROOT / "guest" / "legofs_io500_bootstrap_init.sh"
+LEGOFS_SERVER_SOURCE = ROOT / "components" / "legofs" / "badfs-server" / "src" / "lib.rs"
 
 
 def load_runner():
@@ -27,7 +31,12 @@ def load_runner():
     return module
 
 
-def cxl_serving_evidence(endpoint, submitted=1):
+def cxl_serving_evidence(
+    endpoint,
+    submitted=1,
+    cursor_mode="owned",
+    cq_wait_mode="timer_sleep",
+):
     return [{
         "authority_id": 0,
         "lane_id": endpoint,
@@ -50,7 +59,9 @@ def cxl_serving_evidence(endpoint, submitted=1):
             "sqe_consumed": submitted,
             "cqe_published": submitted,
             "authority_queue_wait_ns": submitted,
+            "successful_request_poll_ns": submitted,
             "dispatcher_backend_ns": submitted,
+            "completion_publication_wait_ns": submitted,
             "cqe_publish_ns": submitted,
         },
         "client_timing": {
@@ -60,6 +71,46 @@ def cxl_serving_evidence(endpoint, submitted=1):
             "sq_credit_wait_ns": 0,
             "sq_publish_ns": submitted,
             "cq_wait_ns": submitted,
+            "cq_empty_polls": 0,
+            "cq_spin_polls": 0,
+            "cq_cooperative_yields": 0,
+            "cq_timer_sleeps": 0,
+        },
+        "cursor_mode": cursor_mode,
+        "cq_wait_mode": cq_wait_mode,
+        "open_mode": "fused_pin",
+        "fused_open_attempts": submitted,
+        "fused_open_pins": submitted,
+        "fused_open_fallbacks": 0,
+        "fused_close_attempts": submitted,
+        "fused_close_snapshot_releases": submitted,
+        "direct_metadata_capability": False,
+        "direct_metadata_attempts": 0,
+        "direct_metadata_hits": 0,
+        "direct_metadata_not_found_hits": 0,
+        "direct_metadata_no_hint": 0,
+        "direct_metadata_stale": 0,
+        "direct_metadata_cold_attempts": 0,
+        "direct_metadata_cold_hits": 0,
+        "direct_metadata_cold_not_found_hits": 0,
+        "direct_metadata_cold_fallbacks": 0,
+        "direct_metadata_fallback_commands": 0,
+        "direct_metadata_commands_elided": 0,
+        "direct_metadata_read_ns": 0,
+        "direct_metadata_gate_loads": 0,
+        "direct_metadata_root_loads": 0,
+        "direct_metadata_dentry_cell_loads": 0,
+        "direct_metadata_inode_record_loads": 0,
+        "client_lane_access": {
+            "submit_calls": submitted,
+            "completion_polls": submitted,
+            "request_polls": 0,
+            "completions": submitted,
+            "ready_loads": 0,
+            "peer_publication_loads": submitted,
+            "self_cursor_shared_loads": 0 if cursor_mode == "owned" else 2 * submitted,
+            "capacity_refreshes": 0,
+            "shared_identity_rereads": 0 if cursor_mode == "owned" else submitted,
         },
         "dispatches_by_opcode": {"35": 1} if submitted == 1 else {
             "1": submitted - 1,
@@ -117,7 +168,9 @@ def recovery_checkpoint(server=0):
                 "sqe_consumed": 2,
                 "cqe_published": 2,
                 "authority_queue_wait_ns": 1,
+                "successful_request_poll_ns": 1,
                 "dispatcher_backend_ns": 1,
+                "completion_publication_wait_ns": 0,
                 "cqe_publish_ns": 0,
             },
             "client_timing": {
@@ -234,13 +287,219 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertTrue(negative_control.server_read_exclusive)
 
         cxl = self.runner.parse_args(
-            ["--stage", "tiny", "--serving-transport", "cxl"]
+            [
+                "--stage", "tiny",
+                "--serving-transport", "cxl",
+                "--cursor-mode", "legacy_shared",
+                "--cq-wait-mode", "timer_sleep",
+            ]
         )
         self.assertEqual(cxl.serving_transport, "cxl")
+        self.assertEqual(cxl.cursor_mode, "legacy_shared")
+        self.assertEqual(cxl.cq_wait_mode, "timer_sleep")
+        self.assertFalse(hasattr(cxl, "direct_metadata_mode"))
 
         init = INIT_SCRIPT.read_text(encoding="utf-8")
+        rank = RANK_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("io500.client_count=", RUNNER.read_text(encoding="utf-8"))
         self.assertIn('-n "$client_count"', init)
+        self.assertIn('> /run/cursor-mode', init)
+        self.assertIn('> /run/cq-wait-mode', init)
+        self.assertNotIn('/run/direct-metadata-mode', init)
+        self.assertNotIn('/run/open-mode', init)
+        self.assertIn('BADFS_SERVING_CURSOR_MODE="$cursor_mode"', rank)
+        self.assertIn('BADFS_SERVING_CQ_WAIT_MODE="$cq_wait_mode"', rank)
+        self.assertNotIn('BADFS_DIRECT_METADATA_MODE', rank)
+        self.assertNotIn('BADFS_SERVING_OPEN_MODE', rank)
+        self.assertNotIn(
+            "--open-mode", TOP_LEVEL_RUNNER.read_text(encoding="utf-8")
+        )
+        self.assertNotIn(
+            "--direct-metadata-mode", TOP_LEVEL_RUNNER.read_text(encoding="utf-8")
+        )
+        server = LEGOFS_SERVER_SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn("BADFS_DIRECT_METADATA_MODE", server)
+        self.assertIn(
+            "if serving_profile == CxlServingProfile::SingleAuthorityMinimal",
+            server,
+        )
+        self.assertIn("CxlDirectMetadataStore::initialize", server)
+
+    def observation_arena(self, run_id="obs-contract", role=1, endpoint=0, pid=1234):
+        data = bytearray(4096)
+        data[0:8] = b"LEGOFSO1"
+        struct.pack_into("<HHHHQ", data, 8, 1, 0, 4096, 64, len(data))
+        data[24] = 1
+        data[25] = 1
+        data[26] = role
+        data[27] = 4
+        struct.pack_into("<HHII", data, 28, 8, 384, endpoint, pid)
+        struct.pack_into("<QQQQ", data, 40, 91, 1, 0b11, self.runner.observation_run_hash(run_id))
+        struct.pack_into("<QQQQQ", data, 72, 1_000_000, 2_000_000, 10, 20, 30)
+        struct.pack_into("<IIQQQ", data, 112, 1, 4096, 4096, 4096, 0)
+        struct.pack_into("<Q", data, 248, 8195)
+        struct.pack_into(
+            "<Q", data, 416, int(self.runner.OBSERVATION_SCHEMA_DIGEST, 16)
+        )
+        identity = 4096 - 0  # identity table starts immediately after the header
+        # Extend only for this parser contract; runner validation reads the first
+        # identity record at offset 4096, as production arenas do.
+        data.extend(b"\0" * 64)
+        data[identity] = role
+        struct.pack_into("<IIIQQ", data, identity + 4, endpoint, pid,
+                         endpoint if role == 1 else 0xFFFFFFFF, 91, 1)
+        struct.pack_into("<Q", data, 16, len(data))
+        return bytes(data)
+
+    def observation_frame_text(self, payload, run_id="obs-contract", role="client-rank", endpoint=0, pid=1234):
+        filename = f"observation-v1-{run_id}-{role}-{endpoint}-{pid}.bin"
+        digest = hashlib.sha256(payload).hexdigest()
+        encoded = base64.b64encode(payload).decode("ascii")
+        lines = [encoded[index:index + 76] for index in range(0, len(encoded), 76)]
+        return "\n".join([
+            f"LEGOFS_OBSERVATION_BEGIN role={role} endpoint={endpoint} file={filename} bytes={len(payload)} sha256={digest}",
+            *lines,
+            f"LEGOFS_OBSERVATION_END role={role} endpoint={endpoint} file={filename}",
+        ]) + "\n"
+
+    def test_observation_cli_profile_and_guest_contract(self):
+        args = self.runner.parse_args([
+            "--stage", "tiny", "--observation-mode", "aggregate",
+            "--observation-sample-shift", "6", "--observation-arena-mib", "12",
+            "--host-profiler", "stat",
+        ])
+        config = self.runner.resolve_observation_config(
+            args, pathlib.Path(self.temporary.name), "obs-contract"
+        )
+        self.assertEqual(config["mode"], "aggregate")
+        self.assertEqual(config["sample_shift"], 6)
+        self.assertEqual(config["arena_bytes"], 12 * 1024**2)
+
+        default = self.runner.resolve_observation_config(
+            self.runner.parse_args(["--stage", "tiny"]),
+            pathlib.Path(self.temporary.name),
+            "obs-default",
+        )
+        self.assertEqual(default["mode"], "default")
+        init = INIT_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('unset BADFS_OBSERVATION_MODE', init)
+        self.assertIn('BADFS_OBSERVATION_WORKLOAD_ENDPOINTS', init)
+        self.assertIn('LEGOFS_DUMP_OBSERVATION', init)
+        self.assertIn('/bin/busybox wc -c', init)
+        self.assertIn('/bin/busybox sha256sum', init)
+        self.assertIn('/bin/busybox base64', init)
+        self.assertNotIn('$(wc -c', init)
+        runner_source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("o=", runner_source)
+        boot_token = self.runner.observation_boot_token({
+            **config,
+            "run_id": self.runner.observation_run_id_for_label("x" * 96),
+        })
+        self.assertLessEqual(len(boot_token), 40)
+
+        for shift in (-1, 21):
+            bad = self.runner.parse_args([
+                "--stage", "tiny", "--observation-sample-shift", str(shift)
+            ])
+            with self.assertRaisesRegex(ValueError, "between 0 and 20"):
+                self.runner.resolve_observation_config(
+                    bad, pathlib.Path(self.temporary.name), "bad"
+                )
+        for arena in (7, 65):
+            bad = self.runner.parse_args([
+                "--stage", "tiny", "--observation-arena-mib", str(arena)
+            ])
+            with self.assertRaisesRegex(ValueError, "between 8 and 64"):
+                self.runner.resolve_observation_config(
+                    bad, pathlib.Path(self.temporary.name), "bad"
+                )
+
+    def test_observation_profile_hash_is_checked_before_execute(self):
+        profile = {
+            "schema_version": "legofs.observation.profile.v1",
+            "name": "o1-aggregate-v1",
+            "mode": "aggregate",
+            "sample_shift": 4,
+            "arena_mib": 12,
+            "producer_slots": 8,
+            "histogram": {"bins": 576},
+            "idle_sample_stride": 1024,
+            "observation_schema": {
+                "major": 1, "minor": 0, "event_record_bytes": 64,
+                "digest": self.runner.OBSERVATION_SCHEMA_DIGEST,
+            },
+        }
+        profile["profile_sha256"] = self.runner.observation_profile_digest(profile)
+        path = pathlib.Path(self.temporary.name) / "profile.json"
+        path.write_text(json.dumps(profile), encoding="utf-8")
+        loaded = self.runner.load_observation_profile(path)
+        self.assertEqual(loaded["sample_shift"], 4)
+        profile["sample_shift"] = 5
+        path.write_text(json.dumps(profile), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.runner.load_observation_profile(path)
+
+        args = self.runner.parse_args([
+            "--stage", "tiny", "--observation-profile-manifest", str(path),
+            "--observation-mode", "aggregate",
+        ])
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            self.runner.resolve_observation_config(
+                args, pathlib.Path(self.temporary.name), "obs-contract"
+            )
+
+    def test_observation_frame_rejects_truncation_digest_and_identity_mismatch(self):
+        payload = self.observation_arena()
+        text = self.observation_frame_text(payload)
+        frames = self.runner.parse_observation_frames(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["payload"], payload)
+        header = self.runner.validate_observation_frame(
+            frames[0], expected_role="client-rank", expected_endpoint=0,
+            config={
+                "mode": "aggregate", "sample_shift": 4,
+                "producer_slots": 8, "arena_bytes": len(payload),
+                "run_id": "obs-contract",
+            },
+            client_count=2,
+        )
+        self.assertTrue(header["snapshot_complete"])
+        self.assertTrue(header["runtime_valid"])
+
+        abandoned = bytearray(payload)
+        struct.pack_into("<Q", abandoned, 224, 1)
+        abandoned_frame = self.runner.parse_observation_frames(
+            self.observation_frame_text(bytes(abandoned))
+        )[0]
+        abandoned_header = self.runner.validate_observation_frame(
+            abandoned_frame, expected_role="client-rank", expected_endpoint=0,
+            config={
+                "mode": "aggregate", "sample_shift": 4,
+                "producer_slots": 8, "arena_bytes": len(abandoned),
+                "run_id": "obs-contract",
+            },
+            client_count=2,
+        )
+        self.assertFalse(abandoned_header["runtime_valid"])
+
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            self.runner.parse_observation_frames(text.rsplit("\n", 2)[0] + "\n")
+        bad_digest = text.replace(hashlib.sha256(payload).hexdigest(), "0" * 64)
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            self.runner.parse_observation_frames(bad_digest)
+        bad_end = text.replace(
+            "LEGOFS_OBSERVATION_END role=client-rank endpoint=0",
+            "LEGOFS_OBSERVATION_END role=client-rank endpoint=1",
+        )
+        with self.assertRaisesRegex(ValueError, "identity mismatch"):
+            self.runner.parse_observation_frames(bad_end)
+
+    def test_observation_failure_domain_does_not_raise(self):
+        result = self.runner.dump_observations_safely(
+            config={"mode": "aggregate"}
+        )
+        self.assertFalse(result["observation_valid"])
+        self.assertIsNotNone(result["observation_error"])
 
     def test_clean_restart_fault_is_cxl_only_and_guest_commands_are_explicit(self):
         args = self.runner.parse_args([
@@ -613,6 +872,7 @@ class Io500RuntimeTest(unittest.TestCase):
             "((BUILD_ONLY + RUN_ONLY + PAYLOAD_ONLY <= 1))",
             runner,
         )
+        self.assertIn("BUILD_ONLY == 0 && PAYLOAD_ONLY == 0", runner)
         self.assertIn(
             '"$ROOT/scripts/rebuild_legofs_io500_payload.sh" --jobs "$JOBS"',
             runner,
@@ -1019,6 +1279,36 @@ class Io500RuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fatal marker"):
             self.runner.wait_mpi_exit(console, "tiny", timeout=3600, start=0)
 
+        console.output = ""
+        server = FakeConsole("rcu: rcu_sched detected stalls on CPUs/tasks:\r\n")
+        with self.assertRaisesRegex(RuntimeError, "INCONCLUSIVE_RACE.*server0"):
+            self.runner.wait_mpi_exit(
+                console,
+                "metadata-smoke",
+                timeout=3600,
+                start=0,
+                monitored_guests=[
+                    ("client0", console, 0),
+                    ("server0", server, 0),
+                ],
+            )
+
+        server.output = (
+            "epc : 000000000022f09a badaddr: 00007fff90600040 "
+            "cause: 0000000000000005\r\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "server0.*fatal process fault"):
+            self.runner.wait_mpi_exit(
+                console,
+                "metadata-smoke",
+                timeout=3600,
+                start=0,
+                monitored_guests=[
+                    ("client0", console, 0),
+                    ("server0", server, 0),
+                ],
+            )
+
     def test_verifier_exit_is_observed_immediately(self):
         class FakeProcess:
             returncode = None
@@ -1100,7 +1390,13 @@ class Io500RuntimeTest(unittest.TestCase):
     def test_result_extraction_rejects_empty_find_even_for_tiny(self):
         source = RUNNER.read_text()
         self.assertIn('raise ValueError("IO500 find phase did not match any file")', source)
-        self.assertIn('if "[find]" in text', source)
+        self.assertIn('if find_enabled and (', source)
+        self.assertTrue(
+            self.runner.io500_phase_enabled("[find]\nrun = TRUE\n", "find")
+        )
+        self.assertFalse(
+            self.runner.io500_phase_enabled("[find]\nrun = FALSE\n", "find")
+        )
 
     def test_tiny_hard_mdtest_completes_an_io500_find_candidate(self):
         config = (ROOT / "configs" / "io500-tiny.ini").read_text()
@@ -1139,10 +1435,60 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("[ior-hard]\nrun = FALSE\n", easy)
 
         metadata = (ROOT / "configs" / "io500-metadata-smoke.ini").read_text()
-        self.assertIn("[mdtest-easy]\nAPI = POSIX\nn = 128\nrun = TRUE\n", metadata)
-        self.assertIn("[mdtest-hard]\nAPI = POSIX\nn = 128\nrun = TRUE\n", metadata)
-        self.assertIn("[find]\nrun = TRUE\n", metadata)
+        self.assertIn(
+            "[mdtest-hard]\nAPI = POSIX\nn = 32\nfiles-per-dir = 32\nrun = TRUE\n",
+            metadata,
+        )
+        self.assertIn("[mdtest-hard-write]\nAPI = POSIX\nrun = TRUE\n", metadata)
+        self.assertIn("[mdtest-hard-read]\nAPI = POSIX\nrun = TRUE\n", metadata)
+        self.assertIn("[mdtest-hard-stat]\nAPI = POSIX\nrun = TRUE\n", metadata)
+        for disabled in (
+            "[mdtest-easy]\nrun = FALSE\n",
+            "[find]\nrun = FALSE\n",
+            "[mdtest-hard-delete]\nrun = FALSE\n",
+        ):
+            self.assertIn(disabled, metadata)
         self.assertIn("[ior-easy]\nrun = FALSE\n", metadata)
+        rank_script = RANK_SCRIPT.read_text()
+        self.assertIn(
+            "metadata-smoke) export BADFS_LIFECYCLE_WRITE_ARENA_SLOTS=32 ;;",
+            rank_script,
+        )
+        self.assertIn(
+            "*) export BADFS_LIFECYCLE_WRITE_ARENA_SLOTS=64 ;;", rank_script
+        )
+
+    def test_lifecycle_payload_evidence_accepts_only_closed_durability_paths(self):
+        base = {
+            "direct_write_commit_items": 2,
+            "writer_persisted_direct_items": 0,
+            "writer_persisted_direct_bytes": 0,
+            "provider_payload_barriers": 1,
+            "provider_payload_bytes": 8192,
+        }
+        provider = self.runner.lifecycle_payload_persistence_evidence(base, 0)
+        self.assertTrue(provider["provider_payload_barrier"])
+        self.assertFalse(provider["writer_persisted_complete"])
+
+        writer = dict(base)
+        writer.update({
+            "writer_persisted_direct_items": 2,
+            "writer_persisted_direct_bytes": 7802,
+            "provider_payload_barriers": 0,
+            "provider_payload_bytes": 0,
+        })
+        writer_evidence = self.runner.lifecycle_payload_persistence_evidence(
+            writer, 0
+        )
+        self.assertFalse(writer_evidence["provider_payload_barrier"])
+        self.assertTrue(writer_evidence["writer_persisted_complete"])
+
+        missing = dict(writer, writer_persisted_direct_items=1)
+        with self.assertRaisesRegex(ValueError, "without payload persistence"):
+            self.runner.lifecycle_payload_persistence_evidence(missing, 0)
+        impossible = dict(writer, writer_persisted_direct_items=3)
+        with self.assertRaisesRegex(ValueError, "more writer-persisted"):
+            self.runner.lifecycle_payload_persistence_evidence(impossible, 0)
 
     def test_rnd4k_smoke_generates_official_easy_files_then_reads_them(self):
         config = (ROOT / "configs" / "io500-rnd4k.ini").read_text()
@@ -1204,6 +1550,134 @@ class Io500RuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rank/endpoint mismatch"):
             self.runner.validate_posix_summaries(records)
 
+    def test_direct_metadata_gate_requires_capability_and_exact_accounting(self):
+        records = []
+        for rank in range(2):
+            evidence = cxl_serving_evidence(rank, 2)[0]
+            evidence.update({
+                "format_generation": self.runner.DIRECT_METADATA_FORMAT_GENERATION,
+                "direct_metadata_capability": True,
+                "direct_metadata_attempts": 2,
+                "direct_metadata_hits": 1,
+                "direct_metadata_not_found_hits": 0,
+                "direct_metadata_no_hint": 1,
+                "direct_metadata_stale": 0,
+                "direct_metadata_cold_attempts": 1,
+                "direct_metadata_cold_hits": 0,
+                "direct_metadata_cold_not_found_hits": 0,
+                "direct_metadata_cold_fallbacks": 1,
+                "direct_metadata_fallback_commands": 1,
+                "direct_metadata_commands_elided": 1,
+                "direct_metadata_read_ns": 10,
+                "direct_metadata_gate_loads": 2,
+                "direct_metadata_root_loads": 2,
+                "direct_metadata_dentry_cell_loads": 3,
+                "direct_metadata_inode_record_loads": 1,
+                "dispatches_by_opcode": {"2": 1, "35": 1},
+            })
+            records.append({
+                "schema_version": "badfs.posix.path-summary.v4",
+                "mpi_rank": rank,
+                "endpoint": rank,
+                "intercept_enabled": True,
+                "cxl_serving_evidence": [evidence],
+                "stats": {"open_ops": 1},
+                "syscall_classification": {
+                    "totals": {
+                        "handled": 1,
+                        "rejected": 0,
+                        "non_badfs_forward": 0,
+                        "forbidden_badfs_forward": 0,
+                    },
+                    "syscalls": [],
+                },
+            })
+
+        self.runner.validate_posix_summaries(
+            records,
+            client_count=2,
+            expected_direct_metadata_mode="cxl",
+        )
+
+        broken = json.loads(json.dumps(records))
+        broken[0]["cxl_serving_evidence"][0][
+            "direct_metadata_commands_elided"
+        ] = 0
+        with self.assertRaisesRegex(ValueError, "command-elision"):
+            self.runner.validate_posix_summaries(
+                broken,
+                client_count=2,
+                expected_direct_metadata_mode="cxl",
+            )
+
+        broken = json.loads(json.dumps(records))
+        broken[0]["cxl_serving_evidence"][0][
+            "direct_metadata_capability"
+        ] = False
+        with self.assertRaisesRegex(ValueError, "capability absent"):
+            self.runner.validate_posix_summaries(
+                broken,
+                client_count=2,
+                expected_direct_metadata_mode="cxl",
+            )
+
+        rpc_records = json.loads(json.dumps(records))
+        for record in rpc_records:
+            evidence = record["cxl_serving_evidence"][0]
+            evidence["direct_metadata_capability"] = False
+            for field in self.runner.DIRECT_METADATA_CLIENT_COUNTERS:
+                evidence[field] = 0
+            evidence["dispatches_by_opcode"] = {"1": 1, "35": 1}
+        self.runner.validate_posix_summaries(
+            rpc_records,
+            client_count=2,
+            expected_direct_metadata_mode="rpc",
+        )
+
+    def test_direct_metadata_result_breakdown_preserves_command_demand(self):
+        evidence = cxl_serving_evidence(0, 2)[0]
+        evidence.update({
+            "direct_metadata_capability": True,
+            "direct_metadata_attempts": 3,
+            "direct_metadata_hits": 2,
+            "direct_metadata_not_found_hits": 0,
+            "direct_metadata_no_hint": 1,
+            "direct_metadata_stale": 0,
+            "direct_metadata_cold_attempts": 1,
+            "direct_metadata_cold_hits": 0,
+            "direct_metadata_cold_not_found_hits": 0,
+            "direct_metadata_cold_fallbacks": 1,
+            "direct_metadata_fallback_commands": 1,
+            "direct_metadata_commands_elided": 2,
+            "direct_metadata_read_ns": 30,
+            "direct_metadata_gate_loads": 4,
+            "direct_metadata_root_loads": 4,
+            "direct_metadata_dentry_cell_loads": 7,
+            "direct_metadata_inode_record_loads": 2,
+            "dispatches_by_opcode": {"2": 1, "35": 1},
+        })
+        authority = {
+            "publication_batches": 3,
+            "dentry_writes": 4,
+            "inode_writes": 3,
+            "registered_hints": 2,
+            "capacity_failures": 0,
+            "publication_failures": 0,
+            "dentry_high_water": 4,
+            "dentry_capacity": 1024,
+            "inode_capacity": 1024,
+        }
+        result = self.runner.direct_metadata_breakdown(
+            [{"cxl_serving_evidence": [evidence]}],
+            {"audit": {"direct_metadata": authority}},
+            "cxl",
+        )
+        self.assertEqual(result["read_metadata_commands"], 1)
+        self.assertEqual(result["baseline_equivalent_read_metadata_demand"], 3)
+        self.assertEqual(result["client"]["direct_metadata_commands_elided"], 2)
+        self.assertAlmostEqual(result["hit_ratio"], 2 / 3)
+        self.assertEqual(result["authority"], authority)
+
     def test_posix_summary_gate_rejects_unbalanced_cxl_lane_and_fallback(self):
         records = []
         for rank in range(10):
@@ -1248,6 +1722,28 @@ class Io500RuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not CLIENT_FS"):
             self.runner.validate_posix_summaries(records)
 
+        records[3]["cxl_serving_evidence"] = cxl_serving_evidence(3, 2)
+        records[3]["cxl_serving_evidence"][0]["cq_wait_mode"] = "timer_sleep"
+        records[3]["cxl_serving_evidence"][0]["client_timing"][
+            "cq_cooperative_yields"
+        ] = 1
+        records[3]["cxl_serving_evidence"][0]["client_timing"]["cq_empty_polls"] = 1
+        records[3]["cxl_serving_evidence"][0]["client_lane_access"][
+            "completion_polls"
+        ] = 3
+        records[3]["cxl_serving_evidence"][0]["client_lane_access"][
+            "peer_publication_loads"
+        ] = 3
+        with self.assertRaisesRegex(ValueError, "timer CQ wait"):
+            self.runner.validate_posix_summaries(records)
+
+        records[3]["cxl_serving_evidence"] = cxl_serving_evidence(3, 2)
+        records[3]["cxl_serving_evidence"][0]["client_timing"][
+            "cq_empty_polls"
+        ] = 1
+        with self.assertRaisesRegex(ValueError, "lane-access evidence"):
+            self.runner.validate_posix_summaries(records)
+
     def test_fixed_stage_roots_refuse_overwrite(self):
         self.paths.run.mkdir(parents=True)
         with self.assertRaisesRegex(FileExistsError, "already exists"):
@@ -1278,6 +1774,31 @@ hash = DCBA4321
         self.assertEqual(metrics["extended"]["hash"], "DCBA4321")
         self.assertEqual(metrics["phases"][0]["unit"], "GiB/s")
         self.assertEqual(metrics["phases"][1]["unit"], "kIOPS")
+
+    def test_observation_phase_projection_marks_boundary_uncertainty(self):
+        phases = [
+            {"name": "first", "start_realtime_ns": 10_000, "end_realtime_ns": 20_000},
+            {"name": "second", "start_realtime_ns": 20_000, "end_realtime_ns": 30_000},
+        ]
+        header = {
+            "realtime_anchor_ns": 10_000,
+            "monotonic_anchor_ns": 1_000,
+            "anchor_span_ns": 10,
+        }
+        inside = self.runner.project_observation_timestamp_to_phase(
+            6_000, header, phases, guest_sync_error_ns=10,
+            io500_timestamp_resolution_ns=10,
+        )
+        self.assertEqual(inside["phase"], "first")
+        self.assertFalse(inside["phase_ambiguous"])
+
+        boundary = self.runner.project_observation_timestamp_to_phase(
+            11_000, header, phases, guest_sync_error_ns=10,
+            io500_timestamp_resolution_ns=10,
+        )
+        self.assertIsNone(boundary["phase"])
+        self.assertTrue(boundary["phase_ambiguous"])
+        self.assertEqual(boundary["overlapping_phases"], ["first", "second"])
 
     def test_host_process_cost_is_explicitly_inclusive(self):
         before = {
@@ -1354,6 +1875,29 @@ hash = DCBA4321
         )
         self.assertEqual(timing["arena_acquire"]["arena_acquire_total_ns"], 90)
         self.assertIn("nested", timing["interpretation"])
+
+    def test_cq_attribution_keeps_inner_intervals_nested(self):
+        evidence = cxl_serving_evidence(0)[0]
+        evidence["client_timing"].update({"calls": 1, "cq_wait_ns": 100})
+        evidence["authority_timing"].update({
+            "successful_request_poll_ns": 20,
+            "authority_queue_wait_ns": 10,
+            "dispatcher_backend_ns": 15,
+            "completion_publication_wait_ns": 1,
+            "cqe_publish_ns": 4,
+        })
+        timing = self.runner.legofs_timing_breakdown(
+            [{"stats": {}, "cxl_serving_evidence": [evidence]}],
+            {"audit": {}},
+            wall_ns=100,
+            client_count=1,
+        )
+        attribution = timing["transport_cq_attribution"]
+        self.assertEqual(attribution["outer_cq_wait_ns"], 100)
+        self.assertEqual(attribution["inner_authority_ns"], 50)
+        self.assertEqual(attribution["residual_ns"], 50)
+        self.assertEqual(attribution["residual_share_of_outer"], 0.5)
+        self.assertIn("nested", attribution["interpretation"])
 
     def test_strict_bi_proof_correlates_owner_range_and_host_order(self):
         self.paths.bundle.mkdir(parents=True)
@@ -1583,6 +2127,16 @@ hash = DCBA4321
         with self.assertRaisesRegex(ValueError, "dirty_data_completions"):
             self.runner.validate_tiny_provider_counters(
                 {"snp_data_inv": 1, "model_acks": 1}, backinvalidation
+            )
+
+        inspection = {"audit": {"writer_persisted_direct_items": 2}}
+        self.runner.validate_inspection_provider_counters(
+            {"request_fence": 1, "persistence_fence_completions": 1},
+            inspection,
+        )
+        with self.assertRaisesRegex(ValueError, "persistence_fence_completions"):
+            self.runner.validate_inspection_provider_counters(
+                {"request_fence": 1}, inspection
             )
 
 

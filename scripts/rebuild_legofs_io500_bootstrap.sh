@@ -7,6 +7,15 @@ PLATFORM="$TARGET_ROOT/platform"
 INITRAMFS="$TARGET_ROOT/initramfs"
 LINUX_BUILD="$TARGET_ROOT/linux"
 CROSS_COMPILE="${CROSS_COMPILE:-riscv64-linux-gnu-}"
+source "$ROOT/scripts/legofs_toolchain_path.sh"
+legofs_toolchain_activate io500-bootstrap \
+	bash sh getconf make sha256sum install mktemp mv rm \
+	"${CROSS_COMPILE}gcc" "${CROSS_COMPILE}as" \
+	"${CROSS_COMPILE}ar" "${CROSS_COMPILE}ld" \
+	"${CROSS_COMPILE}nm" "${CROSS_COMPILE}objcopy" \
+	"${CROSS_COMPILE}objdump" "${CROSS_COMPILE}ranlib" \
+	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" \
+	awk sed grep sort find perl python3 bc bison flex openssl cpio
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 IMAGE_TMP=
 

@@ -36,7 +36,13 @@ export BADFS_DISABLE_FABRIC_MMAP=0
 export BADFS_LIFECYCLE_COHERENT_PUBLICATION=1
 export BADFS_LIFECYCLE_COHERENT_READ_CACHE=1
 export BADFS_LIFECYCLE_READ_CACHE_ENTRIES=2048
-export BADFS_LIFECYCLE_WRITE_ARENA_SLOTS=64
+# metadata-smoke is a fixed 32-write/rank read-path pilot. Match its one-use
+# arena to that exact prerequisite instead of persisting 32 unused 2 MiB slots
+# per rank. Score/tiny/product profiles retain the production default below.
+case "$stage" in
+metadata-smoke) export BADFS_LIFECYCLE_WRITE_ARENA_SLOTS=32 ;;
+*) export BADFS_LIFECYCLE_WRITE_ARENA_SLOTS=64 ;;
+esac
 export BADFS_CLIENT_ENDPOINT_ID="$endpoint_id"
 if [ -s /run/serving-transport ]; then
 	serving_transport="$(cat /run/serving-transport)"
@@ -45,6 +51,30 @@ else
 fi
 case "$serving_transport" in legacy|cxl) ;; *) exit 64 ;; esac
 export BADFS_SERVING_TRANSPORT="$serving_transport"
+if [ -s /run/cursor-mode ]; then
+	cursor_mode="$(cat /run/cursor-mode)"
+else
+	cursor_token="$(cmdline_value c= 2>/dev/null || printf 'o\n')"
+	case "$cursor_token" in
+	l) cursor_mode=legacy_shared ;;
+	o) cursor_mode=owned ;;
+	*) exit 64 ;;
+	esac
+fi
+case "$cursor_mode" in legacy_shared|owned) ;; *) exit 64 ;; esac
+export BADFS_SERVING_CURSOR_MODE="$cursor_mode"
+if [ -s /run/cq-wait-mode ]; then
+	cq_wait_mode="$(cat /run/cq-wait-mode)"
+else
+	cq_wait_token="$(cmdline_value w= 2>/dev/null || printf 's\n')"
+	case "$cq_wait_token" in
+	s) cq_wait_mode=timer_sleep ;;
+	y) cq_wait_mode=cooperative_yield ;;
+	*) exit 64 ;;
+	esac
+fi
+case "$cq_wait_mode" in timer_sleep|cooperative_yield) ;; *) exit 64 ;; esac
+export BADFS_SERVING_CQ_WAIT_MODE="$cq_wait_mode"
 export BADFS_SERVING_MAX_CLIENTS=64
 export BADFS_LIFECYCLE_REGION_SIZE=68719476736
 export BADFS_POSIX_TRACE_DIR=/tmp/posix
@@ -70,6 +100,7 @@ if [ "$stage" = tiny ] && [ "$serving_transport" = cxl ]; then
 	# disjoint range so its completed generation cannot block either consumer.
 	diagnostic_endpoint="$((client_count + 1 + endpoint_id))"
 	[ "$diagnostic_endpoint" -lt "$BADFS_SERVING_MAX_CLIENTS" ] || exit 64
+	BADFS_OBSERVATION_MODE=off \
 	BADFS_CLIENT_ENDPOINT_ID="$diagnostic_endpoint" BADFS_BENCH_MODE=syscall-matrix \
 		LD_PRELOAD= /payload/bin/badfs-bench.real
 	# Preflight is intentionally outside the measured IO500 phases and can be
@@ -108,6 +139,7 @@ if [ "${PMI_RANK:-unset}" = 0 ]; then
 		exporter_endpoint="$((2 * client_count + 1))"
 		[ "$exporter_endpoint" -lt "$serving_client_lane_count" ] || exit 64
 		/bin/busybox mkdir -p /tmp/posix-export
+		BADFS_OBSERVATION_MODE=off \
 		BADFS_CLIENT_ENDPOINT_ID="$exporter_endpoint" \
 			BADFS_POSIX_TRACE_DIR=/tmp/posix-export \
 			PMI_RANK= PMIX_RANK= OMPI_COMM_WORLD_RANK= \
