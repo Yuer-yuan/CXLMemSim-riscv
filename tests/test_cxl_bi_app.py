@@ -14,6 +14,7 @@ from scripts.cxl_bi_app import (
     parse_guest_records,
     parse_server_stats,
     percentiles_ns,
+    require_dirty_handoff,
     validate_guest_evidence,
 )
 
@@ -176,6 +177,12 @@ class TraceEvidenceTests(unittest.TestCase):
         self.assertEqual(path["snoop_id"], 91)
         self.assertEqual(path["request_id"], 44)
         self.assertEqual(path["payload_len"], 64)
+        self.assertEqual(require_dirty_handoff(evidence, 1, 0), path)
+
+    def test_required_handoff_rejects_the_reverse_direction(self):
+        evidence = analyze_trace(self._write(self._records()), {0x200000})
+        with self.assertRaisesRegex(ValueError, "0->1"):
+            require_dirty_handoff(evidence, 0, 1)
 
     def test_trace_reports_unrelated_target_as_incomplete(self):
         evidence = analyze_trace(self._write(self._records()), {0x300000})

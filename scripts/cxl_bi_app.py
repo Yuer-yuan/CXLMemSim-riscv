@@ -32,6 +32,7 @@ TYPE3_DECODER = (
     "41.00.0 Type 3 decoder0: HPA 0000001000000000 "
     "size 0000000010000000 target 0 ctrl 00001600"
 )
+BI_ENABLE_MARKER = "CXL Type3: BI enabled via decoder control"
 LEGACY_TRANSPORT_ENV = (
     "CXL_TRANSPORT_MODE",
     "CXL_PGAS_SHM",
@@ -466,6 +467,26 @@ def analyze_trace(path: pathlib.Path, target_dpas: set[int]) -> dict[str, object
         "event_counts": dict(sorted(event_counts.items())),
         "dirty_paths": dirty_paths,
     }
+
+
+def require_dirty_handoff(
+    trace_evidence: dict[str, object], owner_host: int, requester_host: int
+) -> dict[str, object]:
+    paths = trace_evidence.get("dirty_paths")
+    if not isinstance(paths, list):
+        raise ValueError("trace evidence lacks dirty paths")
+    matches = [
+        path
+        for path in paths
+        if isinstance(path, dict)
+        and path.get("owner_host") == owner_host
+        and path.get("requester_host") == requester_host
+    ]
+    if not matches:
+        raise ValueError(
+            f"dirty hand-off {owner_host}->{requester_host} is absent"
+        )
+    return matches[0]
 
 
 def _one_event(
@@ -1356,6 +1377,10 @@ def run_experiment(paths: RuntimePaths, config: RunConfig) -> dict[str, object]:
 
         reader_records = parse_guest_records(reader.output)
         writer_records = parse_guest_records(writer.output)
+        for role, console in consoles.items():
+            if BI_ENABLE_MARKER not in console.output:
+                raise ValueError(f"{role} console lacks the BI decoder enable marker")
+            result["uboot_evidence"][role]["qemu_bi_enable_marker"] = True
         application = validate_guest_evidence(
             reader_records,
             writer_records,
@@ -1393,6 +1418,14 @@ def run_experiment(paths: RuntimePaths, config: RunConfig) -> dict[str, object]:
                 "application passed but no address-correlated dirty BI path covers "
                 f"payload DPA {hex(int(payload_dpa))}"
             )
+        try:
+            required_handoff = require_dirty_handoff(trace_evidence, 1, 0)
+        except ValueError as error:
+            raise ValueError(
+                "payload DPA lacks the required dirty writer(host 1) to "
+                "reader(host 0) BI hand-off"
+            ) from error
+        trace_evidence["required_dirty_owner_handoff"] = required_handoff
         trace_evidence["registrations"] = registrations
         trace_evidence["error_events"] = 0
         result["bi_trace_evidence"] = trace_evidence
@@ -1407,7 +1440,20 @@ def run_experiment(paths: RuntimePaths, config: RunConfig) -> dict[str, object]:
             raise ValueError("coherence server recorded no dirty data completion")
         result["coherence_server_stats"] = stats
         result["performance"] = {
-            "observed": application["measurements"],
+            "observed": application["measurements"]
+            | {
+                "bi_trace": {
+                    "classification": "qemu_tcg_tcp_wallclock",
+                    "request_to_completion_ns": required_handoff["completion_ns"]
+                    - required_handoff["request_ns"],
+                    "snoop_to_ack_ns": required_handoff["ack_ns"]
+                    - required_handoff["snoop_ns"],
+                    "ack_to_dirty_completion_ns": required_handoff[
+                        "completion_ns"
+                    ]
+                    - required_handoff["ack_ns"],
+                }
+            },
             "analytical": analytical_envelope(
                 config.link_gbps,
                 config.media_ns,

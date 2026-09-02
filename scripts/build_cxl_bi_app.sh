@@ -78,6 +78,10 @@ mkdir -p "${BUILD}" "${IMAGES}" "${RESULTS}" "${LOGS}" \
 exec > >(tee -a "${LOGS}/build.log") 2>&1
 
 printf '%s\n' '[cxl-bi-build] static RISC-V DAX benchmark PID 1'
+if grep -Eq '\<(msync|fsync|fdatasync|sync|clflush)\>[[:space:]]*\(' \
+	"${ROOT}/guest/cxl_bi_app_init.c"; then
+	die "guest benchmark contains an explicit cache/persistence flush call"
+fi
 "${MUSL_CC}" \
 	-static -O2 -g -std=c11 -Wall -Wextra -Werror \
 	-march=rv64imafdc -mabi=lp64d \
