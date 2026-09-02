@@ -103,12 +103,13 @@ and records these controls:
 - both guests must report the same DAX offset/size but different endpoint IDs;
 - trace analysis must join the tested DPA with a request, snoop, dirty ACK, and
   completion, and must validate the 64-byte dirty data where available;
-- a `--negative-control` mode intentionally boots one endpoint without
-  committing BI. The current QEMU implementation is expected to fail closed
-  (DAX access error or guest-test timeout), not to return a coherent value.
+- command-construction tests cover the non-BI FMW restriction as a fail-closed
+  building block. A runtime non-BI boot is not treated as a stale-data control:
+  the current QEMU adapter rejects coherence-v2 memory transactions while its
+  BI decoder is disabled, so that run tests admission rather than coherence.
 
-The negative control is optional because it costs another dual-guest boot. The
-normal run's distinct files plus address-correlated BI trace are mandatory.
+The normal run's distinct backing files plus address-correlated BI trace are
+the mandatory causality controls.
 
 ## Performance Reporting
 

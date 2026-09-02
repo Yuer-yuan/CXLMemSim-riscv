@@ -10,6 +10,7 @@ from scripts.cxl_bi_app import (
     analyze_trace,
     build_bootargs,
     build_qemu_command,
+    parse_args,
     parse_guest_records,
     parse_server_stats,
     percentiles_ns,
@@ -254,6 +255,15 @@ class CommandConstructionTests(unittest.TestCase):
             self.assertIn("cxlmemsim-port=31234", rendered)
             self.assertNotIn("virtio-blk", rendered)
 
+    def test_non_bi_command_building_block_removes_fmw_bi_capability(self):
+        rendered = " ".join(
+            build_qemu_command(
+                self.paths, self.config, 1, 31234, bi_enabled=False
+            )
+        )
+        self.assertIn("cxl-fmw.0.restrictions=0x09", rendered)
+        self.assertNotIn("cxl-fmw.0.restrictions=0x29", rendered)
+
     def test_bootargs_identify_role_and_never_request_a_flush(self):
         reader = build_bootargs("reader", self.config)
         writer = build_bootargs("writer", self.config)
@@ -398,6 +408,40 @@ class ServerStatsTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "protocol_errors"):
             parse_server_stats(output)
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_valid_cli_values_become_run_config(self):
+        config = parse_args(
+            [
+                "--iterations",
+                "32",
+                "--stream-bytes",
+                "131072",
+                "--timeout",
+                "180",
+                "--link-gbps",
+                "64",
+            ]
+        )
+        self.assertEqual(config.iterations, 32)
+        self.assertEqual(config.stream_bytes, 131072)
+        self.assertEqual(config.timeout_seconds, 180)
+        self.assertEqual(config.link_gbps, 64.0)
+
+    def test_invalid_cli_values_exit_with_usage_error(self):
+        cases = (
+            ["--iterations", "0"],
+            ["--stream-bytes", "65"],
+            ["--timeout", "0"],
+            ["--link-gbps", "0"],
+            ["--media-ns", "-1"],
+            ["--guest-memory", "one-gigabyte"],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit) as caught:
+                parse_args(arguments)
+            self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":

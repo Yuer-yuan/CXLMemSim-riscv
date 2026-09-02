@@ -49,7 +49,6 @@ class RunConfig:
     request_ns: float = 150.0
     bi_ns: float = 200.0
     guest_memory: str = "1G"
-    negative_control: bool = False
 
 
 class RuntimePaths:
@@ -1258,7 +1257,6 @@ def run_experiment(paths: RuntimePaths, config: RunConfig) -> dict[str, object]:
             "stream_bytes": config.stream_bytes,
             "timeout_seconds": config.timeout_seconds,
             "guest_memory": config.guest_memory,
-            "negative_control": config.negative_control,
         },
         "logs": {
             "reader_serial": str(paths.console_log(0)),
@@ -1271,10 +1269,6 @@ def run_experiment(paths: RuntimePaths, config: RunConfig) -> dict[str, object]:
         "processes": {},
     }
     try:
-        if config.negative_control:
-            raise ValueError(
-                "negative control must be launched separately with the dedicated control mode"
-            )
         manifest = load_runtime_manifest(paths)
         result["build_manifest"] = str(paths.manifest)
         result["component_commits"] = manifest.get("submodules", {})
@@ -1490,11 +1484,6 @@ def parse_args(argv: list[str] | None = None) -> RunConfig:
     parser.add_argument("--request-ns", type=float, default=150.0)
     parser.add_argument("--bi-ns", type=float, default=200.0)
     parser.add_argument("--guest-memory", default="1G")
-    parser.add_argument(
-        "--negative-control",
-        action="store_true",
-        help="reserved for the separate fail-closed BI control run",
-    )
     args = parser.parse_args(argv)
     if not 1 <= args.iterations <= 16384:
         parser.error("iterations must be in 1..16384")
@@ -1519,7 +1508,6 @@ def parse_args(argv: list[str] | None = None) -> RunConfig:
         request_ns=args.request_ns,
         bi_ns=args.bi_ns,
         guest_memory=args.guest_memory,
-        negative_control=args.negative_control,
     )
 
 

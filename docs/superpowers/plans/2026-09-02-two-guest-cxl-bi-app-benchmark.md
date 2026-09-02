@@ -345,8 +345,7 @@ git commit -m "feat: orchestrate two-guest CXL BI benchmark"
 - Modify: `tests/test_cxl_bi_app.py`
 
 **Interfaces:**
-- CLI modes: default build-and-run, `--build-only`, `--run-only`, and optional
-  `--negative-control`.
+- CLI modes: default build-and-run, `--build-only`, and `--run-only`.
 - Tunables: `--iterations`, `--stream-bytes`, `--timeout`, `--link-gbps`,
   `--media-ns`, `--request-ns`, and `--bi-ns`.
 
@@ -364,8 +363,8 @@ scripts/cxl_bi_app.py "$@"`. Forward signals through `exec`.
 - [ ] **Step 3: Document exact commands and interpretation**
 
 Document the one-command positive run, a fast smoke configuration, the
-optional negative control, evidence directory layout, PASS gates, and the
-emulator-versus-hardware claim boundary. Include the warning that GPF and
+evidence directory layout, PASS gates, and the emulator-versus-hardware claim
+boundary. Include the warning that GPF and
 persistence are outside this coherence-only test.
 
 - [ ] **Step 4: Run static checks and commit**
