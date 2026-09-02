@@ -145,6 +145,24 @@ static void mount_one(const char *source, const char *target,
 		fatal("mount", errno);
 }
 
+static void setup_console(void)
+{
+	int descriptor;
+
+	if (mknod("/dev/console", S_IFCHR | 0600, makedev(5, 1)) != 0 &&
+	    errno != EEXIST)
+		fatal("mknod-console", errno);
+	descriptor = open("/dev/console", O_RDWR | O_NOCTTY);
+	if (descriptor < 0)
+		fatal("open-console", errno);
+	if (dup2(descriptor, STDIN_FILENO) < 0 ||
+	    dup2(descriptor, STDOUT_FILENO) < 0 ||
+	    dup2(descriptor, STDERR_FILENO) < 0)
+		fatal("dup-console", errno);
+	if (descriptor > STDERR_FILENO)
+		close(descriptor);
+}
+
 static ssize_t read_text_file(const char *path, char *buffer, size_t capacity)
 {
 	int descriptor;
@@ -683,6 +701,7 @@ int main(void)
 	mount_one("proc", "/proc", "proc", 0);
 	mount_one("sysfs", "/sys", "sysfs", 0);
 	mount_one("devtmpfs", "/dev", "devtmpfs", 0);
+	setup_console();
 	options = parse_options();
 	dax = discover_dax(options.timeout_ms);
 	required_bytes = STREAM_OFFSET + options.stream_bytes;
