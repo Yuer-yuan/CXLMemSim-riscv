@@ -4,10 +4,16 @@ import tempfile
 import unittest
 
 from scripts.cxl_bi_app import (
+    RunConfig,
+    RuntimePaths,
     analytical_envelope,
     analyze_trace,
+    build_bootargs,
+    build_qemu_command,
     parse_guest_records,
+    parse_server_stats,
     percentiles_ns,
+    validate_guest_evidence,
 )
 
 
@@ -203,6 +209,195 @@ class TraceEvidenceTests(unittest.TestCase):
         records[2]["monotonic_ns"] = 5
         with self.assertRaisesRegex(ValueError, "backwards"):
             analyze_trace(self._write(records), {0x200000})
+
+
+class CommandConstructionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = pathlib.Path(self.temporary.name) / "repo"
+        self.paths = RuntimePaths.for_test(self.root)
+        self.config = RunConfig(
+            iterations=16,
+            stream_bytes=65536,
+            timeout_seconds=240,
+            link_gbps=32.0,
+            media_ns=100.0,
+            request_ns=150.0,
+            bi_ns=200.0,
+            guest_memory="1G",
+        )
+
+    def test_two_commands_use_distinct_files_and_host_ids(self):
+        commands = [
+            build_qemu_command(self.paths, self.config, node, 31234)
+            for node in (0, 1)
+        ]
+        rendered = [" ".join(command) for command in commands]
+        self.assertIn(str(self.paths.endpoint_memory(0)), rendered[0])
+        self.assertNotIn(str(self.paths.endpoint_memory(1)), rendered[0])
+        self.assertIn(str(self.paths.endpoint_memory(1)), rendered[1])
+        self.assertIn("coherence-v2-host-id=0", rendered[0])
+        self.assertIn("coherence-v2-host-id=1", rendered[1])
+        self.assertIn("coherence-v2-read-exclusive=on", rendered[0])
+        self.assertIn("coherence-v2-read-exclusive=off", rendered[1])
+
+    def test_both_commands_require_bi_hdm_db_and_same_server(self):
+        for node in (0, 1):
+            rendered = " ".join(
+                build_qemu_command(self.paths, self.config, node, 31234)
+            )
+            self.assertIn("cxl-fmw.0.restrictions=0x29", rendered)
+            self.assertIn("coherence-v2=on", rendered)
+            self.assertIn("hdm-db=on", rendered)
+            self.assertIn("x-256b-flit=on", rendered)
+            self.assertIn("cxlmemsim-port=31234", rendered)
+            self.assertNotIn("virtio-blk", rendered)
+
+    def test_bootargs_identify_role_and_never_request_a_flush(self):
+        reader = build_bootargs("reader", self.config)
+        writer = build_bootargs("writer", self.config)
+        for bootargs in (reader, writer):
+            self.assertIn("cxl_core.pmem_as_dax=1", bootargs)
+            self.assertIn("cxlbi.iterations=16", bootargs)
+            self.assertIn("cxlbi.stream_bytes=65536", bootargs)
+            self.assertIn("cxlbi.timeout_ms=240000", bootargs)
+            self.assertNotIn("flush", bootargs)
+        self.assertIn("cxlbi.role=reader", reader)
+        self.assertIn("cxlbi.role=writer", writer)
+
+
+class GuestEvidenceValidationTests(unittest.TestCase):
+    @staticmethod
+    def _records(role):
+        endpoint = 0 if role == "reader" else 1
+        records = [
+            {
+                "schema_version": 1,
+                "event": "mapped",
+                "role": role,
+                "endpoint_id": endpoint,
+                "dax": "dax0.0",
+                "dax_size": 268435456,
+                "dax_align": 2097152,
+                "mapping_offset": 0,
+                "mapping_bytes": 4194304,
+                "litmus_generation_offset": 256,
+                "payload_offset": 320,
+                "ping_request_offset": 384,
+                "ping_ack_offset": 448,
+                "stream_offset": 2097152,
+            },
+            {
+                "schema_version": 1,
+                "event": "litmus",
+                "role": role,
+                "operation": "observe" if role == "reader" else "publish",
+                "generation": 1,
+                "elapsed_ns": 1000,
+                "payload_checksum": 12345,
+                "errors": 0,
+            },
+            {
+                "schema_version": 1,
+                "event": "pingpong",
+                "role": role,
+                "iterations": 16,
+                "elapsed_ns": 16000,
+                "errors": 0,
+            },
+            {
+                "schema_version": 1,
+                "event": "stream",
+                "role": role,
+                "operation": "read_verify" if role == "reader" else "write",
+                "direction": 0,
+                "bytes": 65536,
+                "elapsed_ns": 10000,
+                "errors": 0,
+            },
+            {
+                "schema_version": 1,
+                "event": "stream",
+                "role": role,
+                "operation": "write" if role == "reader" else "read_verify",
+                "direction": 1,
+                "bytes": 65536,
+                "elapsed_ns": 11000,
+                "errors": 0,
+            },
+            {
+                "schema_version": 1,
+                "event": "summary",
+                "role": role,
+                "status": "pass",
+                "iterations": 16,
+                "stream_bytes": 65536,
+                "errors": 0,
+                "explicit_flush_calls": 0,
+            },
+        ]
+        if role == "reader":
+            records[2].update(
+                min_ns=900,
+                mean_ns=1000,
+                p50_ns=950,
+                p95_ns=1200,
+                p99_ns=1300,
+                max_ns=1400,
+            )
+        else:
+            records[1]["old_payload_checksum"] = 999
+        return records
+
+    def test_accepts_complete_two_role_application_evidence(self):
+        result = validate_guest_evidence(
+            self._records("reader"), self._records("writer"), 16, 65536
+        )
+        self.assertEqual(result["payload_offset"], 320)
+        self.assertEqual(result["application_errors"], 0)
+        self.assertEqual(
+            result["measurements"]["classification"],
+            "qemu_tcg_tcp_wallclock",
+        )
+        self.assertAlmostEqual(
+            result["measurements"]["stream"]["direction_0_read_verify_MiBps"],
+            6250.0,
+        )
+
+    def test_rejects_checksum_disagreement(self):
+        writer = self._records("writer")
+        writer[1]["payload_checksum"] = 88
+        with self.assertRaisesRegex(ValueError, "payload checksum"):
+            validate_guest_evidence(self._records("reader"), writer, 16, 65536)
+
+    def test_rejects_any_explicit_flush_count(self):
+        writer = self._records("writer")
+        writer[-1]["explicit_flush_calls"] = 1
+        with self.assertRaisesRegex(ValueError, "flush"):
+            validate_guest_evidence(self._records("reader"), writer, 16, 65536)
+
+
+class ServerStatsTests(unittest.TestCase):
+    def test_parse_server_stats_requires_zero_error_counters(self):
+        output = (
+            'noise\nCOHERENCE_V2_STATS_JSON {"registrations":2,"getm":8,'
+            '"snp_data_inv":3,"model_acks":3,"dirty_data_completions":3,'
+            '"timeouts":0,"protocol_errors":0,"delivery_failures":0,'
+            '"server_copy_failures":0,"active_bindings":0}\n'
+        )
+        stats = parse_server_stats(output)
+        self.assertEqual(stats["registrations"], 2)
+        self.assertEqual(stats["dirty_data_completions"], 3)
+
+    def test_parse_server_stats_rejects_protocol_error(self):
+        output = (
+            'COHERENCE_V2_STATS_JSON {"timeouts":0,"protocol_errors":1,'
+            '"delivery_failures":0,"server_copy_failures":0,'
+            '"active_bindings":0}\n'
+        )
+        with self.assertRaisesRegex(ValueError, "protocol_errors"):
+            parse_server_stats(output)
 
 
 if __name__ == "__main__":
