@@ -868,6 +868,7 @@ class Console:
         self.name = name
         self.command = list(command)
         self.output = ""
+        self.completed_lines: list[str] = []
         self.condition = threading.Condition()
         self.closed = False
         self.log = pathlib.Path(log_path).open("w", encoding="utf-8")
@@ -890,6 +891,7 @@ class Console:
     def _capture_event(self, raw_line: bytes) -> None:
         decoded = raw_line.decode(errors="replace").rstrip("\r")
         capture_ns = time.monotonic_ns()
+        self.completed_lines.append(decoded)
         json.dump(
             {"host_capture_ns": capture_ns, "line": decoded},
             self.events,
@@ -952,6 +954,34 @@ class Console:
             raise RuntimeError(f"{self.name} QEMU console is not writable")
         self.process.stdin.write((line + "\n").encode())
         self.process.stdin.flush()
+
+    def wait_guest_event(self, event: str, role: str, timeout: float) -> dict[str, object]:
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                for line in self.completed_lines:
+                    if RECORD_PREFIX not in line:
+                        continue
+                    records = parse_guest_records(line)
+                    if len(records) != 1:
+                        raise ValueError(f"{self.name} guest line has multiple records")
+                    record = records[0]
+                    if record.get("event") == "fatal":
+                        raise RuntimeError(f"{self.name} reported {line}")
+                    if record.get("event") == event and record.get("role") == role:
+                        return record
+                if self.process.poll() is not None:
+                    raise RuntimeError(
+                        f"{self.name} QEMU exited with {self.process.returncode} "
+                        f"while waiting for complete {event}/{role} record"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"timed out waiting for complete {event}/{role} record "
+                        f"on {self.name}"
+                    )
+                self.condition.wait(min(remaining, 0.5))
 
     def command_until_prompt(self, command: str, timeout: float) -> str:
         start = len(self.output)
@@ -1302,7 +1332,7 @@ def run_experiment(paths: RuntimePaths, config: RunConfig) -> dict[str, object]:
         boot_evidence = {
             "reader": run_uboot(reader, paths, "reader", config)
         }
-        reader.wait('"event":"ready","role":"reader"', config.timeout_seconds)
+        reader.wait_guest_event("ready", "reader", config.timeout_seconds)
 
         writer = Console(
             "writer",
@@ -1318,8 +1348,8 @@ def run_experiment(paths: RuntimePaths, config: RunConfig) -> dict[str, object]:
         boot_evidence["writer"] = run_uboot(writer, paths, "writer", config)
         result["uboot_evidence"] = boot_evidence
 
-        writer.wait('"event":"summary","role":"writer"', config.timeout_seconds)
-        reader.wait('"event":"summary","role":"reader"', config.timeout_seconds)
+        writer.wait_guest_event("summary", "writer", config.timeout_seconds)
+        reader.wait_guest_event("summary", "reader", config.timeout_seconds)
 
         for console in consoles.values():
             console.owned.terminate_owned("runner_after_guest_summary")
