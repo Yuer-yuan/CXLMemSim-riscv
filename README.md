@@ -56,12 +56,19 @@ sudo apt install \
   zlib1g-dev libzstd-dev flex bison libssl-dev bc swig cpio
 ```
 
-The pinned QEMU requires Meson 1.5 or newer. When the distribution package is
-older, the top-level CXLMemSim-riscv checkout supplies a uv environment at
-`.cxl-bi-tools/uv`; `run-legofs-type3.sh` discovers it automatically. Generic
-libraries and cross tools still come from the distribution rather than a
-repository-local sysroot. `scripts/check-deps.sh` only reports missing commands;
-it never invokes `sudo` or a package manager.
+The pinned QEMU requires Meson 1.5 or newer to be available through the normal
+process `PATH`. Generic libraries and cross tools likewise come from the host
+environment rather than a repository-local tool root. `scripts/check-deps.sh`
+only reports missing commands; it never invokes `sudo` or a package manager.
+
+The LegoFS Type-3 and IO500 entry points resolve every declared build tool to
+an absolute executable before doing any work, then freeze the child `PATH` to
+the resolved tool directories. By default they search the current account's
+`.cargo/bin`, `.local/bin`, and the caller's absolute `PATH` entries. For a
+migrated or non-standard host, set `LEGOFS_TOOLCHAIN_PATH` to an explicit
+colon-separated list of absolute tool directories; relative and empty entries
+are rejected. Each invocation prints the resulting tool-to-path mapping so the
+build environment can be reproduced from its log.
 
 The Type-3 build explicitly enables libpmem and libslirp. They are runtime
 requirements for `pmem=on` file-backed memory and the guest TCP forwarding

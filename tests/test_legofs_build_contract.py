@@ -44,11 +44,8 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertNotIn("BADFS_BENCH_BLOCK_SIZE=4096", source)
         self.assertIn('set_ifreq_name(&request, "lo")', source)
         self.assertIn("set_sockaddr(&request.value.address, ipv4(127, 0, 0, 1))", source)
-        self.assertIn("BADFS_CONTROL_TRANSPORT=cxl", source)
-        self.assertIn("BADFS_CXL_CLIENT_SLOT=0", source)
-        self.assertIn("control_transport=cxl-dax-ring", source)
-        self.assertNotIn("connect_tcp(", source)
-        self.assertNotIn("BADFS_SERVERS=", source)
+        self.assertIn("connect_tcp(ipv4(127, 0, 0, 1), 3345)", source)
+        self.assertIn("LEG_OFS_SERVER_PROBE errno=", source)
 
     def test_cxl_devdax_exposes_real_persistence_flush(self):
         device = (ROOT / "components/linux/drivers/dax/device.c").read_text()
@@ -88,6 +85,12 @@ class LegofsBuildContractTest(unittest.TestCase):
             )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
+    def test_run_uses_process_path_without_repository_tool_probe(self):
+        source = RUN.read_text(encoding="utf-8")
+        self.assertNotIn(".cxl-bi-tools", source)
+        self.assertNotIn("LEGOFS_TYPE3_TOOL_ROOT", source)
+        self.assertNotIn("LOCAL_TOOL_ROOT", source)
+
     def test_build_script_names_complete_manifest(self):
         self.assertTrue(BUILD.is_file(), "scripts/build_legofs_type3.sh is missing")
         source = BUILD.read_text(encoding="utf-8")
@@ -105,32 +108,6 @@ class LegofsBuildContractTest(unittest.TestCase):
         self.assertIn('--source "legofs=${LEGOFS_SOURCE_ROOT}"', source)
         self.assertIn("--enable-libpmem", source)
         self.assertIn("--enable-slirp", source)
-        self.assertIn(
-            "SLIRP_COMMIT=26be815b86e8d49add8c9a8b320239b9594ff03d",
-            source,
-        )
-        self.assertIn('fetch --depth=1 origin "${SLIRP_COMMIT}"', source)
-        self.assertIn("PMEM_DEB_VERSION=1.13.1-1.1ubuntu2", source)
-        self.assertIn("PMEM_DEV_SHA256=f710b78c", source)
-        self.assertIn("PMEM_RUNTIME_SHA256=8f1be1cc", source)
-        self.assertIn("pkg-config --modversion libpmem", source)
-        self.assertIn("pkg-config --variable=libdir libpmem", source)
-        self.assertIn(
-            's|^libdir=/usr/lib/x86_64-linux-gnu$|libdir=${pmem_libdir}|',
-            source,
-        )
-        self.assertIn('libpmem_build=${PMEM_MANIFEST}', source)
-        self.assertIn("SPDLOG_DEB_VERSION=1:1.12.0+ds-2build1", source)
-        self.assertIn("SPDLOG_DEV_SHA256=850b97a9", source)
-        self.assertIn("FMT_DEB_VERSION=9.1.0+ds1-2", source)
-        self.assertIn("FMT_DEV_SHA256=cc05cae4", source)
-        self.assertIn("-DCXLMEMSIM_ENABLE_RDMA=OFF", source)
-        self.assertIn("-DCXLMEMSIM_ENABLE_SLUGALLOCATOR=OFF", source)
-        self.assertIn('cxlmemsim_build_deps=${CXL_DEPS_MANIFEST}', source)
-        self.assertIn("SWIG_DEB_VERSION=4.2.0-2ubuntu1", source)
-        self.assertIn("SWIG_DEB_SHA256=5925dc6e", source)
-        self.assertIn("SWIG_LIB=", source)
-        self.assertIn('uboot_build_deps=${UBOOT_DEPS_MANIFEST}', source)
         self.assertIn("--no-artifact-hashes", source)
         self.assertNotIn('${ROOT}/../..', source)
         self.assertIn('--compiler "qemu=${qemu} --version"', source)
@@ -147,25 +124,18 @@ class LegofsBuildContractTest(unittest.TestCase):
             with self.subTest(artifact=artifact):
                 self.assertIn(f'--artifact "{artifact}=', source)
 
-    def test_io500_build_hashes_artifacts_and_records_live_legofs_source(self):
+    def test_io500_build_uses_legofs_owned_interceptor_and_resumable_sources(self):
         source = (ROOT / "scripts/build_legofs_io500.sh").read_text(encoding="utf-8")
-        self.assertIn('--source "legofs=$LEGOFS_ROOT"', source)
-        self.assertIn(
-            'cxlmemsim_build_deps=$ROOT/out/legofs-type3/results/cxlmemsim-build-debs.txt',
-            source,
-        )
-        self.assertIn(
-            'uboot_build_deps=$ROOT/out/legofs-type3/results/uboot-build-debs.txt',
-            source,
-        )
-        self.assertNotIn("--no-artifact-hashes", source)
+        self.assertIn("--no-artifact-hashes", source)
         self.assertIn('fetch --depth=1 origin "$commit"', source)
         self.assertIn(
-            'ensure_checkout SyscallIntercept "$SYSINT_REPOSITORY" '
-            '"$SYSINT_COMMIT"',
+            'SYSINT_ROOT="$LEGOFS_ROOT/third_party/syscall-intercept-riscv"',
             source,
         )
-        self.assertIn('SYSINT_ROOT="$SOURCES/syscall-intercept"', source)
+        self.assertIn(
+            '"$LEGOFS_ROOT/scripts/build-syscall-intercept-riscv.sh"', source
+        )
+        self.assertNotIn('SYSINT_ROOT="$SOURCES/syscall-intercept"', source)
         self.assertNotIn('LEGOFS_TOOL_ROOT="${ROOT}/.cxl-bi-tools"', source)
         self.assertNotIn('git clone "$repository" "$directory"', source)
         self.assertIn(

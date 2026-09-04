@@ -13,8 +13,6 @@ CARGO_TARGET="${BUILD}/cargo"
 LEGOFS_BIN="${BUILD}/legofs-bin"
 CROSS_COMPILE="${CROSS_COMPILE:-riscv64-linux-gnu-}"
 RUST_TARGET="riscv64gc-unknown-linux-musl"
-SLIRP_REPOSITORY=https://gitlab.freedesktop.org/slirp/libslirp.git
-SLIRP_COMMIT=26be815b86e8d49add8c9a8b320239b9594ff03d
 MUSL_VERSION=1.2.5
 MUSL_SHA256=a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
 MUSL_SOURCE_ROOT="${OUT}/toolchain-src"
@@ -23,33 +21,20 @@ MUSL_TARBALL="${MUSL_SOURCE_ROOT}/musl-${MUSL_VERSION}.tar.gz"
 MUSL_BUILD="${BUILD}/musl-rv64gc"
 MUSL_PREFIX="${OUT}/toolchain/musl-rv64gc"
 MUSL_CC="${MUSL_PREFIX}/bin/musl-gcc"
-PMEM_DEB_VERSION=1.13.1-1.1ubuntu2
-PMEM_DEV_SHA256=f710b78cc1ca3650e312d92c1a32f77597e727a4d042061485f8e6485aed4195
-PMEM_RUNTIME_SHA256=8f1be1cc834a98f0cf5c0950153f7f939a0c2c92095e98cd7bb40c752c545c1b
-PMEM_DEB_CACHE="${ROOT}/target/download-cache/pmdk"
-PMEM_SYSROOT="${OUT}/toolchain/libpmem-amd64"
-PMEM_DEV_DEB="${PMEM_DEB_CACHE}/libpmem-dev_${PMEM_DEB_VERSION}_amd64.deb"
-PMEM_RUNTIME_DEB="${PMEM_DEB_CACHE}/libpmem1_${PMEM_DEB_VERSION}_amd64.deb"
-PMEM_MANIFEST="${RESULTS}/libpmem-debs.txt"
-SPDLOG_DEB_VERSION=1:1.12.0+ds-2build1
-SPDLOG_DEV_SHA256=850b97a93e252c1d2f9d8e9f59cac919015efb56241138098637f84a188ae3a0
-SPDLOG_RUNTIME_SHA256=e69e315e1596b6cf97a714ae797e55d42765664a739a0b30beac35164a4edaff
-FMT_DEB_VERSION=9.1.0+ds1-2
-FMT_DEV_SHA256=cc05cae4b7c6e541b6871e3333329605c0d90312a852f2c3b507ad5c30dd9914
-FMT_RUNTIME_SHA256=0a9dd337aea7ae59aba44994a92dd2780365b534a714518477c4e906f0efd297
-CXL_DEB_CACHE="${ROOT}/target/download-cache/cxlmemsim"
-CXL_DEPS_SYSROOT="${OUT}/toolchain/cxlmemsim-amd64"
-SPDLOG_DEV_DEB="${CXL_DEB_CACHE}/libspdlog-dev_1%3a1.12.0+ds-2build1_amd64.deb"
-SPDLOG_RUNTIME_DEB="${CXL_DEB_CACHE}/libspdlog1.12_1%3a1.12.0+ds-2build1_amd64.deb"
-FMT_DEV_DEB="${CXL_DEB_CACHE}/libfmt-dev_${FMT_DEB_VERSION}_amd64.deb"
-FMT_RUNTIME_DEB="${CXL_DEB_CACHE}/libfmt9_${FMT_DEB_VERSION}_amd64.deb"
-CXL_DEPS_MANIFEST="${RESULTS}/cxlmemsim-build-debs.txt"
-SWIG_DEB_VERSION=4.2.0-2ubuntu1
-SWIG_DEB_SHA256=5925dc6e25348bdb350c44a9157da350ef608666b2a21f7057222e8b6aebd61d
-UBOOT_DEB_CACHE="${ROOT}/target/download-cache/uboot"
-SWIG_SYSROOT="${OUT}/toolchain/swig-amd64"
-SWIG_DEB="${UBOOT_DEB_CACHE}/swig_${SWIG_DEB_VERSION}_amd64.deb"
-UBOOT_DEPS_MANIFEST="${RESULTS}/uboot-build-debs.txt"
+source "$ROOT/scripts/legofs_toolchain_path.sh"
+legofs_toolchain_activate type3-build \
+	bash sh git cargo rustc rustup getconf \
+	"${CROSS_COMPILE}gcc" "${CROSS_COMPILE}g++" \
+	"${CROSS_COMPILE}as" "${CROSS_COMPILE}ar" \
+	"${CROSS_COMPILE}ld" "${CROSS_COMPILE}nm" \
+	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
+	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
+	"${CROSS_COMPILE}strip" \
+	cc gcc g++ ar ld nm objcopy ranlib readelf strip \
+	cmake ninja meson make pkg-config \
+	mke2fs debugfs truncate python3 wget sha256sum tar install stat cmp file \
+	tee awk sed grep sort find xargs dtc flex bison bc cpio swig perl openssl \
+	patch gzip mkdir chmod mv
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 die()
@@ -80,11 +65,6 @@ legofs_git_root="$(git -C "${LEGOFS_SOURCE_ROOT}" rev-parse --show-toplevel 2>/d
 [[ "$(cd -- "${legofs_git_root}" && pwd -P)" == "${LEGOFS_SOURCE_ROOT}" ]] ||
 	die "LegoFS component path is not its Git worktree root: ${LEGOFS_SOURCE_ROOT}"
 
-for command in cargo rustc git "${CROSS_COMPILE}gcc" \
-	"${CROSS_COMPILE}readelf" "${CROSS_COMPILE}strip" cmake ninja make mke2fs \
-	apt-get debugfs dpkg-deb pkg-config truncate python3 wget sha256sum tar install stat cmp; do
-	command -v "${command}" >/dev/null || die "required command is missing: ${command}"
-done
 rust_sysroot="$(rustc --print sysroot)"
 rust_std=("${rust_sysroot}/lib/rustlib/${RUST_TARGET}/lib"/libstd-*.rlib)
 [[ -f "${rust_std[0]}" ]] ||
@@ -184,59 +164,6 @@ cmp "${badfs_server}" "${verify_server}" || die 'badfs-server ext2 payload is in
 cmp "${badfs_bench}" "${verify_bench}" || die 'badfs-bench ext2 payload is incomplete'
 
 printf '%s\n' '[legofs-build] QEMU riscv64-softmmu with Type-3 MESI v2 BI'
-mkdir -p "${PMEM_DEB_CACHE}" "${PMEM_SYSROOT}"
-if [[ ! -f "${PMEM_DEV_DEB}" ]]; then
-	(cd "${PMEM_DEB_CACHE}" && apt-get download "libpmem-dev=${PMEM_DEB_VERSION}")
-fi
-if [[ ! -f "${PMEM_RUNTIME_DEB}" ]]; then
-	(cd "${PMEM_DEB_CACHE}" && apt-get download "libpmem1=${PMEM_DEB_VERSION}")
-fi
-printf '%s  %s\n' "${PMEM_DEV_SHA256}" "${PMEM_DEV_DEB}" | sha256sum -c -
-printf '%s  %s\n' "${PMEM_RUNTIME_SHA256}" "${PMEM_RUNTIME_DEB}" | sha256sum -c -
-pmem_stamp="version=${PMEM_DEB_VERSION} dev=${PMEM_DEV_SHA256} runtime=${PMEM_RUNTIME_SHA256}"
-if [[ ! -f "${PMEM_SYSROOT}/.complete" ]] ||
-	[[ "$(<"${PMEM_SYSROOT}/.complete")" != "${pmem_stamp}" ]]; then
-	dpkg-deb -x "${PMEM_RUNTIME_DEB}" "${PMEM_SYSROOT}"
-	dpkg-deb -x "${PMEM_DEV_DEB}" "${PMEM_SYSROOT}"
-	printf '%s\n' "${pmem_stamp}" > "${PMEM_SYSROOT}/.complete"
-fi
-mkdir -p "${PMEM_SYSROOT}/pkgconfig"
-pmem_libdir="${PMEM_SYSROOT}/usr/lib/x86_64-linux-gnu"
-sed \
-	-e "s|^prefix=/usr$|prefix=${PMEM_SYSROOT}/usr|" \
-	-e "s|^libdir=/usr/lib/x86_64-linux-gnu$|libdir=${pmem_libdir}|" \
-	"${PMEM_SYSROOT}/usr/lib/x86_64-linux-gnu/pkgconfig/libpmem.pc" \
-	> "${PMEM_SYSROOT}/pkgconfig/libpmem.pc.tmp"
-mv "${PMEM_SYSROOT}/pkgconfig/libpmem.pc.tmp" \
-	"${PMEM_SYSROOT}/pkgconfig/libpmem.pc"
-export PKG_CONFIG_PATH="${PMEM_SYSROOT}/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
-export LD_LIBRARY_PATH="${pmem_libdir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-[[ "$(pkg-config --modversion libpmem)" == 1.13.1 ]] ||
-	die 'pinned libpmem pkg-config identity mismatch'
-[[ "$(pkg-config --variable=libdir libpmem)" == "${pmem_libdir}" ]] ||
-	die 'pinned libpmem pkg-config library path escaped its sysroot'
-[[ -e "${pmem_libdir}/libpmem.so" ]] ||
-	die 'pinned libpmem linker input is missing'
-printf '%s\n' \
-	"version=${PMEM_DEB_VERSION}" \
-	"libpmem_dev_sha256=${PMEM_DEV_SHA256}" \
-	"libpmem_runtime_sha256=${PMEM_RUNTIME_SHA256}" \
-	> "${PMEM_MANIFEST}"
-slirp_source="${ROOT}/components/qemu/subprojects/slirp"
-if [[ ! -d "${slirp_source}/.git" ]]; then
-	[[ ! -e "${slirp_source}" ]] ||
-		die "QEMU slirp source exists but is not a Git checkout: ${slirp_source}"
-	git init "${slirp_source}"
-	git -C "${slirp_source}" remote add origin "${SLIRP_REPOSITORY}"
-fi
-[[ "$(git -C "${slirp_source}" remote get-url origin)" == "${SLIRP_REPOSITORY}" ]] ||
-	die 'QEMU slirp repository mismatch'
-if ! git -C "${slirp_source}" cat-file -e "${SLIRP_COMMIT}^{commit}" 2>/dev/null; then
-	git -C "${slirp_source}" fetch --depth=1 origin "${SLIRP_COMMIT}"
-fi
-git -C "${slirp_source}" checkout --detach "${SLIRP_COMMIT}"
-[[ "$(git -C "${slirp_source}" rev-parse HEAD)" == "${SLIRP_COMMIT}" ]] ||
-	die 'QEMU slirp commit mismatch'
 qemu_configure_args=(
 	--target-list=riscv64-softmmu
 	--disable-docs
@@ -252,54 +179,10 @@ qemu_configure_args=(
 )
 ninja -C "${BUILD}/qemu" -j "${JOBS}" qemu-system-riscv64
 
-printf '%s\n' '[legofs-build] pinned CXLMemSim build dependencies'
-mkdir -p "${CXL_DEB_CACHE}" "${CXL_DEPS_SYSROOT}"
-if [[ ! -f "${SPDLOG_DEV_DEB}" ]]; then
-	(cd "${CXL_DEB_CACHE}" && apt-get download "libspdlog-dev=${SPDLOG_DEB_VERSION}")
-fi
-if [[ ! -f "${SPDLOG_RUNTIME_DEB}" ]]; then
-	(cd "${CXL_DEB_CACHE}" && apt-get download "libspdlog1.12=${SPDLOG_DEB_VERSION}")
-fi
-if [[ ! -f "${FMT_DEV_DEB}" ]]; then
-	(cd "${CXL_DEB_CACHE}" && apt-get download "libfmt-dev=${FMT_DEB_VERSION}")
-fi
-if [[ ! -f "${FMT_RUNTIME_DEB}" ]]; then
-	(cd "${CXL_DEB_CACHE}" && apt-get download "libfmt9=${FMT_DEB_VERSION}")
-fi
-printf '%s  %s\n' "${SPDLOG_DEV_SHA256}" "${SPDLOG_DEV_DEB}" | sha256sum -c -
-printf '%s  %s\n' "${SPDLOG_RUNTIME_SHA256}" "${SPDLOG_RUNTIME_DEB}" | sha256sum -c -
-printf '%s  %s\n' "${FMT_DEV_SHA256}" "${FMT_DEV_DEB}" | sha256sum -c -
-printf '%s  %s\n' "${FMT_RUNTIME_SHA256}" "${FMT_RUNTIME_DEB}" | sha256sum -c -
-cxl_deps_stamp="spdlog=${SPDLOG_DEB_VERSION} fmt=${FMT_DEB_VERSION} spdlog_dev=${SPDLOG_DEV_SHA256} spdlog_runtime=${SPDLOG_RUNTIME_SHA256} fmt_dev=${FMT_DEV_SHA256} fmt_runtime=${FMT_RUNTIME_SHA256}"
-if [[ ! -f "${CXL_DEPS_SYSROOT}/.complete" ]] ||
-	[[ "$(<"${CXL_DEPS_SYSROOT}/.complete")" != "${cxl_deps_stamp}" ]]; then
-	dpkg-deb -x "${SPDLOG_RUNTIME_DEB}" "${CXL_DEPS_SYSROOT}"
-	dpkg-deb -x "${SPDLOG_DEV_DEB}" "${CXL_DEPS_SYSROOT}"
-	dpkg-deb -x "${FMT_RUNTIME_DEB}" "${CXL_DEPS_SYSROOT}"
-	dpkg-deb -x "${FMT_DEV_DEB}" "${CXL_DEPS_SYSROOT}"
-	printf '%s\n' "${cxl_deps_stamp}" > "${CXL_DEPS_SYSROOT}/.complete"
-fi
-[[ -f "${CXL_DEPS_SYSROOT}/usr/lib/x86_64-linux-gnu/cmake/spdlog/spdlogConfig.cmake" ]] ||
-	die 'pinned spdlog CMake package is missing'
-[[ -f "${CXL_DEPS_SYSROOT}/usr/lib/x86_64-linux-gnu/cmake/fmt/fmt-config.cmake" ]] ||
-	die 'pinned fmt CMake package is missing'
-printf '%s\n' \
-	"spdlog_version=${SPDLOG_DEB_VERSION}" \
-	"spdlog_dev_sha256=${SPDLOG_DEV_SHA256}" \
-	"spdlog_runtime_sha256=${SPDLOG_RUNTIME_SHA256}" \
-	"fmt_version=${FMT_DEB_VERSION}" \
-	"fmt_dev_sha256=${FMT_DEV_SHA256}" \
-	"fmt_runtime_sha256=${FMT_RUNTIME_SHA256}" \
-	> "${CXL_DEPS_MANIFEST}"
-
 printf '%s\n' '[legofs-build] CXLMemSim MESI-v2 server'
 cmake --fresh -U RDMACM_LIB -U IBVERBS_LIB \
 	-S "${ROOT}/components/cxlmemsim" -B "${BUILD}/cxlmemsim" \
-	-DCMAKE_BUILD_TYPE=Release \
-	-DCMAKE_PREFIX_PATH="${CXL_DEPS_SYSROOT}/usr" \
-	-DCXLMEMSIM_BUILD_MICROBENCHMARKS=OFF \
-	-DCXLMEMSIM_ENABLE_RDMA=OFF \
-	-DCXLMEMSIM_ENABLE_SLUGALLOCATOR=OFF
+	-DCMAKE_BUILD_TYPE=Release
 cmake --build "${BUILD}/cxlmemsim" --target cxlmemsim_server \
 	--parallel "${JOBS}"
 
@@ -307,27 +190,6 @@ printf '%s\n' '[legofs-build] OpenSBI and CXL U-Boot'
 make -C "${ROOT}/components/opensbi" O="${BUILD}/opensbi" \
 	CROSS_COMPILE="${CROSS_COMPILE}" PLATFORM=generic \
 	'platform-cflags-y=-std=gnu11' -j "${JOBS}"
-mkdir -p "${UBOOT_DEB_CACHE}" "${SWIG_SYSROOT}"
-if [[ ! -f "${SWIG_DEB}" ]]; then
-	(cd "${UBOOT_DEB_CACHE}" && apt-get download "swig=${SWIG_DEB_VERSION}")
-fi
-printf '%s  %s\n' "${SWIG_DEB_SHA256}" "${SWIG_DEB}" | sha256sum -c -
-swig_stamp="version=${SWIG_DEB_VERSION} sha256=${SWIG_DEB_SHA256}"
-if [[ ! -f "${SWIG_SYSROOT}/.complete" ]] ||
-	[[ "$(<"${SWIG_SYSROOT}/.complete")" != "${swig_stamp}" ]]; then
-	dpkg-deb -x "${SWIG_DEB}" "${SWIG_SYSROOT}"
-	printf '%s\n' "${swig_stamp}" > "${SWIG_SYSROOT}/.complete"
-fi
-mkdir -p "${SWIG_SYSROOT}/bin"
-ln -sfn "${SWIG_SYSROOT}/usr/bin/swig4.0" "${SWIG_SYSROOT}/bin/swig"
-export PATH="${SWIG_SYSROOT}/bin:${PATH}"
-export SWIG_LIB="${SWIG_SYSROOT}/usr/share/swig4.0"
-swig -version | grep -Fq 'SWIG Version 4.2.0' ||
-	die 'pinned SWIG identity mismatch'
-printf '%s\n' \
-	"swig_version=${SWIG_DEB_VERSION}" \
-	"swig_sha256=${SWIG_DEB_SHA256}" \
-	> "${UBOOT_DEPS_MANIFEST}"
 make -C "${ROOT}/components/u-boot" O="${BUILD}/u-boot" \
 	CROSS_COMPILE="${CROSS_COMPILE}" sifive_unleashed_qemu_cxl_defconfig
 python3 "${ROOT}/scripts/prepare_uboot_pylibfdt.py" \
@@ -397,9 +259,6 @@ python3 "${ROOT}/scripts/write_manifest.py" \
 	--artifact "legofs_disk=${legofs_disk}" \
 	--artifact "badfs_server=${badfs_server}" \
 	--artifact "badfs_bench=${badfs_bench}" \
-	--artifact "cxlmemsim_server=${cxlmemsim_server}" \
-	--artifact "libpmem_build=${PMEM_MANIFEST}" \
-	--artifact "cxlmemsim_build_deps=${CXL_DEPS_MANIFEST}" \
-	--artifact "uboot_build_deps=${UBOOT_DEPS_MANIFEST}"
+	--artifact "cxlmemsim_server=${cxlmemsim_server}"
 
 printf '%s\n' "[legofs-build] manifest ${RESULTS}/build-manifest.json"

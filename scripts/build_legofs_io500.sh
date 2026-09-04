@@ -10,7 +10,6 @@ PAYLOAD_ROOT="${TARGET_ROOT}/payload-root"
 INITRAMFS="${TARGET_ROOT}/initramfs"
 IMAGES="${TARGET_ROOT}/images"
 RESULTS="${ROOT}/target/results/legofs-io500"
-RDWO_RESULTS="${RESULTS}/rdwo-v1.1"
 CARGO_TARGET="${TARGET_ROOT}/cargo-rv64imafdc-compiler-rt"
 MPICH_BUILD="${TARGET_ROOT}/mpich-rv64imafdc-compiler-rt-build"
 MPICH_PREFIX="${TARGET_ROOT}/mpich-rv64imafdc-compiler-rt-install"
@@ -23,12 +22,9 @@ LLVM_MC="${LLVM_MC:-llvm-mc}"
 LLVM_RANLIB="${LLVM_RANLIB:-llvm-ranlib}"
 RUST_MUSL_TARGET=riscv64gc-unknown-linux-musl
 MUSL_VERSION=1.2.5
-MUSL_TARBALL_SHA256=a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
-MUSL_HOTPATCH_PADDING_PATCH="${ROOT}/scripts/patches/musl/0001-riscv64-syscall-hotpatch-padding.patch"
 LLVM_REPOSITORY=https://github.com/llvm/llvm-project.git
 LLVM_TAG=llvmorg-20.1.8
 LLVM_COMMIT=87f0227cb60147a26a1eeb4fb06e3b505e9c7261
-JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 MPICH_REPOSITORY=https://github.com/pmodels/mpich.git
 MPICH_COMMIT=15f59ab2b740539472dfd130f7fe01b61c28bba4
@@ -44,6 +40,24 @@ SYSINT_REPOSITORY=https://github.com/alpha-unito/syscall_intercept.git
 SYSINT_COMMIT=7dbdf6ab9c576f96843ef2553b7efc7d15cf66b4
 CAPSTONE_REPOSITORY=https://github.com/capstone-engine/capstone.git
 CAPSTONE_COMMIT=accf4df62f1fba6f92cae692985d27063552601c
+
+source "$ROOT/scripts/legofs_toolchain_path.sh"
+legofs_toolchain_activate io500-build \
+	bash sh git cargo rustc rustup getconf \
+	"${CROSS_COMPILE}gcc" "${CROSS_COMPILE}g++" \
+	"${CROSS_COMPILE}as" "${CROSS_COMPILE}ar" \
+	"${CROSS_COMPILE}ld" "${CROSS_COMPILE}nm" \
+	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
+	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
+	"${CROSS_COMPILE}strip" \
+	"$CLANG" "$LLVM_AR" "$LLVM_MC" "$LLVM_RANLIB" \
+	cc gcc g++ ar ld nm objcopy ranlib readelf strip \
+	cmake ctest ninja meson make pkg-config \
+	mke2fs debugfs truncate file install rsync python3 \
+	wget sha256sum tar mktemp cmp tee awk sed grep sort find xargs \
+	dtc flex bison bc cpio swig perl openssl patch gzip \
+	mkdir chmod cp mv rm ln touch head tr
+JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 
 die()
 {
@@ -63,17 +77,6 @@ while (($#)); do
 done
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "jobs must be a positive integer"
 
-for command in git make cmake ninja cargo rustc mke2fs debugfs truncate tar \
-	sha256sum \
-	file install rsync "${CROSS_COMPILE}gcc" \
-	"${CROSS_COMPILE}ar" "${CROSS_COMPILE}ld" \
-	"${CROSS_COMPILE}nm" "${CROSS_COMPILE}strings" \
-	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
-	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
-	"${CROSS_COMPILE}strip" "$CLANG" "$LLVM_AR" "$LLVM_MC" \
-	"$LLVM_RANLIB"; do
-	command -v "$command" >/dev/null || die "required command is missing: $command"
-done
 rust_sysroot="$(rustc --print sysroot)"
 rust_std=("$rust_sysroot/lib/rustlib/$RUST_MUSL_TARGET/lib"/libstd-*.rlib)
 [ -f "${rust_std[0]}" ] ||
@@ -81,7 +84,7 @@ rust_std=("$rust_sysroot/lib/rustlib/$RUST_MUSL_TARGET/lib"/libstd-*.rlib)
 [ -x "$NOV_GCC" ] || die "missing no-RVV compiler wrapper: $NOV_GCC"
 
 mkdir -p "$TARGET_ROOT" "$SOURCES" "$PLATFORM" "$PAYLOAD_ROOT" \
-	"$INITRAMFS" "$IMAGES" "$RESULTS" "$RDWO_RESULTS" "$CARGO_TARGET"
+	"$INITRAMFS" "$IMAGES" "$RESULTS" "$CARGO_TARGET"
 
 ensure_checkout()
 {
@@ -112,8 +115,6 @@ ensure_checkout IO500 "$IO500_REPOSITORY" "$IO500_COMMIT" "$SOURCES/io500"
 ensure_checkout IOR "$IOR_REPOSITORY" "$IOR_COMMIT" "$SOURCES/io500/build/ior"
 ensure_checkout pfind "$PFIND_REPOSITORY" "$PFIND_COMMIT" "$SOURCES/io500/build/pfind"
 ensure_checkout BusyBox "$BUSYBOX_REPOSITORY" "$BUSYBOX_COMMIT" "$SOURCES/busybox"
-ensure_checkout SyscallIntercept "$SYSINT_REPOSITORY" "$SYSINT_COMMIT" \
-	"$SOURCES/syscall-intercept"
 LLVM_SOURCE="$SOURCES/llvm-project"
 if [ ! -d "$LLVM_SOURCE/.git" ]; then
 	[ ! -e "$LLVM_SOURCE" ] || die "LLVM source exists but is not a Git checkout: $LLVM_SOURCE"
@@ -122,6 +123,8 @@ if [ ! -d "$LLVM_SOURCE/.git" ]; then
 fi
 [ "$(git -C "$LLVM_SOURCE" remote get-url origin)" = "$LLVM_REPOSITORY" ] ||
 	die 'LLVM repository mismatch'
+[ -n "$(git -C "$LLVM_SOURCE" rev-parse --git-dir 2>/dev/null)" ] ||
+	die 'LLVM source is not a Git checkout'
 if ! git -C "$LLVM_SOURCE" cat-file -e "${LLVM_COMMIT}^{commit}" 2>/dev/null; then
 	git -C "$LLVM_SOURCE" fetch --depth=1 --filter=blob:none origin "$LLVM_COMMIT"
 fi
@@ -179,7 +182,7 @@ require_sifive_u_isa()
 			print output
 		}' |
 		"$LLVM_MC" --triple=riscv64 \
-			--mattr=+m,+a,+f,+d,+c,+zicsr,+zifencei \
+			--mattr=+m,+a,+f,+d,+c,+zicsr,+zifencei,+zicbom \
 			--disassemble 2>&1 >/dev/null)
 	invalid_count=$(printf '%s\n' "$decoder_diagnostics" |
 		grep -c 'invalid instruction encoding' || true)
@@ -187,7 +190,7 @@ require_sifive_u_isa()
 		"$binary" "$invalid_count" "$vector_count" "$attribute" >> "$ISA_REPORT"
 	if [ -n "$decoder_diagnostics" ]; then
 		printf '%s\n' "$decoder_diagnostics" | sed -n '1,40p' >> "$ISA_REPORT"
-		die "SiFive U payload contains instructions outside rv64imafdc: $binary"
+		die "SiFive U payload contains instructions outside rv64imafdc+zicbom: $binary"
 	fi
 }
 
@@ -232,33 +235,6 @@ require_syscall_intercept_abi()
 	done
 }
 
-require_musl_hotpatch_padding()
-{
-	binary="$1"
-	report="$2"
-	if ! "${CROSS_COMPILE}objdump" -d "$binary" |
-		awk '
-			$1 ~ /^[0-9a-f]+:$/ && $2 ~ /^[0-9a-f]+$/ {
-				if ($3 == "ecall") {
-					total++
-					if (previous_encoding != "00000013") {
-						bad++
-						printf "bad_ecall=%s previous_encoding=%s\n", \
-							$1, previous_encoding
-					}
-				}
-				previous_encoding = $2
-			}
-			END {
-				printf "ecall_count=%d bad_ecall_count=%d required_previous_encoding=00000013\n", \
-					total + 0, bad + 0
-				exit total == 0 || bad != 0
-			}' > "$report"; then
-		cat "$report" >&2
-		die "musl libc lacks a four-byte nop immediately before every ecall: $binary"
-	fi
-}
-
 reject_glibc_versions()
 {
 	binary="$1"
@@ -289,42 +265,17 @@ require_unwind_provider()
 }
 
 printf '%s\n' '[io500-build] bootstrap musl headers for compiler-rt'
-MUSL_UPSTREAM_SOURCE="${ROOT}/out/legofs-type3/toolchain-src/musl-${MUSL_VERSION}"
+MUSL_SOURCE="${ROOT}/out/legofs-type3/toolchain-src/musl-${MUSL_VERSION}"
 MUSL_TARBALL="${ROOT}/out/legofs-type3/toolchain-src/musl-${MUSL_VERSION}.tar.gz"
-MUSL_SOURCE="${TARGET_ROOT}/musl-${MUSL_VERSION}-io500-source"
-MUSL_SOURCE_STAMP="${MUSL_SOURCE}/.legofs-io500-source"
 MUSL_BOOTSTRAP_BUILD="${TARGET_ROOT}/musl-rv64imafdc-bootstrap-build"
 MUSL_BOOTSTRAP_PREFIX="${TARGET_ROOT}/musl-rv64imafdc-bootstrap"
-[ -x "$MUSL_UPSTREAM_SOURCE/configure" ] || die "baseline build did not prepare musl source"
+[ -x "$MUSL_SOURCE/configure" ] || die "baseline build did not prepare musl source"
 [ -s "$MUSL_TARBALL" ] || die "baseline build did not prepare musl tarball"
-[ -s "$MUSL_HOTPATCH_PADDING_PATCH" ] ||
-	die "missing musl syscall hotpatch-padding patch: $MUSL_HOTPATCH_PADDING_PATCH"
-actual_musl_tarball_sha256=$(sha256sum "$MUSL_TARBALL" | awk '{print $1}')
-[ "$actual_musl_tarball_sha256" = "$MUSL_TARBALL_SHA256" ] ||
-	die "musl tarball hash mismatch: $actual_musl_tarball_sha256"
-MUSL_HOTPATCH_PADDING_SHA256=$(sha256sum "$MUSL_HOTPATCH_PADDING_PATCH" |
-	awk '{print $1}')
-MUSL_SOURCE_ID="musl-${MUSL_VERSION} tar_sha256=${MUSL_TARBALL_SHA256} hotpatch_padding_sha256=${MUSL_HOTPATCH_PADDING_SHA256}"
-if [ ! -f "$MUSL_SOURCE_STAMP" ] ||
-	[ "$(cat "$MUSL_SOURCE_STAMP" 2>/dev/null || true)" != "$MUSL_SOURCE_ID" ]; then
-	rm -rf -- "$MUSL_SOURCE"
-	mkdir -p "$MUSL_SOURCE"
-	tar -xf "$MUSL_TARBALL" -C "$MUSL_SOURCE" --strip-components=1
-	(
-		cd "$MUSL_SOURCE"
-		GIT_DIR=/dev/null git apply "$MUSL_HOTPATCH_PADDING_PATCH"
-	)
-	printf '%s\n' "$MUSL_SOURCE_ID" > "$MUSL_SOURCE_STAMP"
-fi
-[ -x "$MUSL_SOURCE/configure" ] || die "patched musl source is incomplete"
-MUSL_BOOTSTRAP_STAMP="$MUSL_BOOTSTRAP_PREFIX/.legofs-musl-source"
 if [ ! -x "$MUSL_BOOTSTRAP_PREFIX/bin/musl-gcc" ] ||
-	! cmp -s "$MUSL_SOURCE_STAMP" "$MUSL_BOOTSTRAP_STAMP" ||
 	! grep -Fqx "prefix = $MUSL_BOOTSTRAP_PREFIX" \
 		"$MUSL_BOOTSTRAP_BUILD/config.mak" 2>/dev/null ||
 	! grep -Fq -- "-specs \"$MUSL_BOOTSTRAP_PREFIX/lib/musl-gcc.specs\"" \
 		"$MUSL_BOOTSTRAP_PREFIX/bin/musl-gcc" 2>/dev/null; then
-	rm -rf -- "$MUSL_BOOTSTRAP_BUILD" "$MUSL_BOOTSTRAP_PREFIX"
 	mkdir -p "$MUSL_BOOTSTRAP_BUILD" "$MUSL_BOOTSTRAP_PREFIX"
 	(
 		cd "$MUSL_BOOTSTRAP_BUILD"
@@ -334,7 +285,6 @@ if [ ! -x "$MUSL_BOOTSTRAP_PREFIX/bin/musl-gcc" ] ||
 		make -j "$JOBS"
 		make install
 	)
-	cp "$MUSL_SOURCE_STAMP" "$MUSL_BOOTSTRAP_STAMP"
 fi
 
 # compiler-rt's clear-cache implementation includes Linux UAPI headers even
@@ -379,14 +329,11 @@ require_sifive_u_isa "$BUILTINS_ARCHIVE"
 printf '%s\n' '[io500-build] final musl runtime with compiler-rt'
 MUSL_BUILD="${TARGET_ROOT}/musl-rv64imafdc-compiler-rt-build"
 MUSL_PREFIX="${TARGET_ROOT}/musl-rv64imafdc-compiler-rt"
-MUSL_FINAL_STAMP="$MUSL_PREFIX/.legofs-musl-source"
 if [ ! -x "$MUSL_PREFIX/bin/musl-gcc" ] ||
-	! cmp -s "$MUSL_SOURCE_STAMP" "$MUSL_FINAL_STAMP" ||
 	! grep -Fqx "prefix = $MUSL_PREFIX" "$MUSL_BUILD/config.mak" 2>/dev/null ||
 	! grep -Fqx "LIBCC = $BUILTINS_ARCHIVE" "$MUSL_BUILD/config.mak" 2>/dev/null ||
 	! grep -Fq -- "-specs \"$MUSL_PREFIX/lib/musl-gcc.specs\"" \
 		"$MUSL_PREFIX/bin/musl-gcc" 2>/dev/null; then
-	rm -rf -- "$MUSL_BUILD" "$MUSL_PREFIX"
 	mkdir -p "$MUSL_BUILD" "$MUSL_PREFIX"
 	(
 		cd "$MUSL_BUILD"
@@ -396,7 +343,6 @@ if [ ! -x "$MUSL_PREFIX/bin/musl-gcc" ] ||
 		make -j "$JOBS"
 		make install
 	)
-	cp "$MUSL_SOURCE_STAMP" "$MUSL_FINAL_STAMP"
 fi
 grep -Fqx "LIBCC = $BUILTINS_ARCHIVE" "$MUSL_BUILD/config.mak" ||
 	die 'final musl was not linked with the pinned compiler-rt archive'
@@ -424,8 +370,6 @@ grep -Fqx "$MUSL_BUILTINS $MUSL_EMPTY_LIBGCC_EH" "$MUSL_SPECS" ||
 MUSL_CC="$MUSL_PREFIX/bin/musl-gcc"
 export REALGCC="$NOV_GCC"
 require_sifive_u_isa "$MUSL_PREFIX/lib/libc.so"
-MUSL_ECALL_GATE="$RESULTS/musl-ecall-gate.txt"
-require_musl_hotpatch_padding "$MUSL_PREFIX/lib/libc.so" "$MUSL_ECALL_GATE"
 make -C "$ROOT/components/linux" O="$BASELINE/linux" ARCH=riscv \
 	INSTALL_HDR_PATH="$MUSL_PREFIX" headers_install >/dev/null
 
@@ -540,11 +484,12 @@ make -C "$IOR_SOURCE" distclean >/dev/null 2>&1 || true
 )
 
 printf '%s\n' '[io500-build] workspace RISC-V syscall interceptor'
-SYSINT_ROOT="$SOURCES/syscall-intercept" \
+SYSINT_ROOT="$LEGOFS_ROOT/third_party/syscall-intercept-riscv" \
 SYSINT_CAPSTONE_MIRROR="$SOURCES/capstone.git" \
 SYSINT_BUILD_ROOT="$SYSINT_BUILD_ROOT" SYSINT_JOBS="$JOBS" \
+SYSINT_MUSL_LIBC="$MUSL_PREFIX/lib/libc.so" \
 RISCV_CC="$MUSL_CC" \
-	"$ROOT/scripts/build_syscall_intercept_riscv.sh"
+	"$LEGOFS_ROOT/scripts/build-syscall-intercept-riscv.sh"
 
 printf '%s\n' '[io500-build] LegoFS preload library and baseline static server tools'
 export CARGO_TARGET_DIR="$CARGO_TARGET"
@@ -557,72 +502,6 @@ RUSTFLAGS="-C target-feature=-crt-static -C panic=abort \
 	--release --target "$RUST_MUSL_TARGET" -p badfs-intercept \
 	--features syscall-intercept-backend
 
-printf '%s\n' '[io500-build] link-time independent RDWO V1.1 artifacts'
-cargo build --manifest-path "$LEGOFS_ROOT/Cargo.toml" --release \
-	-p badfs-rdwo-client --bin badfs-rdwo-manifest
-RUSTFLAGS="-C target-feature=-crt-static -C panic=abort \
--C link-arg=-L$LIBUNWIND_PREFIX/lib" \
-	cargo build --manifest-path "$LEGOFS_ROOT/Cargo.toml" \
-	--release --target "$RUST_MUSL_TARGET" \
-	-p badfs-rdwo-client -p badfs-rdwo-server \
-	-p badfs-rdwo-host-agent -p badfs-rdwo-intercept
-RDWO_CROSS="$CARGO_TARGET/$RUST_MUSL_TARGET/release"
-RDWO_CLIENT="$RDWO_CROSS/badfs-rdwo-client"
-RDWO_SERVER="$RDWO_CROSS/badfs-rdwo-server"
-RDWO_HOST_AGENT="$RDWO_CROSS/badfs-rdwo-host-agent"
-RDWO_INTERCEPT="$RDWO_CROSS/libbadfs_rdwo_intercept.so"
-RDWO_SOURCE_IDENTITY="$RDWO_RESULTS/source-identity.txt"
-(
-	cd "$LEGOFS_ROOT"
-	{
-		printf '%s\n' Cargo.toml Cargo.lock badfs-common/Cargo.toml \
-			badfs-common/src/lib.rs badfs-common/src/product_manifest.rs
-		find badfs-rdwo-client badfs-rdwo-server badfs-rdwo-host-agent \
-			badfs-rdwo-intercept -type f -print
-	} | LC_ALL=C sort -u | while IFS= read -r source; do
-		sha256sum "$source"
-	done
-) > "$RDWO_SOURCE_IDENTITY"
-RDWO_CARGO_TREE="$RDWO_RESULTS/cargo-tree.txt"
-cargo tree --manifest-path "$LEGOFS_ROOT/Cargo.toml" --edges normal,build \
-	-p badfs-rdwo-client -p badfs-rdwo-server \
-	-p badfs-rdwo-host-agent -p badfs-rdwo-intercept > "$RDWO_CARGO_TREE"
-RDWO_CLOSURE="$RDWO_RESULTS/closure.json"
-python3 "$ROOT/scripts/legofs_rdwo_closure.py" \
-	--cargo-tree "$RDWO_CARGO_TREE" \
-	--source-identity "$RDWO_SOURCE_IDENTITY" \
-	--artifact "client=$RDWO_CLIENT" \
-	--artifact "server=$RDWO_SERVER" \
-	--artifact "host_agent=$RDWO_HOST_AGENT" \
-	--artifact "intercept=$RDWO_INTERCEPT" \
-	--readelf "${CROSS_COMPILE}readelf" \
-	--nm "${CROSS_COMPILE}nm" \
-	--strings "${CROSS_COMPILE}strings" \
-	--output "$RDWO_CLOSURE"
-RDWO_REGION_IDENTITY="$RDWO_RESULTS/cxl-region-plane-template.txt"
-RDWO_GENESIS_IDENTITY="$RDWO_RESULTS/genesis-routing-template.txt"
-printf '%s\n' \
-	'schema=legofs.rdwo-cxl-region-plane.v1' \
-	'backend=cxl-region-only' \
-	'planes=catalog,metadata,payload,queue,persistence,recovery' \
-	'region_generation=1' > "$RDWO_REGION_IDENTITY"
-printf '%s\n' \
-	'schema=legofs.rdwo-genesis-routing.v1' \
-	'format_generation=1' \
-	'routing_generation=1' \
-	'state=bootstrap-template-not-serving' > "$RDWO_GENESIS_IDENTITY"
-RDWO_CAPABILITY_MANIFEST="$RDWO_RESULTS/legofs-rdwo-capabilities.manifest"
-RDWO_ENGINE_MANIFEST="$RDWO_RESULTS/legofs-rdwo-engine.manifest"
-"$CARGO_TARGET/release/badfs-rdwo-manifest" generate \
-	"$RDWO_CAPABILITY_MANIFEST" "$RDWO_ENGINE_MANIFEST" \
-	4c65676f46535244574f563131000001 1 1 d-before-v \
-	"$RDWO_REGION_IDENTITY" "$RDWO_GENESIS_IDENTITY" \
-	"$RDWO_SOURCE_IDENTITY" "$RDWO_CARGO_TREE" "$RDWO_CLOSURE"
-[ "$(wc -c < "$RDWO_CAPABILITY_MANIFEST")" -eq 256 ] ||
-	die 'RDWO capability manifest is not the fixed 256-byte ABI'
-[ "$(wc -c < "$RDWO_ENGINE_MANIFEST")" -eq 320 ] ||
-	die 'RDWO engine manifest is not the fixed 320-byte ABI'
-
 printf '%s\n' '[io500-build] MPI placement probe'
 "$MPICC" -O2 -Wall -Wextra -Werror "$ROOT/guest/mpi_hello.c" \
 	-Wl,-rpath,/payload/lib \
@@ -631,6 +510,10 @@ printf '%s\n' '[io500-build] MPI placement probe'
 	-march=rv64imafdc -mabi=lp64d \
 	"$ROOT/guest/export_io500_results.c" \
 	-o "$TARGET_ROOT/export-io500-results"
+"$MUSL_CC" -O2 -Wall -Wextra -Werror \
+	-march=rv64imafdc -mabi=lp64d \
+	"$ROOT/guest/system_sync_probe.c" \
+	-o "$TARGET_ROOT/system-sync-probe"
 
 printf '%s\n' '[io500-build] read-only payload image'
 rm -rf -- "$PAYLOAD_ROOT"
@@ -642,19 +525,16 @@ install -m 0755 "$MPICH_PREFIX/bin/hydra_pmi_proxy" "$PAYLOAD_ROOT/bin/hydra_pmi
 install -m 0755 "$TARGET_ROOT/mpi-hello" "$PAYLOAD_ROOT/bin/mpi-hello"
 install -m 0755 "$TARGET_ROOT/export-io500-results" \
 	"$PAYLOAD_ROOT/bin/export-io500-results"
+install -m 0755 "$TARGET_ROOT/system-sync-probe" \
+	"$PAYLOAD_ROOT/bin/system-sync-probe"
 install -m 0755 "$ROOT/guest/legofs_io500_rank.sh" "$PAYLOAD_ROOT/bin/run-io500-rank"
-install -m 0755 "$BASELINE/legofs-bin/badfs-server" "$PAYLOAD_ROOT/bin/badfs-server"
-install -m 0755 "$BASELINE/legofs-bin/badfs-bench" "$PAYLOAD_ROOT/bin/badfs-bench"
-install -m 0755 "$RDWO_CLIENT" "$PAYLOAD_ROOT/bin/badfs-rdwo-client"
-install -m 0755 "$RDWO_SERVER" "$PAYLOAD_ROOT/bin/badfs-rdwo-server"
-install -m 0755 "$RDWO_HOST_AGENT" "$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent"
+install -m 0755 "$ROOT/guest/legofs_io500_init.sh" "$PAYLOAD_ROOT/bin/legofs-io500-init"
+install -m 0755 "$BASELINE/legofs-bin/badfs-server" "$PAYLOAD_ROOT/bin/badfs-server.real"
+install -m 0755 "$ROOT/guest/legofs_badfs_server.sh" "$PAYLOAD_ROOT/bin/badfs-server"
+install -m 0755 "$BASELINE/legofs-bin/badfs-bench" "$PAYLOAD_ROOT/bin/badfs-bench.real"
+install -m 0755 "$ROOT/guest/legofs_badfs_bench.sh" "$PAYLOAD_ROOT/bin/badfs-bench"
 install -m 0755 "$CARGO_TARGET/$RUST_MUSL_TARGET/release/libbadfs_intercept.so" \
 	"$PAYLOAD_ROOT/lib/libbadfs_intercept.so"
-install -m 0755 "$RDWO_INTERCEPT" "$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so"
-install -m 0644 "$RDWO_ENGINE_MANIFEST" \
-	"$PAYLOAD_ROOT/etc/legofs-rdwo-engine.manifest"
-install -m 0644 "$RDWO_CAPABILITY_MANIFEST" \
-	"$PAYLOAD_ROOT/etc/legofs-rdwo-capabilities.manifest"
 cp -a "$MPICH_PREFIX/lib/"libmpi.so* "$PAYLOAD_ROOT/lib/"
 cp -a "$SYSINT_BUILD_ROOT/build/"libsyscall_intercept.so* "$PAYLOAD_ROOT/lib/"
 cp -a "$LIBUNWIND_PREFIX/lib/"libunwind.so* "$PAYLOAD_ROOT/lib/"
@@ -677,7 +557,7 @@ for applet in sh mount mkdir mknod cat tr basename readlink sleep ip hostname \
 	kill sync poweroff reboot nc printf seq env chmod ls ps grep sed awk find; do
 	ln -s busybox "$INITRAMFS/bin/$applet"
 done
-install -m 0755 "$ROOT/guest/legofs_io500_init.sh" "$INITRAMFS/init"
+install -m 0755 "$ROOT/guest/legofs_io500_bootstrap_init.sh" "$INITRAMFS/init"
 install -m 0755 "$MUSL_PREFIX/lib/libc.so" "$INITRAMFS/lib/ld-musl-riscv64.so.1"
 ln -s ld-musl-riscv64.so.1 "$INITRAMFS/lib/libc.so"
 
@@ -703,25 +583,18 @@ install -m 0644 "$LINUX_BUILD/arch/riscv/boot/Image" "$PLATFORM/linux-io500-Imag
 for binary in "$PAYLOAD_ROOT/bin/io500" "$PAYLOAD_ROOT/bin/io500-verify" \
 	"$PAYLOAD_ROOT/bin/mpiexec.hydra" "$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_ROOT/bin/mpi-hello" "$PAYLOAD_ROOT/bin/export-io500-results" \
-	"$PAYLOAD_ROOT/bin/badfs-server" \
-	"$PAYLOAD_ROOT/bin/badfs-bench" \
-	"$PAYLOAD_ROOT/bin/badfs-rdwo-client" \
-	"$PAYLOAD_ROOT/bin/badfs-rdwo-server" \
-	"$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent" \
-	"$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so" \
-	"$PAYLOAD_ROOT/lib/libmpi.so" \
+	"$PAYLOAD_ROOT/bin/system-sync-probe" \
+	"$PAYLOAD_ROOT/bin/badfs-server.real" \
+	"$PAYLOAD_ROOT/bin/badfs-bench.real" "$PAYLOAD_ROOT/lib/libmpi.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so" \
 	"$PAYLOAD_ROOT/lib/libsyscall_intercept.so" \
-	"$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \
-	"$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so" \
-	"$PAYLOAD_ROOT/bin/badfs-rdwo-client" \
-	"$PAYLOAD_ROOT/bin/badfs-rdwo-server" \
-	"$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent"; do
+	"$PAYLOAD_ROOT/lib/libbadfs_intercept.so"; do
 	file -L "$binary" | grep -q 'RISC-V' || die "payload binary is not RISC-V: $binary"
 	require_sifive_u_isa "$binary"
 done
 for binary in "$PAYLOAD_ROOT/bin/io500" \
-	"$PAYLOAD_ROOT/bin/export-io500-results"; do
+	"$PAYLOAD_ROOT/bin/export-io500-results" \
+	"$PAYLOAD_ROOT/bin/system-sync-probe"; do
 	"${CROSS_COMPILE}readelf" -l "$binary" |
 		grep -q '/lib/ld-musl-riscv64.so.1' ||
 		die "$binary does not use the clean musl loader"
@@ -729,6 +602,7 @@ done
 for binary in "$PAYLOAD_ROOT/bin/io500" "$PAYLOAD_ROOT/bin/io500-verify" \
 	"$PAYLOAD_ROOT/bin/mpiexec.hydra" "$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_ROOT/bin/mpi-hello" "$PAYLOAD_ROOT/bin/export-io500-results" \
+	"$PAYLOAD_ROOT/bin/system-sync-probe" \
 	"$PAYLOAD_ROOT/lib/libmpi.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so" \
 	"$PAYLOAD_ROOT/lib/libsyscall_intercept.so" \
@@ -742,9 +616,10 @@ require_needed "$PAYLOAD_ROOT/lib/libbadfs_intercept.so" libunwind.so.1
 require_needed "$PAYLOAD_ROOT/lib/libbadfs_intercept.so" libc.so
 require_needed "$PAYLOAD_ROOT/lib/libunwind.so" libc.so
 require_needed "$PAYLOAD_ROOT/bin/export-io500-results" libc.so
+require_needed "$PAYLOAD_ROOT/bin/system-sync-probe" libc.so
 require_unwind_provider "$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so"
-for binary in "$PAYLOAD_ROOT/bin/badfs-server" "$PAYLOAD_ROOT/bin/badfs-bench"; do
+for binary in "$PAYLOAD_ROOT/bin/badfs-server.real" "$PAYLOAD_ROOT/bin/badfs-bench.real"; do
 	"${CROSS_COMPILE}readelf" -l "$binary" | grep -q INTERP &&
 		die "static LegoFS binary has an interpreter: $binary"
 done
@@ -753,15 +628,13 @@ printf '%s\n' \
 	"mpich=$MPICH_COMMIT" "io500=$IO500_COMMIT" "ior=$IOR_COMMIT" \
 	"pfind=$PFIND_COMMIT" "busybox=$BUSYBOX_COMMIT" \
 	"syscall_intercept=$SYSINT_COMMIT" "capstone=$CAPSTONE_COMMIT" \
-	"musl_version=$MUSL_VERSION" "musl_tarball_sha256=$MUSL_TARBALL_SHA256" \
-	"musl_hotpatch_padding_sha256=$MUSL_HOTPATCH_PADDING_SHA256" \
+	"musl_version=$MUSL_VERSION" \
 	"llvm_tag=$LLVM_TAG" "llvm=$LLVM_COMMIT" \
 	> "$RESULTS/dependency-versions.txt"
 
 python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--output "$RESULTS/build-manifest.json" \
-	--source "legofs=$LEGOFS_ROOT" \
-	--source "cxlmemsim=$ROOT/components/cxlmemsim" \
+	--no-artifact-hashes \
 	--compiler "riscv_gcc=${CROSS_COMPILE}gcc --version" \
 	--compiler "riscv_nov_gcc=$NOV_GCC --version" \
 	--compiler "riscv_musl_gcc=$MUSL_CC --version" \
@@ -779,27 +652,10 @@ python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--artifact "mpiexec=$PAYLOAD_ROOT/bin/mpiexec.hydra" \
 	--artifact "hydra_proxy=$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	--artifact "io500_result_export=$PAYLOAD_ROOT/bin/export-io500-results" \
-	--artifact "badfs_server=$PAYLOAD_ROOT/bin/badfs-server" \
-	--artifact "badfs_bench=$PAYLOAD_ROOT/bin/badfs-bench" \
-	--artifact "rdwo_client=$PAYLOAD_ROOT/bin/badfs-rdwo-client" \
-	--artifact "rdwo_server=$PAYLOAD_ROOT/bin/badfs-rdwo-server" \
-	--artifact "rdwo_host_agent=$PAYLOAD_ROOT/bin/badfs-rdwo-host-agent" \
-	--artifact "rdwo_intercept=$PAYLOAD_ROOT/lib/libbadfs_rdwo_intercept.so" \
-	--artifact "product_engine_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-engine.manifest" \
-	--artifact "product_capability_manifest=$PAYLOAD_ROOT/etc/legofs-rdwo-capabilities.manifest" \
-	--artifact "rdwo_closure=$RDWO_CLOSURE" \
-	--artifact "rdwo_cargo_tree=$RDWO_CARGO_TREE" \
-	--artifact "rdwo_source_identity=$RDWO_SOURCE_IDENTITY" \
+	--artifact "system_sync_probe=$PAYLOAD_ROOT/bin/system-sync-probe" \
 	--artifact "compiler_rt_builtins=$BUILTINS_ARCHIVE" \
 	--artifact "libunwind=$PAYLOAD_ROOT/lib/libunwind.so.1" \
 	--artifact "badfs_intercept=$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \
-	--artifact "syscall_intercept=$PAYLOAD_ROOT/lib/libsyscall_intercept.so.0.1.0" \
-	--artifact "syscall_intercept_manifest=$SYSINT_BUILD_ROOT/manifest.txt" \
 	--artifact "dependency_versions=$RESULTS/dependency-versions.txt" \
-	--artifact "libpmem_build=$ROOT/out/legofs-type3/results/libpmem-debs.txt" \
-	--artifact "cxlmemsim_build_deps=$ROOT/out/legofs-type3/results/cxlmemsim-build-debs.txt" \
-	--artifact "uboot_build_deps=$ROOT/out/legofs-type3/results/uboot-build-debs.txt" \
-	--artifact "isa_gate=$ISA_REPORT" \
-	--artifact "musl_ecall_gate=$MUSL_ECALL_GATE" \
-	--artifact "musl_hotpatch_padding_patch=$MUSL_HOTPATCH_PADDING_PATCH"
+	--artifact "isa_gate=$ISA_REPORT"
 printf '[io500-build] manifest %s\n' "$RESULTS/build-manifest.json"
