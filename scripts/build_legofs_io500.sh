@@ -165,7 +165,7 @@ require_sifive_u_isa()
 			print output
 		}' |
 		"$LLVM_MC" --triple=riscv64 \
-			--mattr=+m,+a,+f,+d,+c,+zicsr,+zifencei \
+			--mattr=+m,+a,+f,+d,+c,+zicsr,+zifencei,+zicbom \
 			--disassemble 2>&1 >/dev/null)
 	invalid_count=$(printf '%s\n' "$decoder_diagnostics" |
 		grep -c 'invalid instruction encoding' || true)
@@ -173,7 +173,7 @@ require_sifive_u_isa()
 		"$binary" "$invalid_count" "$vector_count" "$attribute" >> "$ISA_REPORT"
 	if [ -n "$decoder_diagnostics" ]; then
 		printf '%s\n' "$decoder_diagnostics" | sed -n '1,40p' >> "$ISA_REPORT"
-		die "SiFive U payload contains instructions outside rv64imafdc: $binary"
+		die "SiFive U payload contains instructions outside rv64imafdc+zicbom: $binary"
 	fi
 }
 
@@ -487,6 +487,10 @@ printf '%s\n' '[io500-build] MPI placement probe'
 	-march=rv64imafdc -mabi=lp64d \
 	"$ROOT/guest/export_io500_results.c" \
 	-o "$TARGET_ROOT/export-io500-results"
+"$MUSL_CC" -O2 -Wall -Wextra -Werror \
+	-march=rv64imafdc -mabi=lp64d \
+	"$ROOT/guest/system_sync_probe.c" \
+	-o "$TARGET_ROOT/system-sync-probe"
 
 printf '%s\n' '[io500-build] read-only payload image'
 rm -rf -- "$PAYLOAD_ROOT"
@@ -498,6 +502,8 @@ install -m 0755 "$MPICH_PREFIX/bin/hydra_pmi_proxy" "$PAYLOAD_ROOT/bin/hydra_pmi
 install -m 0755 "$TARGET_ROOT/mpi-hello" "$PAYLOAD_ROOT/bin/mpi-hello"
 install -m 0755 "$TARGET_ROOT/export-io500-results" \
 	"$PAYLOAD_ROOT/bin/export-io500-results"
+install -m 0755 "$TARGET_ROOT/system-sync-probe" \
+	"$PAYLOAD_ROOT/bin/system-sync-probe"
 install -m 0755 "$ROOT/guest/legofs_io500_rank.sh" "$PAYLOAD_ROOT/bin/run-io500-rank"
 install -m 0755 "$ROOT/guest/legofs_io500_init.sh" "$PAYLOAD_ROOT/bin/legofs-io500-init"
 install -m 0755 "$BASELINE/legofs-bin/badfs-server" "$PAYLOAD_ROOT/bin/badfs-server.real"
@@ -554,6 +560,7 @@ install -m 0644 "$LINUX_BUILD/arch/riscv/boot/Image" "$PLATFORM/linux-io500-Imag
 for binary in "$PAYLOAD_ROOT/bin/io500" "$PAYLOAD_ROOT/bin/io500-verify" \
 	"$PAYLOAD_ROOT/bin/mpiexec.hydra" "$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_ROOT/bin/mpi-hello" "$PAYLOAD_ROOT/bin/export-io500-results" \
+	"$PAYLOAD_ROOT/bin/system-sync-probe" \
 	"$PAYLOAD_ROOT/bin/badfs-server.real" \
 	"$PAYLOAD_ROOT/bin/badfs-bench.real" "$PAYLOAD_ROOT/lib/libmpi.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so" \
@@ -563,7 +570,8 @@ for binary in "$PAYLOAD_ROOT/bin/io500" "$PAYLOAD_ROOT/bin/io500-verify" \
 	require_sifive_u_isa "$binary"
 done
 for binary in "$PAYLOAD_ROOT/bin/io500" \
-	"$PAYLOAD_ROOT/bin/export-io500-results"; do
+	"$PAYLOAD_ROOT/bin/export-io500-results" \
+	"$PAYLOAD_ROOT/bin/system-sync-probe"; do
 	"${CROSS_COMPILE}readelf" -l "$binary" |
 		grep -q '/lib/ld-musl-riscv64.so.1' ||
 		die "$binary does not use the clean musl loader"
@@ -571,6 +579,7 @@ done
 for binary in "$PAYLOAD_ROOT/bin/io500" "$PAYLOAD_ROOT/bin/io500-verify" \
 	"$PAYLOAD_ROOT/bin/mpiexec.hydra" "$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_ROOT/bin/mpi-hello" "$PAYLOAD_ROOT/bin/export-io500-results" \
+	"$PAYLOAD_ROOT/bin/system-sync-probe" \
 	"$PAYLOAD_ROOT/lib/libmpi.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so" \
 	"$PAYLOAD_ROOT/lib/libsyscall_intercept.so" \
@@ -584,6 +593,7 @@ require_needed "$PAYLOAD_ROOT/lib/libbadfs_intercept.so" libunwind.so.1
 require_needed "$PAYLOAD_ROOT/lib/libbadfs_intercept.so" libc.so
 require_needed "$PAYLOAD_ROOT/lib/libunwind.so" libc.so
 require_needed "$PAYLOAD_ROOT/bin/export-io500-results" libc.so
+require_needed "$PAYLOAD_ROOT/bin/system-sync-probe" libc.so
 require_unwind_provider "$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \
 	"$PAYLOAD_ROOT/lib/libunwind.so"
 for binary in "$PAYLOAD_ROOT/bin/badfs-server.real" "$PAYLOAD_ROOT/bin/badfs-bench.real"; do
@@ -619,6 +629,7 @@ python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--artifact "mpiexec=$PAYLOAD_ROOT/bin/mpiexec.hydra" \
 	--artifact "hydra_proxy=$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	--artifact "io500_result_export=$PAYLOAD_ROOT/bin/export-io500-results" \
+	--artifact "system_sync_probe=$PAYLOAD_ROOT/bin/system-sync-probe" \
 	--artifact "compiler_rt_builtins=$BUILTINS_ARCHIVE" \
 	--artifact "libunwind=$PAYLOAD_ROOT/lib/libunwind.so.1" \
 	--artifact "badfs_intercept=$PAYLOAD_ROOT/lib/libbadfs_intercept.so" \

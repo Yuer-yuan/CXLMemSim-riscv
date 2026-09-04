@@ -35,6 +35,8 @@ export BADFS_FABRIC_STAGED_IO=0
 export BADFS_DISABLE_FABRIC_MMAP=0
 export BADFS_LIFECYCLE_COHERENT_PUBLICATION=1
 export BADFS_LIFECYCLE_COHERENT_READ_CACHE=1
+export BADFS_LIFECYCLE_PACKED_SMALL_SEGMENTS="$(cat /run/packed-small-segments)"
+export BADFS_LIFECYCLE_CLOSE_BATCH="$(cat /run/close-batch-mode)"
 export BADFS_LIFECYCLE_READ_CACHE_ENTRIES=2048
 # metadata-smoke is a fixed 32-write/rank read-path pilot. Match its one-use
 # arena to that exact prerequisite instead of persisting 32 unused 2 MiB slots
@@ -95,14 +97,25 @@ fi
 echo "LEGOFS_IO500_RANK_EXEC stage=$stage rank=${PMI_RANK:-unset} size=${PMI_SIZE:-unset} endpoint=$endpoint_id dax=$(cat /run/dax-path)"
 if [ "$stage" = tiny ] && [ "$serving_transport" = cxl ]; then
 	client_count="$(cmdline_value io500.client_count=)"
-	# Lanes [0, client_count) belong to IO500 ranks and lane client_count is
-	# reserved by the post-run inspector.  Syscall preflight uses the next
-	# disjoint range so its completed generation cannot block either consumer.
-	diagnostic_endpoint="$((client_count + 1 + endpoint_id))"
-	[ "$diagnostic_endpoint" -lt "$BADFS_SERVING_MAX_CLIENTS" ] || exit 64
-	BADFS_OBSERVATION_MODE=off \
-	BADFS_CLIENT_ENDPOINT_ID="$diagnostic_endpoint" BADFS_BENCH_MODE=syscall-matrix \
-		LD_PRELOAD= /payload/bin/badfs-bench.real
+	# The syscall matrix proves the payload/profile capability, not a property
+	# unique to every MPI rank.  Running one complete matrix per rank made
+	# startup O(client_count) in shared-namespace work and could deadlock the
+	# diagnostic cleanup before IO500 started.  Rank zero owns the one complete
+	# matrix.  Every rank still exercises its own production lane in IO500 and
+	# contributes post-run transport evidence.
+	if [ "$endpoint_id" -eq 0 ]; then
+		# Lanes [0, client_count) belong to IO500 ranks and lane client_count is
+		# reserved by the post-run inspector.  Use the next disjoint lane so the
+		# completed diagnostic generation cannot block either consumer.
+		diagnostic_endpoint="$((client_count + 1))"
+		[ "$diagnostic_endpoint" -lt "$BADFS_SERVING_MAX_CLIENTS" ] || exit 64
+		BADFS_OBSERVATION_MODE=off \
+		BADFS_CLIENT_ENDPOINT_ID="$diagnostic_endpoint" BADFS_BENCH_MODE=syscall-matrix \
+			LD_PRELOAD= /payload/bin/badfs-bench.real
+		echo "LEGOFS_IO500_PREFLIGHT_MATRIX endpoint=$endpoint_id mode=full"
+	else
+		echo "LEGOFS_IO500_PREFLIGHT_MATRIX endpoint=$endpoint_id mode=covered-by-endpoint-0"
+	fi
 	# Preflight is intentionally outside the measured IO500 phases and can be
 	# slow under TCG.  Do not let different guest clocks drift during it and
 	# then assign incomparable ctime values to the shared namespace.

@@ -42,7 +42,8 @@ class LegofsEvidenceTest(unittest.TestCase):
             "histogram": {"bins": 576},
             "idle_sample_stride": 1024,
             "observation_schema": {
-                "major": 1, "minor": 0, "event_record_bytes": 64,
+                "major": 1, "minor": self.observer.SCHEMA_MINOR,
+                "event_record_bytes": 64,
                 "digest": self.observer.SCHEMA_DIGEST,
             },
         }
@@ -92,8 +93,8 @@ class LegofsEvidenceTest(unittest.TestCase):
         )
 
     def test_observation_metric_banks_keep_stable_stage_ownership(self):
-        self.assertEqual(len(self.observer.STAGES), 58)
-        self.assertEqual(len(self.observer.STAGE_COMPONENTS), 58)
+        self.assertEqual(len(self.observer.STAGES), 61)
+        self.assertEqual(len(self.observer.STAGE_COMPONENTS), 61)
         expected = {
             "hook_to_client": "syscall_intercept",
             "namespace_resolution": "client_semantics",
@@ -103,12 +104,140 @@ class LegofsEvidenceTest(unittest.TestCase):
             "arena_state_persist": "data_arena_extent",
             "persistence_barrier": "persistence",
             "startup_lane_provision": "startup_recovery",
+            "transport_remote_wait": "cxl_client_transport",
+            "authority_request_service": "authority_progress",
+            "completion_publication_wait": "authority_progress",
         }
         ownership = dict(zip(
             self.observer.STAGES, self.observer.STAGE_COMPONENTS
         ))
         for stage, component in expected.items():
             self.assertEqual(ownership[stage], component)
+
+    def test_observation_report_accepts_disabled_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.observer.analyze_observation_files(
+                [], pathlib.Path(directory), config={"mode": "default"}
+            )
+            self.assertTrue(result["observation_valid"])
+            report = (pathlib.Path(directory) / "report.md").read_text()
+            self.assertIn("SQ detection upper-bound sum: `0` ns", report)
+            self.assertIn("CQ detection upper-bound sum: `0` ns", report)
+
+    def test_o2_transport_ledger_requires_four_equal_request_multisets(self):
+        digest = {
+            "count": 2, "xor0": 3, "xor1": 5, "sum0": 11, "sum1": 13,
+        }
+        empty = {
+            "count": 0, "xor0": 0, "xor1": 0, "sum0": 0, "sum1": 0,
+        }
+
+        def metric(stage, duration):
+            return {
+                "component": "authority_progress",
+                "stage": stage,
+                "calls": 2,
+                "duration_samples": 2,
+                "sampled_duration_sum_ns": duration,
+                "sampled_min_ns": duration // 2,
+                "sampled_max_ns": duration // 2,
+                "objects": 2,
+                "bytes": 0,
+                "successes": 2,
+                "errors": 0,
+                "retries": 0,
+                "histogram_underflow": 2,
+                "histogram_overflow": 0,
+                "histogram_saturation": 0,
+                "histogram_bins": [0] * self.observer.HISTOGRAM_BINS,
+            }
+
+        client = {
+            "header": {
+                "role": "client-rank",
+                "request_digests": {
+                    "submit": dict(digest), "observe": dict(empty),
+                    "publish": dict(empty), "consume": dict(digest),
+                },
+            },
+            "stage_matrix": [
+                {
+                    **metric("transport_remote_wait", 1000),
+                    "component": "cxl_client_transport",
+                },
+                {
+                    **metric("cq_active_poll", 350),
+                    "component": "cxl_client_transport",
+                },
+                {
+                    **metric("cq_sleep", 550),
+                    "component": "cxl_client_transport",
+                },
+            ],
+        }
+        server_stages = [metric("authority_request_service", 600)]
+        server_stages.extend(metric(stage, duration) for stage, duration in (
+            ("admission", 20), ("scheduler_wait", 30),
+            ("dispatcher_decode", 40), ("dispatcher_route", 400),
+            ("dispatcher_encode", 50), ("completion_publication_wait", 30),
+            ("cqe_publish", 30),
+        ))
+        server = {
+            "header": {
+                "role": "server",
+                "request_digests": {
+                    "submit": dict(empty), "observe": dict(digest),
+                    "publish": dict(digest), "consume": dict(empty),
+                },
+            },
+            "stage_matrix": server_stages,
+        }
+        ledger = self.observer.transport_ledger([client, server])
+        self.assertTrue(ledger["observation_valid"])
+        self.assertTrue(ledger["request_multiset_match"])
+        self.assertEqual(ledger["client_remote_wait_ns"], 1000)
+        self.assertEqual(ledger["correlated_server_request_ns"], 600)
+        self.assertEqual(ledger["transport_handoff_ns"], 400)
+        self.assertEqual(
+            ledger["authority_exclusive_ledger"]["unaccounted_ns"], 0
+        )
+        self.assertEqual(
+            ledger["client_wait_exclusive_ledger"]["unaccounted_ns"], 100
+        )
+
+        server["header"]["request_digests"]["observe"]["count"] = 1
+        rejected = self.observer.transport_ledger([client, server])
+        self.assertFalse(rejected["observation_valid"])
+        self.assertIn("request_multiset_mismatch", rejected["validity_reasons"])
+
+    def test_o2_request_digest_combination_preserves_u64_wrapping(self):
+        maximum = (1 << 64) - 1
+        empty = {
+            "count": 0, "xor0": 0, "xor1": 0, "sum0": 0, "sum1": 0,
+        }
+
+        def arena(sum0, sum1):
+            digest = {
+                "count": 1, "xor0": 7, "xor1": 9,
+                "sum0": sum0, "sum1": sum1,
+            }
+            return {
+                "header": {
+                    "request_digests": {
+                        "submit": digest, "observe": dict(empty),
+                        "publish": dict(empty), "consume": dict(empty),
+                    },
+                },
+            }
+
+        combined = self.observer._combined_request_digests([
+            arena(maximum, maximum - 1), arena(maximum, maximum),
+        ])
+        self.assertEqual(combined["submit"]["count"], 2)
+        self.assertEqual(combined["submit"]["xor0"], 0)
+        self.assertEqual(combined["submit"]["xor1"], 0)
+        self.assertEqual(combined["submit"]["sum0"], maximum - 1)
+        self.assertEqual(combined["submit"]["sum1"], maximum - 2)
 
     def test_paired_gate_uses_median_mad_and_relative_mad(self):
         ratios = [0.98, 1.0, 1.01, 1.02, 1.20]
@@ -242,17 +371,47 @@ class LegofsEvidenceTest(unittest.TestCase):
                 },
                 "lifecycle_inspection": {"audit": {
                     "pending_operations": 0, "pending_arena_slots": 0,
-                    "active_read_leases": 0,
+                    "active_read_leases": 0, "pending_payload_dependencies": 0,
                     "direct_write_commit_items": 64,
                     "writer_persisted_direct_items": 64,
                     "visibility_durability": {"published_v": 8, "durable_d": 8},
                 }},
                 "legofs_timing": {
+                    "aggregate_rank_wall_ns": int(write_elapsed * 2.5e9),
+                    "client_timed_intervals": {
+                        "metadata_rpc_wait_ns": int(write_elapsed * 0.25e9),
+                        "read_control_rpc_wait_ns": int(write_elapsed * 0.50e9),
+                        "write_control_rpc_wait_ns": int(write_elapsed * 0.75e9),
+                    },
+                    "client_timed_intervals_ns": int(write_elapsed * 1.5e9),
                     "arena_acquire": {
                         "arena_acquire_backend_reserve_ns": int(arena_seconds * 1e9),
+                        "arena_acquire_total_ns": int((arena_seconds + 1.0) * 1e9),
+                        "arena_acquire_calls": 2,
+                    },
+                    "direct_write": {
+                        "direct_write_commit_groups": 8,
+                        "direct_write_commit_items": 64,
+                        "direct_write_prepare_ns": int(write_elapsed * 0.02e9),
+                        "direct_write_payload_persist_ns": int(write_elapsed * 0.03e9),
+                        "direct_write_state_build_ns": int(write_elapsed * 0.02e9),
+                        "direct_write_state_persist_ns": int(write_elapsed * 0.04e9),
+                        "direct_write_publish_ns": int(write_elapsed * 0.01e9),
+                        "direct_write_trace_ns": int(write_elapsed * 0.01e9),
+                        "direct_write_total_ns": int(write_elapsed * 0.18e9),
+                    },
+                    "transport_client": {
+                        "calls": 547 if fused else 675,
+                        "cq_wait_ns": int(write_elapsed * 1.25e9),
                     },
                     "transport_authority": {
                         "sqe_consumed": 547 if fused else 675,
+                        "cqe_published": 547 if fused else 675,
+                        "authority_queue_wait_ns": int(write_elapsed * 0.10e9),
+                        "successful_request_poll_ns": int(write_elapsed * 0.20e9),
+                        "dispatcher_backend_ns": int(write_elapsed * 0.30e9),
+                        "completion_publication_wait_ns": int(write_elapsed * 0.05e9),
+                        "cqe_publish_ns": int(write_elapsed * 0.10e9),
                     },
                 },
                 "cleanup": {"owned_processes_remaining": []},
@@ -317,6 +476,21 @@ class LegofsEvidenceTest(unittest.TestCase):
             self.assertEqual(
                 gate["mechanism"]["paired_command_reductions"], [128] * 5
             )
+            self.assertTrue(gate["time_closure"]["all_pairs_closed"])
+            first_closure = gate["time_closure"]["pairs"][0]
+            self.assertEqual(
+                first_closure["wall_delta_ns"],
+                first_closure["client_timed_delta_ns"]
+                + first_closure["rank_wall_remainder_delta_ns"],
+            )
+            self.assertEqual(
+                first_closure["baseline"]["client_control"]["remainder_ns"],
+                0,
+            )
+            self.assertTrue(
+                first_closure["baseline"]["transport"]["closed"]
+            )
+            self.assertTrue(first_closure["baseline"]["arena"]["closed"])
 
             pilot = self.observer.paired_candidate_gate(
                 baseline_paths[:1],
@@ -352,6 +526,115 @@ class LegofsEvidenceTest(unittest.TestCase):
             self.assertNotEqual(
                 noisy_two_pair_pilot["classification"], "INCONCLUSIVE_RACE"
             )
+
+            packed_baseline = json.loads(baseline_paths[0].read_text())
+            packed_candidate = json.loads(candidate_paths[0].read_text())
+            packed_baseline["topology"].update({
+                "lifecycle_pool_layout": "v6-variable-extents",
+                "small_segment_count_per_authority": 0,
+            })
+            packed_candidate["topology"].update({
+                "lifecycle_pool_layout": "v7-packed-small-segments",
+                "small_segment_count_per_authority": 16,
+            })
+            packed_baseline["legofs_timing"]["packed_small_segment"] = {
+                "backend_fresh_format_scan_bytes": 0,
+                "backend_publication_slots_reset": 0,
+                "startup_small_runtime_segments": 0,
+                "startup_small_runtime_cells": 0,
+                "small_segment_claims": 0,
+                "small_segment_claim_persist_ns": 0,
+                "small_cell_grants": 0,
+                "small_cell_commits": 0,
+                "small_cell_payload_bytes": 0,
+                "small_cell_payload_persist_bytes": 0,
+                "small_cell_allocator_persist_barriers": 0,
+                "legacy_small_arena_reserve_calls": 2,
+                "legacy_small_arena_reserve_ns": 1_000,
+                "client_cache_hits": 0,
+                "client_dynamic_mmap_calls": 0,
+                "client_dynamic_mmap_ns": 0,
+                "client_mapped_owner_segments": 0,
+                "client_protection_calls": 0,
+                "client_protection_ns": 0,
+            }
+            packed_candidate["legofs_timing"]["packed_small_segment"] = {
+                "backend_fresh_format_scan_bytes": 0,
+                "backend_publication_slots_reset": 0,
+                "startup_small_runtime_segments": 0,
+                "startup_small_runtime_cells": 0,
+                "small_segment_claims": 1,
+                "small_segment_claim_persist_ns": 2_000,
+                "small_cell_grants": 64,
+                "small_cell_commits": 64,
+                "small_cell_payload_bytes": 64 * 3901,
+                "small_cell_payload_persist_bytes": 0,
+                "small_cell_allocator_persist_barriers": 0,
+                "legacy_small_arena_reserve_calls": 0,
+                "legacy_small_arena_reserve_ns": 0,
+                "client_cache_hits": 63,
+                "client_dynamic_mmap_calls": 1,
+                "client_dynamic_mmap_ns": 3_000,
+                "client_mapped_owner_segments": 1,
+                "client_protection_calls": 129,
+                "client_protection_ns": 4_000,
+            }
+            packed_candidate["lifecycle_inspection"]["audit"].update({
+                "writer_persisted_direct_bytes": 64 * 3901,
+            })
+            packed_baseline_path = root / "packed-baseline.json"
+            packed_candidate_path = root / "packed-candidate.json"
+            packed_baseline_path.write_text(
+                json.dumps(packed_baseline), encoding="utf-8"
+            )
+            packed_candidate_path.write_text(
+                json.dumps(packed_candidate), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "normalized topology"):
+                self.observer.paired_candidate_gate(
+                    [packed_baseline_path],
+                    [packed_candidate_path],
+                    primary_phase="mdtest-hard-read",
+                    protected_phases=["mdtest-hard-write"],
+                )
+            packed_gate = self.observer.paired_candidate_gate(
+                [packed_baseline_path],
+                [packed_candidate_path],
+                primary_phase="mdtest-hard-read",
+                protected_phases=["mdtest-hard-write"],
+                allowed_topology_differences={
+                    "lifecycle_pool_layout",
+                    "small_segment_count_per_authority",
+                },
+            )
+            self.assertEqual(
+                packed_gate["isolation"]["allowed_topology_differences"],
+                ["lifecycle_pool_layout", "small_segment_count_per_authority"],
+            )
+            self.assertTrue(packed_gate["time_closure"]["all_pairs_closed"])
+            self.assertEqual(
+                packed_gate["mechanism"]["candidate_path_counters"]
+                ["small_cell_commits"],
+                64,
+            )
+
+            missing_mechanism = json.loads(json.dumps(packed_candidate))
+            missing_mechanism["legofs_timing"].pop("packed_small_segment")
+            missing_mechanism_path = root / "packed-candidate-missing-mechanism.json"
+            missing_mechanism_path.write_text(
+                json.dumps(missing_mechanism), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "packed-small-segment mechanism"):
+                self.observer.paired_candidate_gate(
+                    [packed_baseline_path],
+                    [missing_mechanism_path],
+                    primary_phase="mdtest-hard-read",
+                    protected_phases=["mdtest-hard-write"],
+                    allowed_topology_differences={
+                        "lifecycle_pool_layout",
+                        "small_segment_count_per_authority",
+                    },
+                )
 
     def records(self):
         direct = [{

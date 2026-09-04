@@ -17,6 +17,14 @@ FULL_COHERENCE_TRACE=0
 SERVING_TRANSPORT=legacy
 CURSOR_MODE=owned
 CQ_WAIT_MODE=timer_sleep
+DURABILITY_PROFILE=d-before-v
+PAYLOAD_PERSISTENCE_OWNER=auto
+WRITER_PERSIST_PROVIDER=msync
+# Keep the already-gated, capacity-independent v7 allocator in the product
+# and benchmark profile. v6 remains an explicit diagnostic selector.
+PACKED_SMALL_SEGMENTS=on
+SMALL_SEGMENT_COUNT=2048
+SMALL_SEGMENT_COUNT_EXPLICIT=0
 FAULT_PROFILE=none
 OBSERVATION_MODE=
 OBSERVATION_SAMPLE_SHIFT=
@@ -42,7 +50,17 @@ Usage: ./run-legofs-io500.sh [OPTIONS]
   --serving-transport MODE LegoFS serving path: legacy or cxl (default: legacy)
 	  --cursor-mode MODE      CXL lane cursor algorithm: legacy_shared or owned (default: owned)
   --cq-wait-mode MODE     active CQ wait: timer_sleep or cooperative_yield (default: timer_sleep)
-  --fault-profile PROFILE none, clean-server-restart, reject-unauthorized-clean-restart, or reject-active-clean-retirement (default: none)
+  --durability-profile PROFILE
+                           d-before-v, coherent-seal-no-writeback, or coherent-seal-needs-writeback
+  --payload-persistence-owner OWNER
+                           auto, authority-bi-acquire, writer-receipt, placement-routed,
+                           or writer-before-visibility
+  --writer-persist-provider PROVIDER
+                           msync or riscv-zicbom-dax (default: msync)
+  --packed-small-segments MODE
+                           lifecycle layout: on (v7 product default) or off (v6 diagnostic)
+  --small-segment-count N number of 2 MiB packed segments per authority (default: 2048)
+  --fault-profile PROFILE none, lifecycle fault gates, or diagnose-system-sync (default: none)
   --observation-mode MODE default, off, aggregate, or sampled
   --observation-sample-shift N
                            deterministic duration sample shift, 0..20
@@ -83,6 +101,11 @@ while (($#)); do
 	--serving-transport) (($# >= 2)) || die '--serving-transport requires a value'; SERVING_TRANSPORT="$2"; shift 2 ;;
 		--cursor-mode) (($# >= 2)) || die '--cursor-mode requires a value'; CURSOR_MODE="$2"; shift 2 ;;
 	--cq-wait-mode) (($# >= 2)) || die '--cq-wait-mode requires a value'; CQ_WAIT_MODE="$2"; shift 2 ;;
+	--durability-profile) (($# >= 2)) || die '--durability-profile requires a value'; DURABILITY_PROFILE="$2"; shift 2 ;;
+	--payload-persistence-owner) (($# >= 2)) || die '--payload-persistence-owner requires a value'; PAYLOAD_PERSISTENCE_OWNER="$2"; shift 2 ;;
+	--writer-persist-provider) (($# >= 2)) || die '--writer-persist-provider requires a value'; WRITER_PERSIST_PROVIDER="$2"; shift 2 ;;
+	--packed-small-segments) (($# >= 2)) || die '--packed-small-segments requires a value'; PACKED_SMALL_SEGMENTS="$2"; shift 2 ;;
+	--small-segment-count) (($# >= 2)) || die '--small-segment-count requires a value'; SMALL_SEGMENT_COUNT="$2"; SMALL_SEGMENT_COUNT_EXPLICIT=1; shift 2 ;;
 	--fault-profile) (($# >= 2)) || die '--fault-profile requires a value'; FAULT_PROFILE="$2"; shift 2 ;;
 	--observation-mode) (($# >= 2)) || die '--observation-mode requires a value'; OBSERVATION_MODE="$2"; shift 2 ;;
 	--observation-sample-shift) (($# >= 2)) || die '--observation-sample-shift requires a value'; OBSERVATION_SAMPLE_SHIFT="$2"; shift 2 ;;
@@ -105,7 +128,21 @@ case "$SERVER_COUNT" in 1|2) ;; *) die 'server-count must be 1 or 2' ;; esac
 case "$SERVING_TRANSPORT" in legacy|cxl) ;; *) die 'serving-transport must be legacy or cxl' ;; esac
 case "$CURSOR_MODE" in legacy_shared|owned) ;; *) die 'cursor-mode must be legacy_shared or owned' ;; esac
 case "$CQ_WAIT_MODE" in timer_sleep|cooperative_yield) ;; *) die 'cq-wait-mode must be timer_sleep or cooperative_yield' ;; esac
-case "$FAULT_PROFILE" in none|clean-server-restart|reject-unauthorized-clean-restart|reject-active-clean-retirement) ;; *) die 'invalid fault-profile' ;; esac
+case "$DURABILITY_PROFILE" in d-before-v|coherent-seal-no-writeback|coherent-seal-needs-writeback) ;; *) die 'invalid durability-profile' ;; esac
+case "$PAYLOAD_PERSISTENCE_OWNER" in auto|authority-bi-acquire|writer-receipt|placement-routed|writer-before-visibility) ;; *) die 'invalid payload-persistence-owner' ;; esac
+case "$WRITER_PERSIST_PROVIDER" in msync|riscv-zicbom-dax) ;; *) die 'invalid writer-persist-provider' ;; esac
+if [[ "$DURABILITY_PROFILE" != d-before-v && "$SERVING_TRANSPORT" != cxl ]]; then
+	die 'coherent durability profiles require --serving-transport cxl'
+fi
+case "$PACKED_SMALL_SEGMENTS" in off|on) ;; *) die 'packed-small-segments must be off or on' ;; esac
+[[ "$SMALL_SEGMENT_COUNT" =~ ^[1-9][0-9]*$ ]] || die 'small-segment-count must be a positive integer'
+if ((SMALL_SEGMENT_COUNT_EXPLICIT)) && [[ "$PACKED_SMALL_SEGMENTS" != on ]]; then
+	die '--small-segment-count requires --packed-small-segments on'
+fi
+case "$FAULT_PROFILE" in none|clean-server-restart|reject-unauthorized-clean-restart|reject-active-clean-retirement|diagnose-system-sync) ;; *) die 'invalid fault-profile' ;; esac
+if [[ "$DURABILITY_PROFILE" != d-before-v && "$FAULT_PROFILE" != none ]]; then
+	die 'coherent durability profiles currently require --fault-profile none'
+fi
 if [[ -n "$OBSERVATION_MODE" ]]; then
 	case "$OBSERVATION_MODE" in default|off|aggregate|sampled) ;; *) die 'invalid observation-mode' ;; esac
 fi
@@ -139,7 +176,11 @@ if ((BUILD_ONLY == 0 && PAYLOAD_ONLY == 0)); then
 	args=(--stage "$STAGE" --server-count "$SERVER_COUNT" \
 		--client-count "$CLIENT_COUNT" --timeout "$TIMEOUT" \
 		--serving-transport "$SERVING_TRANSPORT" --cursor-mode "$CURSOR_MODE" \
-		--cq-wait-mode "$CQ_WAIT_MODE")
+		--cq-wait-mode "$CQ_WAIT_MODE" --durability-profile "$DURABILITY_PROFILE" \
+		--payload-persistence-owner "$PAYLOAD_PERSISTENCE_OWNER" \
+		--writer-persist-provider "$WRITER_PERSIST_PROVIDER" \
+		--packed-small-segments "$PACKED_SMALL_SEGMENTS" \
+		--small-segment-count "$SMALL_SEGMENT_COUNT")
 	args+=(--fault-profile "$FAULT_PROFILE")
 	args+=(--host-profiler "$HOST_PROFILER")
 	if [[ -n "$OBSERVATION_MODE" ]]; then

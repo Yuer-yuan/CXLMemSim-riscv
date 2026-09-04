@@ -22,3 +22,6 @@
 [submodule "components/legofs"]
 	path = components/legofs
 	url = https://github.com/Zettai-US/legofs.git
+[submodule "components/3FS"]
+	path = components/3FS
+	url = git@github.com:Yuer-yuan/3FS.git

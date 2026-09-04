@@ -29,11 +29,13 @@ source "$ROOT/scripts/legofs_toolchain_path.sh"
 legofs_toolchain_activate io500-payload \
 	bash sh cargo rustc getconf \
 	"${CROSS_COMPILE}gcc" "${CROSS_COMPILE}ar" \
-	"${CROSS_COMPILE}ld" "${CROSS_COMPILE}objdump" \
+	"${CROSS_COMPILE}ld" "${CROSS_COMPILE}nm" \
+	"${CROSS_COMPILE}objcopy" "${CROSS_COMPILE}objdump" \
 	"${CROSS_COMPILE}ranlib" "${CROSS_COMPILE}readelf" \
 	"${CROSS_COMPILE}strip" "$LLVM_MC" \
-	cc ar ld mke2fs debugfs truncate file install rsync \
-	sha256sum mktemp cmp python3 awk grep sed sort seq cp mv rm mkdir
+	cc ar ld git cmake make tar mke2fs debugfs truncate file install rsync \
+	sha256sum mktemp cmp python3 awk grep sed sort seq cp mv rm mkdir \
+	find xargs env uname dirname
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')"
 PAYLOAD_STAGE=
 PAYLOAD_IMAGE_TMP=
@@ -113,7 +115,7 @@ require_file "$MPICH_PREFIX/bin/mpiexec.hydra"
 require_file "$MPICH_PREFIX/bin/hydra_pmi_proxy"
 require_file "$TARGET_ROOT/mpi-hello"
 require_file "$TARGET_ROOT/export-io500-results"
-require_file "$SYSINT_BUILD_ROOT/build/libsyscall_intercept.so.0"
+require_file "$ROOT/guest/system_sync_probe.c"
 require_file "$LIBUNWIND_PREFIX/lib/libunwind.so.1"
 require_file "$BUILTINS_ARCHIVE"
 require_file "$DEPENDENCY_VERSIONS"
@@ -133,10 +135,8 @@ done
 
 shopt -s nullglob
 mpi_libraries=("$MPICH_PREFIX/lib/"libmpi.so*)
-sysint_libraries=("$SYSINT_BUILD_ROOT/build/"libsyscall_intercept.so*)
 unwind_libraries=("$LIBUNWIND_PREFIX/lib/"libunwind.so*)
 ((${#mpi_libraries[@]} > 0)) || die 'missing prerequisite MPICH shared libraries'
-((${#sysint_libraries[@]} > 0)) || die 'missing prerequisite syscall-intercept libraries'
 ((${#unwind_libraries[@]} > 0)) || die 'missing prerequisite libunwind libraries'
 
 platform_hashes()
@@ -150,6 +150,20 @@ platform_hashes()
 }
 
 platform_hashes_before="$(platform_hashes)"
+
+printf '%s\n' '[io500-payload] vendored RISC-V syscall interceptor'
+SYSINT_ROOT="$LEGOFS_ROOT/third_party/syscall-intercept-riscv" \
+SYSINT_CAPSTONE_MIRROR="$SOURCES/capstone.git" \
+SYSINT_BUILD_ROOT="$SYSINT_BUILD_ROOT" SYSINT_JOBS="$JOBS" \
+SYSINT_MUSL_LIBC="$MUSL_PREFIX/lib/libc.so" \
+RISCV_CC="$MUSL_CC" RISCV_LD="${CROSS_COMPILE}ld" \
+RISCV_OBJCOPY="${CROSS_COMPILE}objcopy" \
+RISCV_OBJDUMP="${CROSS_COMPILE}objdump" \
+RISCV_AR="${CROSS_COMPILE}ar" RISCV_RANLIB="${CROSS_COMPILE}ranlib" \
+	"$LEGOFS_ROOT/scripts/build-syscall-intercept-riscv.sh"
+require_file "$SYSINT_BUILD_ROOT/build/libsyscall_intercept.so.0"
+sysint_libraries=("$SYSINT_BUILD_ROOT/build/"libsyscall_intercept.so*)
+((${#sysint_libraries[@]} > 0)) || die 'missing rebuilt syscall-intercept libraries'
 
 printf '%s\n' '[io500-payload] static LegoFS server and benchmark'
 mkdir -p "$STATIC_CARGO_TARGET" "$DYNAMIC_CARGO_TARGET" "$IMAGES" "$RESULTS"
@@ -178,6 +192,13 @@ RUSTFLAGS="-C target-feature=-crt-static -C panic=abort -C link-arg=-L$LIBUNWIND
 BADFS_INTERCEPT="$DYNAMIC_CARGO_TARGET/$RUST_TARGET/release/libbadfs_intercept.so"
 require_file "$BADFS_INTERCEPT"
 
+printf '%s\n' '[io500-payload] dynamic system(3) sync regression probe'
+"$MUSL_CC" -O2 -Wall -Wextra -Werror \
+	-march=rv64imafdc -mabi=lp64d \
+	"$ROOT/guest/system_sync_probe.c" \
+	-o "$TARGET_ROOT/system-sync-probe"
+require_file "$TARGET_ROOT/system-sync-probe"
+
 PAYLOAD_STAGE="$(mktemp -d "$TARGET_ROOT/.payload-build.XXXXXX")"
 PAYLOAD_TREE="$PAYLOAD_STAGE/root"
 mkdir -p "$PAYLOAD_TREE/bin" "$PAYLOAD_TREE/lib" "$PAYLOAD_TREE/etc"
@@ -189,6 +210,8 @@ install -m 0755 "$MPICH_PREFIX/bin/hydra_pmi_proxy" "$PAYLOAD_TREE/bin/hydra_pmi
 install -m 0755 "$TARGET_ROOT/mpi-hello" "$PAYLOAD_TREE/bin/mpi-hello"
 install -m 0755 "$TARGET_ROOT/export-io500-results" \
 	"$PAYLOAD_TREE/bin/export-io500-results"
+install -m 0755 "$TARGET_ROOT/system-sync-probe" \
+	"$PAYLOAD_TREE/bin/system-sync-probe"
 install -m 0755 "$ROOT/guest/legofs_io500_rank.sh" \
 	"$PAYLOAD_TREE/bin/run-io500-rank"
 install -m 0755 "$ROOT/guest/legofs_io500_init.sh" \
@@ -234,7 +257,7 @@ require_sifive_u_isa()
 			print output
 		}' |
 		"$LLVM_MC" --triple=riscv64 \
-			--mattr=+m,+a,+f,+d,+c,+zicsr,+zifencei \
+			--mattr=+m,+a,+f,+d,+c,+zicsr,+zifencei,+zicbom \
 			--disassemble 2>&1 >/dev/null)
 	invalid_count=$(printf '%s\n' "$decoder_diagnostics" |
 		grep -c 'invalid instruction encoding' || true)
@@ -242,7 +265,7 @@ require_sifive_u_isa()
 		"$binary" "$invalid_count" "$vector_count" "$attribute" >> "$ISA_REPORT_STAGE"
 	if [[ -n "$decoder_diagnostics" ]]; then
 		printf '%s\n' "$decoder_diagnostics" | sed -n '1,40p' >> "$ISA_REPORT_STAGE"
-		die "SiFive U payload contains instructions outside rv64imafdc: $binary"
+		die "SiFive U payload contains instructions outside rv64imafdc+zicbom: $binary"
 	fi
 }
 
@@ -314,6 +337,7 @@ require_unwind_provider()
 for binary in "$PAYLOAD_TREE/bin/io500" "$PAYLOAD_TREE/bin/io500-verify" \
 	"$PAYLOAD_TREE/bin/mpiexec.hydra" "$PAYLOAD_TREE/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_TREE/bin/mpi-hello" "$PAYLOAD_TREE/bin/export-io500-results" \
+	"$PAYLOAD_TREE/bin/system-sync-probe" \
 	"$PAYLOAD_TREE/bin/badfs-server.real" "$PAYLOAD_TREE/bin/badfs-bench.real" \
 	"$PAYLOAD_TREE/lib/libmpi.so" "$PAYLOAD_TREE/lib/libunwind.so" \
 	"$PAYLOAD_TREE/lib/libsyscall_intercept.so" \
@@ -323,7 +347,8 @@ for binary in "$PAYLOAD_TREE/bin/io500" "$PAYLOAD_TREE/bin/io500-verify" \
 done
 
 for binary in "$PAYLOAD_TREE/bin/io500" \
-	"$PAYLOAD_TREE/bin/export-io500-results"; do
+	"$PAYLOAD_TREE/bin/export-io500-results" \
+	"$PAYLOAD_TREE/bin/system-sync-probe"; do
 	"${CROSS_COMPILE}readelf" -l "$binary" |
 		grep -q '/lib/ld-musl-riscv64.so.1' ||
 		die "$binary does not use the clean musl loader"
@@ -332,6 +357,7 @@ done
 for binary in "$PAYLOAD_TREE/bin/io500" "$PAYLOAD_TREE/bin/io500-verify" \
 	"$PAYLOAD_TREE/bin/mpiexec.hydra" "$PAYLOAD_TREE/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_TREE/bin/mpi-hello" "$PAYLOAD_TREE/bin/export-io500-results" \
+	"$PAYLOAD_TREE/bin/system-sync-probe" \
 	"$PAYLOAD_TREE/lib/libmpi.so" "$PAYLOAD_TREE/lib/libunwind.so" \
 	"$PAYLOAD_TREE/lib/libsyscall_intercept.so" \
 	"$PAYLOAD_TREE/lib/libbadfs_intercept.so"; do
@@ -344,6 +370,7 @@ require_needed "$PAYLOAD_TREE/lib/libbadfs_intercept.so" libunwind.so.1
 require_needed "$PAYLOAD_TREE/lib/libbadfs_intercept.so" libc.so
 require_needed "$PAYLOAD_TREE/lib/libunwind.so" libc.so
 require_needed "$PAYLOAD_TREE/bin/export-io500-results" libc.so
+require_needed "$PAYLOAD_TREE/bin/system-sync-probe" libc.so
 require_unwind_provider "$PAYLOAD_TREE/lib/libbadfs_intercept.so" \
 	"$PAYLOAD_TREE/lib/libunwind.so"
 for binary in "$PAYLOAD_TREE/bin/badfs-server.real" "$PAYLOAD_TREE/bin/badfs-bench.real"; do
@@ -397,6 +424,7 @@ python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--artifact "mpiexec=$PAYLOAD_ROOT/bin/mpiexec.hydra" \
 	--artifact "hydra_proxy=$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	--artifact "io500_result_export=$PAYLOAD_ROOT/bin/export-io500-results" \
+	--artifact "system_sync_probe=$PAYLOAD_ROOT/bin/system-sync-probe" \
 	--artifact "compiler_rt_builtins=$BUILTINS_ARCHIVE" \
 	--artifact "libunwind=$PAYLOAD_ROOT/lib/libunwind.so.1" \
 	--artifact "badfs_server=$PAYLOAD_ROOT/bin/badfs-server.real" \

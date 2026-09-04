@@ -65,6 +65,10 @@ client_count="$(cmdline_value io500.client_count=)" || fail missing-client-count
 serving_transport="$(cmdline_value io500.serving_transport=)" || fail missing-serving-transport
 cursor_token="$(cmdline_value c=)" || fail missing-cursor-mode
 cq_wait_token="$(cmdline_value w=)" || fail missing-cq-wait-mode
+durability_token="$(cmdline_value d=)" || fail missing-durability-profile
+payload_owner_token="$(cmdline_value u=)" || fail missing-payload-persistence-owner
+packed_segment_count="$(cmdline_value p=)" || fail missing-packed-segment-count
+close_batch_token="$(cmdline_value b=)" || fail missing-close-batch-mode
 observation_spec="$(cmdline_value o=)" || fail missing-observation-spec
 saved_ifs="$IFS"
 IFS=,
@@ -94,6 +98,33 @@ case "$cq_wait_token" in
 s) cq_wait_mode=timer_sleep ;;
 y) cq_wait_mode=cooperative_yield ;;
 *) fail invalid-cq-wait-mode ;;
+esac
+case "$durability_token" in
+d) durability_profile=d_before_v ;;
+n) durability_profile=coherent_seal_no_writeback ;;
+w) durability_profile=coherent_seal_needs_writeback ;;
+*) fail invalid-durability-profile ;;
+esac
+case "$payload_owner_token" in
+a) payload_persistence_owner=authority_bi_acquire; writer_persist_provider=msync ;;
+r) payload_persistence_owner=writer_receipt; writer_persist_provider=msync ;;
+R) payload_persistence_owner=writer_receipt; writer_persist_provider=riscv-zicbom-dax ;;
+h) payload_persistence_owner=placement_routed; writer_persist_provider=msync ;;
+H) payload_persistence_owner=placement_routed; writer_persist_provider=riscv-zicbom-dax ;;
+v) payload_persistence_owner=writer_before_visibility; writer_persist_provider=msync ;;
+*) fail invalid-payload-persistence-owner ;;
+esac
+case "$packed_segment_count" in ''|*[!0-9]*) fail invalid-packed-segment-count ;; esac
+[ "$packed_segment_count" -le 32767 ] || fail invalid-packed-segment-count
+if [ "$packed_segment_count" -eq 0 ]; then
+	packed_small_segments=0
+else
+	packed_small_segments=1
+fi
+case "$close_batch_token" in
+0) close_batch_mode=0 ;;
+1) close_batch_mode=1 ;;
+*) fail invalid-close-batch-mode ;;
 esac
 case "$observation_mode" in default|off|aggregate|sampled) ;; *) fail invalid-observation-mode ;; esac
 case "$observation_sample_shift" in ''|*[!0-9]*) fail invalid-observation-sample-shift ;; esac
@@ -156,6 +187,11 @@ printf '%s\n' "$server_count" > /run/server-count
 printf '%s\n' "$serving_transport" > /run/serving-transport
 printf '%s\n' "$cursor_mode" > /run/cursor-mode
 printf '%s\n' "$cq_wait_mode" > /run/cq-wait-mode
+printf '%s\n' "$durability_profile" > /run/durability-profile
+printf '%s\n' "$payload_persistence_owner" > /run/payload-persistence-owner
+printf '%s\n' "$packed_small_segments" > /run/packed-small-segments
+printf '%s\n' "$packed_segment_count" > /run/small-segment-count
+printf '%s\n' "$close_batch_mode" > /run/close-batch-mode
 printf '%s\n' "$client_count" > /run/client-count
 
 # Observation arenas are process-local DRAM snapshots.  Configuration is
@@ -208,9 +244,29 @@ dump_observation()
 		fi
 		set -- $(/bin/busybox sha256sum "$observation_file")
 		observation_sha256="$1"
-		echo "LEGOFS_OBSERVATION_BEGIN role=$expected_file_role endpoint=$expected_endpoint file=$observation_base bytes=$observation_bytes sha256=$observation_sha256"
-		/bin/busybox base64 -w 76 "$observation_file"
+		compressed_file="$observation_file.export.gz"
+		/bin/busybox rm -f "$compressed_file"
+		if ! /bin/busybox gzip -1 -c "$observation_file" > "$compressed_file"; then
+			echo "LEGOFS_IO500_OBSERVATION_EXPORT_ERROR role=$expected_file_role endpoint=$expected_endpoint reason=gzip-failed file=$observation_base"
+			/bin/busybox rm -f "$compressed_file"
+			continue
+		fi
+		compressed_bytes="$(/bin/busybox wc -c < "$compressed_file")" || continue
+		case "$compressed_bytes" in ''|*[!0-9]*) continue ;; esac
+		set -- $(/bin/busybox sha256sum "$compressed_file")
+		compressed_sha256="$1"
+		encoded_chars=$(( ((compressed_bytes + 2) / 3) * 4 ))
+		observation_chunks=$(( (encoded_chars + 1023) / 1024 ))
+		echo "LEGOFS_OBSERVATION_BEGIN role=$expected_file_role endpoint=$expected_endpoint file=$observation_base bytes=$observation_bytes sha256=$observation_sha256 encoding=gzip-base64-v1 compressed_bytes=$compressed_bytes compressed_sha256=$compressed_sha256 chunks=$observation_chunks"
+		chunk_sequence=0
+		/bin/busybox base64 -w 1024 "$compressed_file" |
+		while IFS= read -r observation_chunk; do
+			printf 'LEGOFS_OBSERVATION_CHUNK seq=%s data=%s\n' "$chunk_sequence" "$observation_chunk"
+			printf 'LEGOFS_OBSERVATION_CHUNK seq=%s data=%s\n' "$chunk_sequence" "$observation_chunk"
+			chunk_sequence=$((chunk_sequence + 1))
+		done
 		echo "LEGOFS_OBSERVATION_END role=$expected_file_role endpoint=$expected_endpoint file=$observation_base"
+		/bin/busybox rm -f "$compressed_file"
 		file_count=$((file_count + 1))
 	done
 	if [ "$file_count" -eq 0 ]; then
@@ -282,6 +338,18 @@ export BADFS_FABRIC_STAGED_IO=0
 export BADFS_DISABLE_FABRIC_MMAP=0
 export BADFS_LIFECYCLE_COHERENT_PUBLICATION=1
 export BADFS_LIFECYCLE_COHERENT_READ_CACHE=1
+export BADFS_LIFECYCLE_PACKED_SMALL_SEGMENTS="$packed_small_segments"
+export BADFS_LIFECYCLE_SMALL_SEGMENT_COUNT="$packed_segment_count"
+export BADFS_LIFECYCLE_DURABILITY_PROFILE="$durability_profile"
+export BADFS_PAYLOAD_PERSISTENCE_OWNER="$payload_persistence_owner"
+export BADFS_WRITER_PERSIST_PROVIDER="$writer_persist_provider"
+export BADFS_START_MODE=genesis
+if [ "$packed_small_segments" = 1 ]; then
+	export BADFS_LIFECYCLE_FRESH_PROVISIONED=functional_model_only
+	export BADFS_LIFECYCLE_PROVISIONING_GENERATION=1
+else
+	unset BADFS_LIFECYCLE_FRESH_PROVISIONED BADFS_LIFECYCLE_PROVISIONING_GENERATION
+fi
 export BADFS_LIFECYCLE_READ_CACHE_ENTRIES=2048
 export BADFS_LIFECYCLE_WRITE_ARENA_SLOTS=64
 export BADFS_CLIENT_ENDPOINT_ID="$index"
@@ -365,6 +433,7 @@ if [ "$role" = server ]; then
 					echo "LEGOFS_IO500_SERVER_OLD_EXIT index=$index old_pid=$old_pid rc=$old_rc"
 					export BADFS_CLUSTER_GENERATION="$target_generation"
 					export BADFS_START_MODE=clean_restart
+					unset BADFS_LIFECYCLE_FRESH_PROVISIONED BADFS_LIFECYCLE_PROVISIONING_GENERATION
 					/payload/bin/badfs-server &
 					server_pid=$!
 					server_generation="$target_generation"
@@ -393,6 +462,7 @@ if [ "$role" = server ]; then
 					if (
 						export BADFS_CLUSTER_GENERATION="$target_generation"
 						export BADFS_START_MODE=clean_restart
+						unset BADFS_LIFECYCLE_FRESH_PROVISIONED BADFS_LIFECYCLE_PROVISIONING_GENERATION
 						export BADFS_SERVER_ADDR=127.0.0.1:3346
 						/payload/bin/badfs-server
 					); then

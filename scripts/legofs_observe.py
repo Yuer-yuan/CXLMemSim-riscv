@@ -15,8 +15,8 @@ import sys
 
 MAGIC = b"LEGOFSO1"
 SCHEMA_MAJOR = 1
-SCHEMA_MINOR = 0
-SCHEMA_DIGEST = "b5640c61c8e38775"
+SCHEMA_MINOR = 2
+SCHEMA_DIGEST = "942b9f1d769746ec"
 HEADER_BYTES = 4096
 EVENT_RECORD_BYTES = 64
 IDENTITY_BASE = 4096
@@ -31,7 +31,7 @@ METRIC_RECORD_BYTES = METRIC_HEADER_BYTES + HISTOGRAM_BINS * 2
 COMPACT_METRIC_BYTES = 64
 WORKLOAD_METRIC_BYTES = METRIC_SLOTS * METRIC_RECORD_BYTES
 DIAGNOSTIC_METRIC_BYTES = METRIC_SLOTS * COMPACT_METRIC_BYTES
-STAGE_COUNT = 58
+STAGE_COUNT = 61
 
 COMPONENTS = (
     "syscall_intercept",
@@ -70,7 +70,8 @@ STAGES = (
     "persistence_provider", "persistence_barrier",
     "startup_bootstrap", "startup_mapping", "startup_authority_open",
     "startup_namespace_recovery", "startup_control_open", "startup_listener_ready",
-    "startup_lane_provision",
+    "startup_lane_provision", "transport_remote_wait",
+    "authority_request_service", "completion_publication_wait",
 )
 STAGE_COMPONENTS = (
     ("syscall_intercept",) * 2
@@ -84,9 +85,12 @@ STAGE_COMPONENTS = (
     + ("data_arena_extent",) * 8
     + ("persistence",) * 5
     + ("startup_recovery",) * 7
+    + ("cxl_client_transport",)
+    + ("authority_progress",) * 2
 )
 ROLES = {1: "client-rank", 2: "server", 3: "diagnostic-client"}
 MODES = {0: "off", 1: "aggregate", 2: "sampled"}
+REQUEST_EDGES = ("submit", "observe", "publish", "consume")
 
 assert len(STAGES) == STAGE_COUNT
 assert len(STAGE_COMPONENTS) == STAGE_COUNT
@@ -161,6 +165,16 @@ def decode_header(data: bytes) -> dict:
         "exec_incarnation": _u64(data, IDENTITY_BASE + 16),
         "serving_generation": _u64(data, IDENTITY_BASE + 24),
     }
+    request_digests = {}
+    for edge_index, edge in enumerate(REQUEST_EDGES):
+        base = 256 + edge_index * 40
+        request_digests[edge] = {
+            "count": _u64(data, base),
+            "xor0": _u64(data, base + 8),
+            "xor1": _u64(data, base + 16),
+            "sum0": _u64(data, base + 24),
+            "sum1": _u64(data, base + 32),
+        }
     header = {
         "schema_major": major,
         "schema_minor": minor,
@@ -202,6 +216,7 @@ def decode_header(data: bytes) -> dict:
         "initialization_error": _u64(data, 232),
         "export_error": _u64(data, 240),
         "clock_reads": _u64(data, 248),
+        "request_digests": request_digests,
         "identity": identity,
     }
     if (
@@ -485,6 +500,165 @@ def decode_arena(path: pathlib.Path) -> dict:
     }
 
 
+def _combined_stage(decoded: list[dict], stage: str, role: str | None = None) -> dict:
+    combined = {}
+    for arena in decoded:
+        if role is not None and arena["header"]["role"] != role:
+            continue
+        for row in arena["stage_matrix"]:
+            if row["stage"] != stage:
+                continue
+            add_metric(combined, {
+                name: value
+                for name, value in row.items()
+                if name not in ("component", "stage")
+            })
+    return combined
+
+
+def _combined_request_digests(decoded: list[dict]) -> dict:
+    u64_mask = (1 << 64) - 1
+    combined = {
+        edge: {"count": 0, "xor0": 0, "xor1": 0, "sum0": 0, "sum1": 0}
+        for edge in REQUEST_EDGES
+    }
+    for arena in decoded:
+        for edge, digest in arena["header"]["request_digests"].items():
+            target = combined[edge]
+            target["count"] += digest["count"]
+            target["xor0"] ^= digest["xor0"]
+            target["xor1"] ^= digest["xor1"]
+            # Each process updates these fields with wrapping u64 addition.
+            # Preserve the same algebra while combining process-local arenas;
+            # an unbounded Python sum would make an equal request multiset look
+            # different merely because it was split across client processes.
+            target["sum0"] = (target["sum0"] + digest["sum0"]) & u64_mask
+            target["sum1"] = (target["sum1"] + digest["sum1"]) & u64_mask
+    return combined
+
+
+def transport_ledger(decoded: list[dict]) -> dict:
+    digests = _combined_request_digests(decoded)
+    digest_reference = digests["submit"]
+    digest_match = all(digests[edge] == digest_reference for edge in REQUEST_EDGES)
+    remote = _combined_stage(decoded, "transport_remote_wait", "client-rank")
+    server = _combined_stage(decoded, "authority_request_service", "server")
+    coverage = "instrumented_at_o2" if remote.get("calls", 0) else "not_reached"
+    reasons = []
+    if coverage == "instrumented_at_o2" and not digest_match:
+        reasons.append("request_multiset_mismatch")
+    remote_samples = int(remote.get("duration_samples", 0))
+    server_samples = int(server.get("duration_samples", 0))
+    if coverage == "instrumented_at_o2" and remote_samples != server_samples:
+        reasons.append("correlated_duration_sample_count_mismatch")
+    if coverage == "instrumented_at_o2" and remote_samples == 0:
+        reasons.append("no_correlated_duration_samples")
+
+    remote_ns = int(remote.get("sampled_duration_sum_ns", 0))
+    server_ns = int(server.get("sampled_duration_sum_ns", 0))
+    handoff_ns = remote_ns - server_ns
+    if coverage == "instrumented_at_o2" and handoff_ns < 0:
+        reasons.append("negative_transport_handoff")
+
+    exclusive_stage_names = (
+        "admission",
+        "scheduler_wait",
+        "dispatcher_decode",
+        "dispatcher_route",
+        "dispatcher_encode",
+        "completion_publication_wait",
+        "cqe_publish",
+    )
+    server_children = {
+        stage: _combined_stage(decoded, stage, "server")
+        for stage in exclusive_stage_names
+    }
+    server_exclusive_ns = sum(
+        int(metric.get("sampled_duration_sum_ns", 0))
+        for metric in server_children.values()
+    )
+    server_unaccounted_ns = server_ns - server_exclusive_ns
+    if coverage == "instrumented_at_o2" and server_unaccounted_ns < 0:
+        reasons.append("negative_authority_unaccounted")
+    server_unaccounted_share = (
+        server_unaccounted_ns / server_ns if server_ns > 0 else None
+    )
+
+    active_poll = _combined_stage(decoded, "cq_active_poll", "client-rank")
+    cq_sleep = _combined_stage(decoded, "cq_sleep", "client-rank")
+    cq_detection = _combined_stage(decoded, "cq_detection_bound", "client-rank")
+    sq_detection = _combined_stage(decoded, "sq_detection_bound", "server")
+    client_exclusive_ns = sum(
+        int(metric.get("sampled_duration_sum_ns", 0))
+        for metric in (active_poll, cq_sleep)
+    )
+    client_unaccounted_ns = remote_ns - client_exclusive_ns
+    if coverage == "instrumented_at_o2" and client_unaccounted_ns < 0:
+        reasons.append("negative_client_wait_unaccounted")
+    client_unaccounted_share = (
+        client_unaccounted_ns / remote_ns if remote_ns > 0 else None
+    )
+    return {
+        "schema_version": "legofs.observation.transport-ledger.v1",
+        "coverage": coverage,
+        "observation_valid": not reasons,
+        "validity_reasons": reasons,
+        "request_digests": digests,
+        "request_multiset_match": digest_match,
+        "correlated_duration_samples": remote_samples,
+        "client_remote_wait_ns": remote_ns,
+        "correlated_server_request_ns": server_ns,
+        "transport_handoff_ns": handoff_ns if handoff_ns >= 0 else None,
+        "remaining_unexplained_ns": (
+            max(0, server_unaccounted_ns) if handoff_ns >= 0 else None
+        ),
+        "shares_of_client_remote_wait": {
+            "server_request": server_ns / remote_ns if remote_ns > 0 else None,
+            "transport_handoff": handoff_ns / remote_ns
+            if remote_ns > 0 and handoff_ns >= 0 else None,
+            "server_unaccounted": server_unaccounted_ns / remote_ns
+            if remote_ns > 0 and server_unaccounted_ns >= 0 else None,
+        },
+        "authority_exclusive_ledger": {
+            "parent_ns": server_ns,
+            "children_ns": server_exclusive_ns,
+            "unaccounted_ns": server_unaccounted_ns,
+            "unaccounted_share": server_unaccounted_share,
+            "within_five_percent": (
+                server_unaccounted_share is not None
+                and 0 <= server_unaccounted_share <= 0.05
+            ),
+            "stages": {
+                stage: public_metric(metric) for stage, metric in server_children.items()
+            },
+        },
+        "client_wait_exclusive_ledger": {
+            "parent_ns": remote_ns,
+            "children_ns": client_exclusive_ns,
+            "unaccounted_ns": client_unaccounted_ns,
+            "unaccounted_share": client_unaccounted_share,
+            "within_five_percent": (
+                client_unaccounted_share is not None
+                and 0 <= client_unaccounted_share <= 0.05
+            ),
+            "stages": {
+                "cq_active_poll": public_metric(active_poll),
+                "cq_sleep": public_metric(cq_sleep),
+            },
+        },
+        "client_wait_diagnostics_non_additive": {
+            "sq_detection_upper_bound": public_metric(sq_detection),
+            "cq_detection_upper_bound": public_metric(cq_detection),
+        },
+        "limitations": [
+            "transport_handoff is a residual of same-request duration sums, not a one-way latency estimate",
+            "SQ/CQ detection bounds can precede publication and are non-additive diagnostics",
+            "client active-poll and sleep are an exclusive local projection but overlap authority service",
+            "phase attribution requires O4 sampled causal events",
+        ],
+    }
+
+
 def component_summary(decoded: list[dict], config: dict | None = None) -> dict:
     combined = {component: {} for component in COMPONENTS}
     for arena in decoded:
@@ -499,13 +673,19 @@ def component_summary(decoded: list[dict], config: dict | None = None) -> dict:
     runtime_enabled = bool(decoded)
     components = []
     for component in COMPONENTS:
-        instrumented = component in (
+        o1_instrumented = component in (
             "syscall_intercept", "client_semantics", "startup_recovery"
         )
+        o2_instrumented = component in (
+            "cxl_client_transport", "authority_progress", "dispatcher_codec"
+        )
+        instrumented = o1_instrumented or o2_instrumented
         metric = combined[component]
         if not runtime_enabled:
             coverage = "observation_off"
-        elif instrumented:
+        elif o2_instrumented:
+            coverage = "instrumented_at_o2"
+        elif o1_instrumented:
             coverage = "instrumented_at_o1"
         else:
             coverage = "not_instrumented_at_o1"
@@ -532,7 +712,7 @@ def component_summary(decoded: list[dict], config: dict | None = None) -> dict:
         "arena_count": len(decoded),
         "components": components,
         "limitations": [
-            "O1 instruments syscall roots and server startup only",
+            "O2 instruments syscall roots, startup and correlated CXL transport",
             "component calls count completed scopes; use stage metrics for stage counts",
             "sampled duration sums are not scaled into unsampled wall time",
             "parent durations are non-additive",
@@ -547,6 +727,11 @@ def analyze_observation_files(
     output_dir.mkdir(parents=True, exist_ok=True)
     decoded = [decode_arena(pathlib.Path(path)) for path in files]
     summary = component_summary(decoded, config)
+    ledger = transport_ledger(decoded)
+    if ledger["coverage"] == "instrumented_at_o2":
+        summary["observation_valid"] = (
+            summary["observation_valid"] and ledger["observation_valid"]
+        )
     atomic_json(output_dir / "decoded.json", {
         "schema_version": "legofs.observation.decoded.v1",
         "arenas": decoded,
@@ -649,10 +834,12 @@ def analyze_observation_files(
                         "errors": row.get("errors", 0),
                         "retries": row.get("retries", 0),
                     })
+    atomic_json(output_dir / "transport-ledger.json", ledger)
     atomic_json(output_dir / "critical-path.json", {
         "schema_version": "legofs.observation.critical-path.v1",
-        "coverage": "not_instrumented_at_o1",
-        "reason": "request linkage and exclusive ledgers enter at O2/O4",
+        "coverage": ledger["coverage"],
+        "transport": ledger,
+        "remaining_scope": "syscall/metadata/persistence closure enters at O3/O4",
     })
     atomic_json(output_dir / "state-transitions.json", {
         "schema_version": "legofs.observation.state-transitions.v1",
@@ -665,8 +852,19 @@ def analyze_observation_files(
         f"Observation valid: `{str(summary['observation_valid']).lower()}`",
         f"Decoded arenas: `{len(decoded)}`",
         "",
-        "O1 covers syscall roots and server startup. Transport, metadata, lifecycle, arena,",
-        "persistence, causal closure and state transitions remain explicitly uninstrumented.",
+        "O2 closes correlated CXL request transport and authority service. Metadata, lifecycle,",
+        "arena, persistence and exact phase attribution remain explicitly uninstrumented.",
+        "",
+        f"Correlated request samples: `{ledger['correlated_duration_samples']}`",
+        f"Client remote wait: `{ledger['client_remote_wait_ns']}` ns",
+        f"Correlated server service: `{ledger['correlated_server_request_ns']}` ns",
+        f"Transport handoff residual: `{ledger['transport_handoff_ns']}` ns",
+        f"Authority unaccounted: `{ledger['authority_exclusive_ledger']['unaccounted_ns']}` ns",
+        f"Client wait unaccounted: `{ledger['client_wait_exclusive_ledger']['unaccounted_ns']}` ns",
+        "SQ detection upper-bound sum: "
+        f"`{ledger['client_wait_diagnostics_non_additive']['sq_detection_upper_bound'].get('sampled_duration_sum_ns', 0)}` ns",
+        "CQ detection upper-bound sum: "
+        f"`{ledger['client_wait_diagnostics_non_additive']['cq_detection_upper_bound'].get('sampled_duration_sum_ns', 0)}` ns",
         "",
     ]
     (output_dir / "report.md").write_text("\n".join(report), encoding="utf-8")
@@ -677,6 +875,7 @@ def analyze_observation_files(
         "semantic_component_matrix": "observation/semantic-component-matrix.csv",
         "stage_metrics": "observation/stage-metrics.csv",
         "critical_path": "observation/critical-path.json",
+        "transport_ledger": "observation/transport-ledger.json",
         "state_transitions": "observation/state-transitions.json",
         "report": "observation/report.md",
     }
@@ -839,6 +1038,8 @@ def _candidate_path_counters(result: dict) -> dict:
         "fused_open_fallbacks": 0,
         "fused_close_attempts": 0,
         "fused_close_snapshot_releases": 0,
+        "batched_close_commands": 0,
+        "batched_close_items": 0,
     }
     opcodes = {}
     for summary in result.get("posix_path_summaries", []):
@@ -848,7 +1049,106 @@ def _candidate_path_counters(result: dict) -> dict:
             for opcode, count in evidence.get("dispatches_by_opcode", {}).items():
                 opcodes[opcode] = opcodes.get(opcode, 0) + count
     totals["dispatches_by_opcode"] = dict(sorted(opcodes.items()))
+    packed = result.get("legofs_timing", {}).get("packed_small_segment")
+    if isinstance(packed, dict):
+        for name, value in packed.items():
+            if isinstance(value, int):
+                totals[name] = value
     return totals
+
+
+def _validate_packed_candidate_mechanism(result: dict) -> None:
+    layout = result.get("topology", {}).get("lifecycle_pool_layout")
+    if layout not in ("v6-variable-extents", "v7-packed-small-segments"):
+        return
+    packed = result.get("legofs_timing", {}).get("packed_small_segment")
+    required = (
+        "backend_fresh_format_scan_bytes",
+        "backend_publication_slots_reset",
+        "startup_small_runtime_segments",
+        "startup_small_runtime_cells",
+        "small_segment_claims",
+        "small_segment_claim_persist_ns",
+        "small_cell_grants",
+        "small_cell_commits",
+        "small_cell_payload_bytes",
+        "small_cell_payload_persist_bytes",
+        "small_cell_allocator_persist_barriers",
+        "legacy_small_arena_reserve_calls",
+        "legacy_small_arena_reserve_ns",
+        "client_cache_hits",
+        "client_dynamic_mmap_calls",
+        "client_dynamic_mmap_ns",
+        "client_mapped_owner_segments",
+        "client_protection_calls",
+        "client_protection_ns",
+    )
+    if not isinstance(packed, dict) or any(
+        not isinstance(packed.get(name), int) or packed[name] < 0
+        for name in required
+    ):
+        raise ValueError("paired input lacks packed-small-segment mechanism evidence")
+
+    if layout == "v7-packed-small-segments":
+        if (
+            packed["backend_fresh_format_scan_bytes"] != 0
+            or packed["backend_publication_slots_reset"] != 0
+            or packed["startup_small_runtime_segments"] != 0
+            or packed["startup_small_runtime_cells"] != 0
+            or packed["small_segment_claims"] <= 0
+            or packed["small_segment_claim_persist_ns"] <= 0
+            or packed["small_cell_grants"] <= 0
+            or packed["small_cell_commits"] <= 0
+            or packed["small_cell_commits"] > packed["small_cell_grants"]
+            or packed["small_cell_payload_bytes"] <= 0
+            or packed["small_cell_payload_persist_bytes"]
+            > packed["small_cell_payload_bytes"]
+            or packed["small_cell_allocator_persist_barriers"] != 0
+            or packed["legacy_small_arena_reserve_calls"] != 0
+            or packed["legacy_small_arena_reserve_ns"] != 0
+            or packed["client_cache_hits"] <= 0
+            or packed["client_dynamic_mmap_calls"] <= 0
+            or packed["client_dynamic_mmap_calls"]
+            != packed["client_mapped_owner_segments"]
+            or packed["client_dynamic_mmap_ns"] <= 0
+            or packed["client_protection_calls"] <= 0
+            or packed["client_protection_ns"] <= 0
+        ):
+            raise ValueError("paired input did not reach the packed-small-segment mechanism")
+        writer_bytes = result.get("lifecycle_inspection", {}).get("audit", {}).get(
+            "writer_persisted_direct_bytes", 0
+        )
+        if (
+            not isinstance(writer_bytes, int)
+            or writer_bytes < 0
+            or packed["small_cell_payload_persist_bytes"] + writer_bytes
+            < packed["small_cell_payload_bytes"]
+        ):
+            raise ValueError(
+                "paired input lacks packed-small-segment payload durability evidence"
+            )
+    else:
+        packed_only = (
+            "small_segment_claims",
+            "small_segment_claim_persist_ns",
+            "small_cell_grants",
+            "small_cell_commits",
+            "small_cell_payload_bytes",
+            "small_cell_payload_persist_bytes",
+            "small_cell_allocator_persist_barriers",
+            "client_cache_hits",
+            "client_dynamic_mmap_calls",
+            "client_dynamic_mmap_ns",
+            "client_mapped_owner_segments",
+            "client_protection_calls",
+            "client_protection_ns",
+        )
+        if (
+            any(packed[name] != 0 for name in packed_only)
+            or packed["legacy_small_arena_reserve_calls"] <= 0
+            or packed["legacy_small_arena_reserve_ns"] <= 0
+        ):
+            raise ValueError("paired v6 input did not reach the legacy small-object path")
 
 
 def _candidate_platform_fingerprint(result: dict) -> dict:
@@ -900,17 +1200,41 @@ def _audit_candidate_result(result: dict) -> dict:
 
     lifecycle = result.get("lifecycle_inspection", {})
     audit = lifecycle.get("audit", {})
-    for name in ("pending_operations", "pending_arena_slots", "active_read_leases"):
+    for name in (
+        "pending_operations",
+        "pending_arena_slots",
+        "active_read_leases",
+        "pending_payload_dependencies",
+    ):
         if audit.get(name) != 0:
             raise ValueError(f"paired input has nonzero lifecycle {name}")
     visibility = audit.get("visibility_durability", {})
     if visibility.get("published_v") != visibility.get("durable_d"):
         raise ValueError("paired input does not close V=D")
     direct_items = audit.get("direct_write_commit_items", 0)
-    if direct_items and audit.get("writer_persisted_direct_items", 0) < direct_items:
+    persistence_items = (
+        audit.get("writer_persisted_direct_items", 0)
+        + audit.get("host_persist_receipts_accepted", 0)
+    )
+    provider_payload = (
+        audit.get("provider_payload_barriers", 0) > 0
+        and audit.get("provider_payload_bytes", 0) > 0
+    )
+    authority_payload = (
+        audit.get("authority_coherent_acquire_jobs", 0) > 0
+        and audit.get("authority_payload_persist_jobs", 0) > 0
+        and audit.get("authority_coherent_acquire_bytes", 0)
+        == audit.get("authority_payload_persist_bytes", 0)
+        > 0
+    )
+    if direct_items and persistence_items < direct_items and not (
+        provider_payload or authority_payload
+    ):
         raise ValueError("paired input lacks direct-write persistence evidence")
     if result.get("cleanup", {}).get("owned_processes_remaining"):
         raise ValueError("paired input leaves owned processes running")
+
+    _validate_packed_candidate_mechanism(result)
 
     normalized_topology = dict(result.get("topology", {}))
     normalized_topology.pop("legofs_open_mode", None)
@@ -927,6 +1251,345 @@ def _audit_candidate_result(result: dict) -> dict:
         "path_counters": _candidate_path_counters(result),
         "functional_model_only": result.get("functional_model_only"),
         "physical_hardware_evidence": result.get("physical_hardware_evidence"),
+    }
+
+
+def _timing_integer(value: dict, path: str, *, positive: bool = False) -> int:
+    number = _nested_number(value, path)
+    if not number.is_integer():
+        raise ValueError(f"timing counter {path!r} is not an integer")
+    number = int(number)
+    if number < 0 or (positive and number == 0):
+        qualifier = "positive" if positive else "nonnegative"
+        raise ValueError(f"timing counter {path!r} must be {qualifier}")
+    return number
+
+
+def _closed_timing_layer(parent_ns: int, children: dict[str, int], name: str) -> dict:
+    if parent_ns <= 0:
+        raise ValueError(f"{name} timing parent must be positive")
+    if any(value < 0 for value in children.values()):
+        raise ValueError(f"{name} timing child must be nonnegative")
+    children_ns = sum(children.values())
+    remainder_ns = parent_ns - children_ns
+    if remainder_ns < 0:
+        raise ValueError(f"{name} timing children exceed their parent")
+    arithmetic_closed = children_ns + remainder_ns == parent_ns
+    return {
+        "parent_ns": parent_ns,
+        "children": children,
+        "children_ns": children_ns,
+        "remainder_ns": remainder_ns,
+        "remainder_share": remainder_ns / parent_ns,
+        "arithmetic_closed": arithmetic_closed,
+        "closed": arithmetic_closed,
+        "within_five_percent": remainder_ns / parent_ns <= 0.05,
+    }
+
+
+def result_time_ledger(result: dict) -> dict:
+    """Build additive ledgers without summing nested timing domains."""
+    rank_wall_ns = _timing_integer(
+        result, "legofs_timing.aggregate_rank_wall_ns", positive=True
+    )
+    client_timed_ns = _timing_integer(
+        result, "legofs_timing.client_timed_intervals_ns"
+    )
+    client_children = {
+        name: _timing_integer(
+            result, f"legofs_timing.client_timed_intervals.{name}"
+        )
+        for name in (
+            "metadata_rpc_wait_ns",
+            "read_control_rpc_wait_ns",
+            "write_control_rpc_wait_ns",
+        )
+    }
+    client_control = _closed_timing_layer(
+        client_timed_ns, client_children, "client control"
+    )
+    rank_wall = _closed_timing_layer(
+        rank_wall_ns,
+        {"client_timed_intervals_ns": client_timed_ns},
+        "aggregate rank wall",
+    )
+
+    transport_calls = _timing_integer(
+        result, "legofs_timing.transport_client.calls", positive=True
+    )
+    consumed = _timing_integer(
+        result, "legofs_timing.transport_authority.sqe_consumed", positive=True
+    )
+    published = _timing_integer(
+        result, "legofs_timing.transport_authority.cqe_published", positive=True
+    )
+    if transport_calls != consumed or consumed != published:
+        raise ValueError("transport timing call counts do not close")
+    transport_parent_ns = _timing_integer(
+        result, "legofs_timing.transport_client.cq_wait_ns", positive=True
+    )
+    transport_children = {
+        name: _timing_integer(
+            result, f"legofs_timing.transport_authority.{name}"
+        )
+        for name in (
+            "authority_queue_wait_ns",
+            "successful_request_poll_ns",
+            "dispatcher_backend_ns",
+            "completion_publication_wait_ns",
+            "cqe_publish_ns",
+        )
+    }
+    transport = _closed_timing_layer(
+        transport_parent_ns, transport_children, "transport CQ envelope"
+    )
+    transport["calls"] = transport_calls
+    transport["remainder_semantics"] = (
+        "request/completion handoff plus uninstrumented authority work"
+    )
+
+    arena_calls = _timing_integer(
+        result, "legofs_timing.arena_acquire.arena_acquire_calls"
+    )
+    arena_parent_ns = _timing_integer(
+        result, "legofs_timing.arena_acquire.arena_acquire_total_ns"
+    )
+    if arena_calls <= 0 or arena_parent_ns <= 0:
+        raise ValueError("candidate timing ledger requires a reached arena path")
+    arena_children = {}
+    arena = result["legofs_timing"]["arena_acquire"]
+    for name in (
+        "arena_acquire_lock_wait_ns",
+        "arena_acquire_state_clone_ns",
+        "arena_acquire_allocation_plan_ns",
+        "arena_acquire_backend_reserve_ns",
+        "arena_acquire_state_build_ns",
+        "arena_acquire_state_validate_ns",
+        "arena_acquire_grant_install_ns",
+        "arena_acquire_state_persist_ns",
+        "arena_acquire_trace_ns",
+    ):
+        value = arena.get(name, 0)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(f"arena timing counter {name!r} must be nonnegative")
+        arena_children[name] = value
+    arena_layer = _closed_timing_layer(
+        arena_parent_ns, arena_children, "arena acquire"
+    )
+    arena_layer["calls"] = arena_calls
+
+    direct = result.get("legofs_timing", {}).get("direct_write")
+    if not isinstance(direct, dict):
+        raise ValueError("candidate timing ledger lacks direct-write timing")
+    direct_groups = direct.get("direct_write_commit_groups")
+    direct_items = direct.get("direct_write_commit_items")
+    if (
+        not isinstance(direct_groups, int)
+        or direct_groups <= 0
+        or not isinstance(direct_items, int)
+        or direct_items <= 0
+    ):
+        raise ValueError("candidate timing ledger requires a reached direct-write path")
+    direct_parent_ns = direct.get("direct_write_total_ns")
+    if not isinstance(direct_parent_ns, int) or direct_parent_ns <= 0:
+        raise ValueError("direct-write timing parent must be positive")
+    legacy_direct_parent = result.get("legofs_timing", {}).get(
+        "server_direct_write_commit_ns"
+    )
+    if (
+        legacy_direct_parent is not None
+        and legacy_direct_parent != direct_parent_ns
+    ):
+        raise ValueError("direct-write timing parents disagree")
+    direct_children = {}
+    for name in (
+        "direct_write_prepare_ns",
+        "direct_write_payload_persist_ns",
+        "direct_write_state_build_ns",
+        "direct_write_state_persist_ns",
+        "direct_write_publish_ns",
+        "direct_write_trace_ns",
+    ):
+        value = direct.get(name)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(f"direct-write timing counter {name!r} must be nonnegative")
+        direct_children[name] = value
+    direct_layer = _closed_timing_layer(
+        direct_parent_ns, direct_children, "direct write"
+    )
+    direct_layer["groups"] = direct_groups
+    direct_layer["items"] = direct_items
+
+    persistence = result.get("legofs_timing", {}).get("persistence", {})
+    authority_persistence = None
+    if persistence.get("authority_coherent_acquire_jobs", 0) > 0:
+        authority_parent_ns = persistence.get(
+            "deferred_state_dependency_close_ns", 0
+        )
+        authority_children = {
+            "authority_coherent_acquire_ns": persistence.get(
+                "authority_coherent_acquire_ns", 0
+            ),
+            "authority_payload_persist_ns": persistence.get(
+                "authority_payload_persist_ns", 0
+            ),
+        }
+        if not isinstance(authority_parent_ns, int) or any(
+            not isinstance(value, int) for value in authority_children.values()
+        ):
+            raise ValueError("authority persistence timing counters must be integers")
+        authority_persistence = _closed_timing_layer(
+            authority_parent_ns,
+            authority_children,
+            "authority persistence dependency closure",
+        )
+        authority_persistence["acquire_jobs"] = persistence.get(
+            "authority_coherent_acquire_jobs"
+        )
+        authority_persistence["persist_jobs"] = persistence.get(
+            "authority_payload_persist_jobs"
+        )
+
+    return {
+        "schema_version": "legofs.performance.time-ledger.v1",
+        "rank_wall": rank_wall,
+        "client_control": client_control,
+        "transport": transport,
+        "arena": arena_layer,
+        "direct_write": direct_layer,
+        "authority_persistence": authority_persistence,
+        "nested_domains": {
+            "transport_is_nested_in_client_control": True,
+            "arena_is_nested_in_transport_authority": True,
+            "direct_write_is_nested_in_transport_authority": True,
+            "persistence_counters_span_arena_and_direct_write": True,
+            "authority_persistence_is_nested_in_background_lifecycle": True,
+        },
+        "interpretation": (
+            "Only children within one named layer are additive. Transport, arena, "
+            "direct-write and persistence are nested diagnostic layers and are never summed "
+            "with aggregate rank wall or client control."
+        ),
+    }
+
+
+def paired_time_closure(baseline: dict, candidate: dict, pair: int) -> dict:
+    baseline_ledger = result_time_ledger(baseline)
+    candidate_ledger = result_time_ledger(candidate)
+    baseline_wall = baseline_ledger["rank_wall"]
+    candidate_wall = candidate_ledger["rank_wall"]
+    baseline_client = baseline_ledger["client_control"]["parent_ns"]
+    candidate_client = candidate_ledger["client_control"]["parent_ns"]
+    wall_delta_ns = baseline_wall["parent_ns"] - candidate_wall["parent_ns"]
+    client_delta_ns = baseline_client - candidate_client
+    remainder_delta_ns = (
+        baseline_wall["remainder_ns"] - candidate_wall["remainder_ns"]
+    )
+    delta_error_ns = wall_delta_ns - client_delta_ns - remainder_delta_ns
+    if delta_error_ns != 0:
+        raise ValueError("paired aggregate-rank wall delta does not close")
+
+    client_category_deltas = {
+        name: baseline_ledger["client_control"]["children"][name]
+        - candidate_ledger["client_control"]["children"][name]
+        for name in baseline_ledger["client_control"]["children"]
+    }
+    client_category_remainder_delta_ns = (
+        baseline_ledger["client_control"]["remainder_ns"]
+        - candidate_ledger["client_control"]["remainder_ns"]
+    )
+    if (
+        sum(client_category_deltas.values())
+        + client_category_remainder_delta_ns
+        != client_delta_ns
+    ):
+        raise ValueError("paired client-control delta does not close")
+
+    phase_deltas = {}
+    baseline_phases = {
+        phase.get("name"): phase
+        for phase in baseline.get("io500", {}).get("metrics", {}).get("phases", [])
+    }
+    for phase in candidate.get("io500", {}).get("metrics", {}).get("phases", []):
+        name = phase.get("name")
+        before = baseline_phases.get(name)
+        if (
+            before is not None
+            and before.get("seconds", 0) > 0
+            and phase.get("seconds", 0) > 0
+        ):
+            phase_deltas[name] = {
+                "baseline_elapsed_s": before["seconds"],
+                "candidate_elapsed_s": phase["seconds"],
+                "elapsed_reduction_s": before["seconds"] - phase["seconds"],
+            }
+
+    nested_deltas = {
+        "transport_cq_wait": (
+            baseline_ledger["transport"]["parent_ns"]
+            - candidate_ledger["transport"]["parent_ns"]
+        ),
+        "arena_acquire_total": (
+            baseline_ledger["arena"]["parent_ns"]
+            - candidate_ledger["arena"]["parent_ns"]
+        ),
+        "arena_backend_reserve": (
+            baseline_ledger["arena"]["children"][
+                "arena_acquire_backend_reserve_ns"
+            ]
+            - candidate_ledger["arena"]["children"][
+                "arena_acquire_backend_reserve_ns"
+            ]
+        ),
+        "direct_write_total": (
+            baseline_ledger["direct_write"]["parent_ns"]
+            - candidate_ledger["direct_write"]["parent_ns"]
+        ),
+    }
+    for name in baseline_ledger["direct_write"]["children"]:
+        nested_deltas[name] = (
+            baseline_ledger["direct_write"]["children"][name]
+            - candidate_ledger["direct_write"]["children"][name]
+        )
+    baseline_packed = baseline.get("legofs_timing", {}).get("packed_small_segment")
+    candidate_packed = candidate.get("legofs_timing", {}).get("packed_small_segment")
+    if isinstance(baseline_packed, dict) and isinstance(candidate_packed, dict):
+        for name in (
+            "small_segment_claim_persist_ns",
+            "legacy_small_arena_reserve_ns",
+            "client_dynamic_mmap_ns",
+            "client_protection_ns",
+        ):
+            before = baseline_packed.get(name)
+            after = candidate_packed.get(name)
+            if (
+                not isinstance(before, int)
+                or before < 0
+                or not isinstance(after, int)
+                or after < 0
+            ):
+                raise ValueError(f"packed timing counter {name!r} must be nonnegative")
+            nested_deltas[name] = before - after
+
+    return {
+        "pair": pair,
+        "baseline": baseline_ledger,
+        "candidate": candidate_ledger,
+        "wall_delta_ns": wall_delta_ns,
+        "client_timed_delta_ns": client_delta_ns,
+        "rank_wall_remainder_delta_ns": remainder_delta_ns,
+        "wall_delta_error_ns": delta_error_ns,
+        "client_category_deltas_ns": client_category_deltas,
+        "client_category_remainder_delta_ns": client_category_remainder_delta_ns,
+        "nested_diagnostic_deltas_ns": nested_deltas,
+        "phase_elapsed_deltas": phase_deltas,
+        "arithmetic_closed": all(
+            ledger[layer]["arithmetic_closed"]
+            for ledger in (baseline_ledger, candidate_ledger)
+            for layer in (
+                "rank_wall", "client_control", "transport", "arena", "direct_write"
+            )
+        ),
     }
 
 
@@ -1067,12 +1730,26 @@ def paired_candidate_gate(
     protected_regression_limit: float = 0.03,
     race_rmad_limit: float = 0.10,
     minimum_command_reduction: int = 0,
+    allowed_topology_differences: set[str] | None = None,
 ) -> dict:
     if len(baseline_paths) != len(candidate_paths):
         raise ValueError("baseline/candidate paired input counts differ")
     if not baseline_paths:
         raise ValueError("candidate gate requires at least one pair")
     explanatory_counters = explanatory_counters or {}
+    allowed_topology_differences = allowed_topology_differences or set()
+    supported_topology_differences = {
+        "lifecycle_pool_layout",
+        "small_segment_count_per_authority",
+    }
+    unknown_topology_differences = (
+        allowed_topology_differences - supported_topology_differences
+    )
+    if unknown_topology_differences:
+        raise ValueError(
+            "unsupported allowed topology difference: "
+            + ", ".join(sorted(unknown_topology_differences))
+        )
     pairs = []
     baseline_payloads = set()
     candidate_payloads = set()
@@ -1080,6 +1757,9 @@ def paired_candidate_gate(
     normalized_topologies = set()
     stages = set()
     command_reductions = []
+    time_closures = []
+    observed_topology_differences = set()
+    topology_difference_values = []
     for index, (baseline_path, candidate_path) in enumerate(
         zip(baseline_paths, candidate_paths), 1
     ):
@@ -1099,10 +1779,30 @@ def paired_candidate_gate(
         command_reductions.append(reduction)
         baseline_payloads.add(baseline_audit["payload_sha256"])
         candidate_payloads.add(candidate_audit["payload_sha256"])
-        for audit in (baseline_audit, candidate_audit):
+        baseline_topology = dict(baseline_audit["topology"])
+        candidate_topology = dict(candidate_audit["topology"])
+        pair_topology_values = {}
+        for name in sorted(allowed_topology_differences):
+            baseline_value = baseline_topology.pop(name, None)
+            candidate_value = candidate_topology.pop(name, None)
+            pair_topology_values[name] = {
+                "baseline": baseline_value,
+                "candidate": candidate_value,
+            }
+            if baseline_value != candidate_value:
+                observed_topology_differences.add(name)
+        topology_difference_values.append({
+            "pair": index,
+            "fields": pair_topology_values,
+        })
+        for audit, topology in (
+            (baseline_audit, baseline_topology),
+            (candidate_audit, candidate_topology),
+        ):
             platform_fingerprints.add(json.dumps(audit["platform"], sort_keys=True))
-            normalized_topologies.add(json.dumps(audit["topology"], sort_keys=True))
+            normalized_topologies.add(json.dumps(topology, sort_keys=True))
             stages.add(audit["stage"])
+        time_closures.append(paired_time_closure(baseline, candidate, index))
         pairs.append({
             "pair": index,
             "baseline": baseline,
@@ -1115,6 +1815,14 @@ def paired_candidate_gate(
         raise ValueError("each side of paired inputs must use one frozen payload")
     if len(platform_fingerprints) != 1:
         raise ValueError("paired inputs do not use one frozen platform")
+    unused_topology_differences = (
+        allowed_topology_differences - observed_topology_differences
+    )
+    if unused_topology_differences:
+        raise ValueError(
+            "allowed topology field does not differ between arms: "
+            + ", ".join(sorted(unused_topology_differences))
+        )
     if len(normalized_topologies) != 1 or len(stages) != 1:
         raise ValueError("paired inputs do not use one normalized topology and stage")
 
@@ -1174,7 +1882,7 @@ def paired_candidate_gate(
 
     first = pairs[0]
     return {
-        "schema_version": "legofs.performance.paired-candidate-gate.v1",
+        "schema_version": "legofs.performance.paired-candidate-gate.v2",
         "classification": classification,
         "pair_count": len(pairs),
         "minimum_pairs": minimum_pairs,
@@ -1186,6 +1894,37 @@ def paired_candidate_gate(
         "baseline_payload_sha256": next(iter(baseline_payloads)),
         "candidate_payload_sha256": next(iter(candidate_payloads)),
         "platform": json.loads(next(iter(platform_fingerprints))),
+        "isolation": {
+            "same_payload_with_runtime_selector": (
+                next(iter(baseline_payloads)) == next(iter(candidate_payloads))
+            ),
+            "allowed_topology_differences": sorted(
+                allowed_topology_differences
+            ),
+            "paired_topology_values": topology_difference_values,
+            "all_other_topology_fields_identical": True,
+        },
+        "time_closure": {
+            "schema_version": "legofs.performance.paired-time-closure.v1",
+            "all_pairs_closed": all(
+                item["arithmetic_closed"] for item in time_closures
+            ),
+            "median_wall_delta_ns": statistics.median(
+                item["wall_delta_ns"] for item in time_closures
+            ),
+            "median_client_timed_delta_ns": statistics.median(
+                item["client_timed_delta_ns"] for item in time_closures
+            ),
+            "median_rank_wall_remainder_delta_ns": statistics.median(
+                item["rank_wall_remainder_delta_ns"] for item in time_closures
+            ),
+            "pairs": time_closures,
+            "interpretation": (
+                "Wall and client-control deltas are additive within their own "
+                "layers. Transport and arena deltas are nested diagnostics and "
+                "must not be added to the wall delta."
+            ),
+        },
         "primary": primary,
         "protected": protected,
         "mechanism": {
@@ -1462,6 +2201,15 @@ def parse_args(argv=None):
     )
     candidate.add_argument("--race-rmad-limit", type=float, default=0.10)
     candidate.add_argument("--minimum-command-reduction", type=int, default=0)
+    candidate.add_argument(
+        "--allow-topology-difference",
+        action="append",
+        default=[],
+        choices=(
+            "lifecycle_pool_layout",
+            "small_segment_count_per_authority",
+        ),
+    )
 
     freeze = subparsers.add_parser("freeze-profile")
     freeze.add_argument("--output", required=True)
@@ -1544,6 +2292,9 @@ def main(argv=None) -> int:
                 protected_regression_limit=args.protected_regression_limit,
                 race_rmad_limit=args.race_rmad_limit,
                 minimum_command_reduction=args.minimum_command_reduction,
+                allowed_topology_differences=set(
+                    args.allow_topology_difference
+                ),
             )
             atomic_json(args.output, result)
         else:

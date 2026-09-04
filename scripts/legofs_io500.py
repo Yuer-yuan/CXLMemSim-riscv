@@ -18,9 +18,9 @@ import socket
 import struct
 import subprocess
 import sys
-import threading
 import time
 import uuid
+import zlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from legofs_type3_2node import Console, OwnedProcess, qemu_environment
@@ -31,9 +31,9 @@ DEFAULT_COHERENCE_CACHE_MIB = 32
 DEFAULT_SSD_CACHE_MIB = 512
 DEFAULT_OBSERVATION_SAMPLE_SHIFT = 4
 DEFAULT_OBSERVATION_ARENA_MIB = 12
-OBSERVATION_SCHEMA_DIGEST = "b5640c61c8e38775"
+OBSERVATION_SCHEMA_DIGEST = "942b9f1d769746ec"
 OBSERVATION_SCHEMA_MAJOR = 1
-OBSERVATION_SCHEMA_MINOR = 0
+OBSERVATION_SCHEMA_MINOR = 2
 OBSERVATION_EVENT_BYTES = 64
 OBSERVATION_MAX_BYTES = 64 * 1024**2
 ENDPOINT_BYTES = 64 * 1024**3
@@ -73,9 +73,20 @@ EXPORT_SUMMARY_RE = re.compile(
     r"LEGOFS_IO500_EXPORT_POSIX_SUMMARY endpoint=(\d+) file=(\S+) "
     r"(\{[^\n]+\})"
 )
+SYSTEM_SYNC_PROBE_RE = re.compile(
+    r"LEGOFS_SYSTEM_SYNC_PROBE_RESULT label=(\S+) raw_status=(-?\d+) "
+    r"errno=(\d+) child_reached=([01]) exited=([01]) exit_status=(-?\d+) "
+    r"signaled=([01]) term_signal=(-?\d+)"
+)
+PROXY_EXIT_RE = re.compile(r"LEGOFS_IO500_PROXY_EXIT index=(\d+) rc=(\d+)")
 OBSERVATION_BEGIN_RE = re.compile(
     r"^LEGOFS_OBSERVATION_BEGIN role=(client-rank|server|diagnostic-client) "
-    r"endpoint=(\d+) file=([^\s/]+) bytes=(\d+) sha256=([0-9a-f]{64})$"
+    r"endpoint=(\d+) file=([^\s/]+) bytes=(\d+) sha256=([0-9a-f]{64})"
+    r"(?: encoding=(gzip-base64-v1) compressed_bytes=(\d+) "
+    r"compressed_sha256=([0-9a-f]{64}) chunks=(\d+))?$"
+)
+OBSERVATION_CHUNK_RE = re.compile(
+    r"^LEGOFS_OBSERVATION_CHUNK seq=(\d+) data=([A-Za-z0-9+/]+={0,2})$"
 )
 OBSERVATION_END_RE = re.compile(
     r"^LEGOFS_OBSERVATION_END role=(client-rank|server|diagnostic-client) "
@@ -85,12 +96,19 @@ MPI_FATAL_MARKERS = (
     "BADFS_STRICT_LIFECYCLE_DIRECT_INIT_FAILED",
     "LEGOFS_IO500_FATAL",
 )
+# TCG oversubscription can delay an otherwise live guest long enough for RCU
+# or kthread watchdog diagnostics.  Those lines are measurement-noise evidence,
+# not proof that MPI or the filesystem stopped making progress.  The bounded
+# workload deadline, guest exit, and explicit fatal markers remain the liveness
+# authorities; only unrecoverable kernel conditions fail immediately here.
 PERFORMANCE_INVALIDATING_GUEST_MARKERS = (
+    "BUG: soft lockup",
+    "Out of memory:",
+)
+PERFORMANCE_NOISE_GUEST_MARKERS = (
     "rcu_sched detected stalls",
     "rcu_preempt detected stalls",
     "kthread starved for",
-    "BUG: soft lockup",
-    "Out of memory:",
 )
 GUEST_PROCESS_FAULT_MARKERS = (
     "Segmentation fault",
@@ -108,6 +126,16 @@ SEMANTIC_SMOKE_STAGES = (
     "hard-smoke",
     "metadata-smoke",
     "rnd4k",
+)
+
+# Packed-small segments serve small-file payloads. Large IOR-only stages must
+# still expose the counters, but zero activity is expected and is not evidence
+# that the configured layout failed to initialize.
+PACKED_SMALL_WORKLOAD_STAGES = (
+    "tiny",
+    "metadata-smoke",
+    "scc",
+    "standard",
 )
 
 CLIENT_TIMING_GROUPS = {
@@ -135,7 +163,10 @@ CLIENT_TIMING_GROUPS = {
     ),
 }
 
-DIRECT_METADATA_FORMAT_GENERATION = 10
+# Must match badfs-common serving_transport::bootstrap. Generation 13 adds the
+# directory catalog, lane-owned mutation arenas, and authority-owned D/R
+# cursors; accepting generation 12 would let an old process alias these ranges.
+DIRECT_METADATA_FORMAT_GENERATION = 13
 DIRECT_METADATA_CLIENT_COUNTERS = (
     "direct_metadata_attempts",
     "direct_metadata_hits",
@@ -153,11 +184,89 @@ DIRECT_METADATA_CLIENT_COUNTERS = (
     "direct_metadata_root_loads",
     "direct_metadata_dentry_cell_loads",
     "direct_metadata_inode_record_loads",
+    "direct_metadata_unstable_read_retries",
+    "direct_metadata_unstable_read_recoveries",
+    "direct_metadata_unstable_read_exhaustions",
+    "direct_metadata_unstable_root_unavailable",
+    "direct_metadata_unstable_dentry_decode",
+    "direct_metadata_unstable_inode_decode",
+    "direct_metadata_unstable_snapshot_changed",
+)
+
+DIRECT_MUTATION_CLIENT_COUNTERS = (
+    "direct_mutation_lease_installs",
+    "direct_mutation_lease_replacements",
+    "direct_mutation_generic_close_handoffs",
+    "direct_create_attempts",
+    "direct_create_hits",
+    "direct_create_fallbacks",
+    "direct_create_commands_elided",
+    "direct_create_post_grant_retry_hits",
+    "direct_create_fallback_ineligible",
+    "direct_create_fallback_no_parent_writer",
+    "direct_create_fallback_existing",
+    "direct_create_fallback_inode_exhausted",
+    "direct_create_errors",
+    "direct_unlink_attempts",
+    "direct_unlink_commands_elided",
+    "direct_unlink_base_commands_elided",
+    "direct_unlink_peer_applied_commands_elided",
+    "direct_unlink_fallbacks",
+    "direct_unlink_fallback_ineligible",
+    "direct_unlink_fallback_no_parent_writer",
+    "direct_unlink_fallback_unapplied_peer",
+    "direct_unlink_fallback_base_unavailable",
+    "direct_unlink_fallback_overlay_changed",
+    "direct_unlink_fallback_unsupported_target",
+    "direct_unlink_fallback_live_ofd",
+    "direct_unlink_not_found",
+    "direct_unlink_membership_changing",
+    "direct_unlink_lease_revoked",
+)
+
+DIRECT_RO_POSIX_COUNTERS = (
+    "direct_ro_open_attempts",
+    "direct_ro_open_hits",
+    "direct_ro_open_fallbacks",
+    "direct_ro_layout_roots_loaded",
+    "direct_ro_layout_entries_loaded",
+    "direct_ro_open_commands_elided",
+    "direct_ro_close_commands_elided",
+    "direct_ro_epoch_acquires",
+    "direct_ro_epoch_releases",
+)
+
+PACKED_SMALL_SEGMENT_SERVER_COUNTERS = (
+    "backend_fresh_format_scan_bytes",
+    "backend_publication_slots_reset",
+    "startup_small_runtime_segments",
+    "startup_small_runtime_cells",
+    "small_segment_claims",
+    "small_segment_claim_persist_ns",
+    "small_cell_grants",
+    "small_cell_commits",
+    "small_cell_payload_bytes",
+    "small_cell_payload_persist_bytes",
+    "small_cell_allocator_persist_barriers",
+    "legacy_small_arena_reserve_calls",
+    "legacy_small_arena_reserve_ns",
+)
+
+PACKED_SMALL_SEGMENT_CLIENT_COUNTERS = (
+    "small_segment_cache_hits",
+    "small_segment_dynamic_mmap_calls",
+    "small_segment_dynamic_mmap_ns",
+    "small_segment_mapped_owner_segments",
+    "small_segment_protection_calls",
+    "small_segment_protection_ns",
 )
 DIRECT_METADATA_AUTHORITY_COUNTERS = (
     "publication_batches",
     "dentry_writes",
     "inode_writes",
+    "record_prepare_ns",
+    "root_odd_ns",
+    "root_odd_max_ns",
     "registered_hints",
     "capacity_failures",
     "publication_failures",
@@ -429,6 +538,22 @@ def host_process_cost_window(
     }
 
 
+def record_host_process_cost_window(
+    result: dict,
+    before: dict,
+    after: dict,
+    started_ns: int,
+    completed_ns: int,
+) -> bool:
+    """Close the MPI cost window once; post-run evidence export is excluded."""
+    if "host_process_cost" in result:
+        return False
+    result["host_process_cost"] = host_process_cost_window(
+        before, after, started_ns, completed_ns
+    )
+    return True
+
+
 def legofs_timing_breakdown(
     summaries: list[dict], inspection: dict, wall_ns: int, client_count: int
 ) -> dict:
@@ -480,6 +605,18 @@ def legofs_timing_breakdown(
         )
     }
     cq_wait_ns = transport_client["cq_wait_ns"]
+    cq_wait_ns_by_opcode: dict[str, int] = {}
+    dispatches_by_opcode: dict[str, int] = {}
+    for record in summaries:
+        for item in record.get("cxl_serving_evidence", []):
+            for opcode, value in item.get("cq_wait_ns_by_opcode", {}).items():
+                cq_wait_ns_by_opcode[str(opcode)] = (
+                    cq_wait_ns_by_opcode.get(str(opcode), 0) + int(value)
+                )
+            for opcode, value in item.get("dispatches_by_opcode", {}).items():
+                dispatches_by_opcode[str(opcode)] = (
+                    dispatches_by_opcode.get(str(opcode), 0) + int(value)
+                )
     cq_inner_fields = (
         "successful_request_poll_ns",
         "authority_queue_wait_ns",
@@ -511,6 +648,21 @@ def legofs_timing_breakdown(
         "residual_share_of_outer": (
             cq_residual_ns / cq_wait_ns if cq_wait_ns else 0.0
         ),
+        "by_opcode": {
+            opcode: {
+                "calls": dispatches_by_opcode.get(opcode, 0),
+                "cq_wait_ns": wait_ns,
+                "cq_wait_ns_per_call": (
+                    wait_ns / dispatches_by_opcode.get(opcode, 0)
+                    if dispatches_by_opcode.get(opcode, 0)
+                    else 0.0
+                ),
+                "share_of_outer": wait_ns / cq_wait_ns if cq_wait_ns else 0.0,
+            }
+            for opcode, wait_ns in sorted(
+                cq_wait_ns_by_opcode.items(), key=lambda item: int(item[0])
+            )
+        },
         "interpretation": (
             "CQ wait is the outer SQE-visible to CQE-consumed envelope. Authority "
             "components are nested inside it; residual contains request/completion "
@@ -524,6 +676,10 @@ def legofs_timing_breakdown(
         audit.get("direct_write_payload_persist_ns", 0)
     )
     lifecycle_state_persist_ns = int(audit.get("direct_write_state_persist_ns", 0))
+    visibility_durability = audit.get("visibility_durability", {})
+    background_lifecycle_persist_ns = int(
+        visibility_durability.get("persistence_worker_lifecycle_ns", 0)
+    )
     arena_acquire = {
         field: int(audit.get(field, 0))
         for field in (
@@ -541,8 +697,83 @@ def legofs_timing_breakdown(
             "arena_acquire_total_ns",
         )
     }
+    direct_write = {
+        field: int(audit.get(field, 0))
+        for field in (
+            "direct_write_commit_groups",
+            "direct_write_commit_items",
+            "direct_write_prepare_ns",
+            "direct_write_payload_persist_ns",
+            "direct_write_state_build_ns",
+            "direct_write_state_persist_ns",
+            "direct_write_publish_ns",
+            "direct_write_trace_ns",
+            "direct_write_total_ns",
+        )
+    }
+    packed_small_segment = {
+        field: int(audit.get(field, 0))
+        for field in PACKED_SMALL_SEGMENT_SERVER_COUNTERS
+    }
+    packed_client_names = {
+        "small_segment_cache_hits": "client_cache_hits",
+        "small_segment_dynamic_mmap_calls": "client_dynamic_mmap_calls",
+        "small_segment_dynamic_mmap_ns": "client_dynamic_mmap_ns",
+        "small_segment_mapped_owner_segments": "client_mapped_owner_segments",
+        "small_segment_protection_calls": "client_protection_calls",
+        "small_segment_protection_ns": "client_protection_ns",
+    }
+    packed_small_segment.update({
+        output_name: sum(
+            int(record.get("stats", {}).get(input_name, 0))
+            for record in summaries
+        )
+        for input_name, output_name in packed_client_names.items()
+    })
+    writer_host_persistence = {
+        field: sum(
+            int(record.get("stats", {}).get(field, 0)) for record in summaries
+        )
+        for field in (
+            "writer_host_persist_jobs_queued",
+            "writer_host_persist_jobs_completed",
+            "writer_host_persist_jobs_failed",
+            "writer_host_local_persist_ns",
+            "writer_host_receipt_submit_ns",
+            "writer_host_queue_wait_ns",
+            "writer_host_msync_persist_jobs",
+            "writer_host_zicbom_persist_jobs",
+            "writer_host_local_persist_ranges",
+            "writer_host_local_persist_bytes",
+            "writer_host_receipt_batches_submitted",
+            "writer_host_receipt_items_submitted",
+            "writer_host_quiescent_handoffs",
+            "writer_host_authority_apply_wait_polls",
+            "writer_host_authority_apply_wait_ns",
+        )
+    }
+    io_envelope = {
+        field: sum(
+            int(record.get("stats", {}).get(field, 0)) for record in summaries
+        )
+        for field in (
+            "read_ops",
+            "read_ns",
+            "read_bytes",
+            "write_ops",
+            "write_ns",
+            "write_bytes",
+        )
+    }
+    io_envelope["read_share_of_rank_wall"] = (
+        io_envelope["read_ns"] / rank_wall_ns if rank_wall_ns else 0.0
+    )
+    io_envelope["write_share_of_rank_wall"] = (
+        io_envelope["write_ns"] / rank_wall_ns if rank_wall_ns else 0.0
+    )
     return {
-        "schema_version": "legofs.timing-breakdown.v4",
+        "schema_version": "legofs.timing-breakdown.v7",
+        "client_io_envelope": io_envelope,
         "client_timed_intervals": groups,
         "client_timed_intervals_ns": client_wait_ns,
         "aggregate_rank_wall_ns": rank_wall_ns,
@@ -567,7 +798,11 @@ def legofs_timing_breakdown(
         "transport_authority": transport_authority,
         "transport_cq_attribution": cq_attribution,
         "arena_acquire": arena_acquire,
+        "direct_write": direct_write,
+        "packed_small_segment": packed_small_segment,
         "persistence": {
+            "payload_persistence_owner": audit.get("payload_persistence_owner"),
+            "writer_host": writer_host_persistence,
             "metadata_wal_persist_ns": metadata_wal_persist_ns,
             "metadata_wal_persist_barriers": int(
                 audit.get("metadata_wal_persist_barriers", 0)
@@ -578,11 +813,61 @@ def legofs_timing_breakdown(
             "metadata_wal_persist_bytes": int(
                 audit.get("metadata_wal_persist_bytes", 0)
             ),
+            "metadata_wal_deferred_appends": int(
+                audit.get("metadata_wal_deferred_appends", 0)
+            ),
+            "metadata_wal_deferred_records": int(
+                audit.get("metadata_wal_deferred_records", 0)
+            ),
+            "metadata_wal_deferred_bytes": int(
+                audit.get("metadata_wal_deferred_bytes", 0)
+            ),
+            "metadata_wal_pending_records": int(
+                audit.get("metadata_wal_pending_records", 0)
+            ),
+            "metadata_wal_durable_lsn": int(
+                audit.get("metadata_wal_durable_lsn", 0)
+            ),
             "lifecycle_payload_persist_ns": lifecycle_payload_persist_ns,
             "lifecycle_state_persist_ns": lifecycle_state_persist_ns,
+            "background_lifecycle_persist_ns": background_lifecycle_persist_ns,
+            "deferred_state_dependency_close_ns": int(
+                audit.get("deferred_state_dependency_close_ns", 0)
+            ),
+            "deferred_state_not_ready_cuts": int(
+                audit.get("deferred_state_not_ready_cuts", 0)
+            ),
+            "deferred_state_resumed_cuts": int(
+                audit.get("deferred_state_resumed_cuts", 0)
+            ),
+            "authority_coherent_acquire_jobs": int(
+                audit.get("authority_coherent_acquire_jobs", 0)
+            ),
+            "authority_coherent_acquire_ranges": int(
+                audit.get("authority_coherent_acquire_ranges", 0)
+            ),
+            "authority_coherent_acquire_bytes": int(
+                audit.get("authority_coherent_acquire_bytes", 0)
+            ),
+            "authority_coherent_acquire_ns": int(
+                audit.get("authority_coherent_acquire_ns", 0)
+            ),
+            "authority_payload_persist_jobs": int(
+                audit.get("authority_payload_persist_jobs", 0)
+            ),
+            "authority_payload_persist_ranges": int(
+                audit.get("authority_payload_persist_ranges", 0)
+            ),
+            "authority_payload_persist_bytes": int(
+                audit.get("authority_payload_persist_bytes", 0)
+            ),
+            "authority_payload_persist_ns": int(
+                audit.get("authority_payload_persist_ns", 0)
+            ),
             "persistence_wait_ns": metadata_wal_persist_ns
             + lifecycle_payload_persist_ns
-            + lifecycle_state_persist_ns,
+            + lifecycle_state_persist_ns
+            + background_lifecycle_persist_ns,
             "provider_persist_barriers": int(
                 audit.get("provider_persist_barriers", 0)
             ),
@@ -600,6 +885,15 @@ def legofs_timing_breakdown(
             "writer_persisted_direct_bytes": int(
                 audit.get("writer_persisted_direct_bytes", 0)
             ),
+            "host_persist_receipts_accepted": int(
+                audit.get("host_persist_receipts_accepted", 0)
+            ),
+            "host_persist_receipts_duplicate": int(
+                audit.get("host_persist_receipts_duplicate", 0)
+            ),
+            "host_persist_receipts_rejected": int(
+                audit.get("host_persist_receipts_rejected", 0)
+            ),
             "provider_allocator_barriers": int(
                 audit.get("provider_allocator_barriers", 0)
             ),
@@ -613,14 +907,23 @@ def legofs_timing_breakdown(
                 audit.get("foreground_checkpoint_wait_ns", 0)
             ),
         },
-        "visibility_durability": audit.get("visibility_durability", {}),
+        "visibility_durability": visibility_durability,
         "interpretation": (
-            "client values are summed elapsed RPC/control intervals across ranks; "
+            "read_ns and write_ns are unsampled outer syscall envelopes summed across "
+            "ranks; client RPC/control values are nested within those envelopes; "
             "transport and persistence intervals are separately accumulated and may be "
             "nested or overlap across ranks, so they are not additive wall-time shares; "
             "none of these counters is CPU time"
         ),
     }
+
+
+def packed_small_validation_expectation(
+    stage: str, packed_small_segments: str, fault_profile: str
+) -> bool | None:
+    if fault_profile != "none" or stage not in PACKED_SMALL_WORKLOAD_STAGES:
+        return None
+    return packed_small_segments == "on"
 
 
 def direct_metadata_breakdown(
@@ -686,6 +989,41 @@ def direct_metadata_breakdown(
             "A direct hit consumes no request id, SQE or CQE. Baseline-equivalent "
             "demand is READ_METADATA commands plus proven commands elided; it is "
             "not a workload-normalization substitute for paired IO500 results."
+        ),
+    }
+
+
+def direct_mutation_breakdown(summaries: list[dict]) -> dict:
+    client = {
+        field: sum(
+            int(item.get(field, 0))
+            for record in summaries
+            for item in record.get("cxl_serving_evidence", [])
+        )
+        for field in DIRECT_MUTATION_CLIENT_COUNTERS
+    }
+    open_or_create_commands = sum(
+        int(item.get("dispatches_by_opcode", {}).get("61", 0))
+        for record in summaries
+        for item in record.get("cxl_serving_evidence", [])
+    )
+    baseline_equivalent_create_demand = (
+        open_or_create_commands + client["direct_create_commands_elided"]
+    )
+    return {
+        "schema_version": "legofs.direct-mutation.v1",
+        "client": client,
+        "open_or_create_commands": open_or_create_commands,
+        "baseline_equivalent_create_demand": baseline_equivalent_create_demand,
+        "hit_ratio": (
+            client["direct_create_commands_elided"] / baseline_equivalent_create_demand
+            if baseline_equivalent_create_demand
+            else 0.0
+        ),
+        "attempt_resolution_hit_ratio": (
+            client["direct_create_hits"] / client["direct_create_attempts"]
+            if client["direct_create_attempts"]
+            else 0.0
         ),
     }
 
@@ -771,7 +1109,10 @@ def observation_run_hash(run_id: str) -> int:
 
 
 def observation_run_id_for_label(result_label: str) -> str:
-    return "r" + hashlib.sha256(result_label.encode("ascii")).hexdigest()[:24]
+    # The arena stores a 64-bit hash of this deterministic token. Carrying more
+    # than 64 bits through U-Boot only consumes its fixed 255-byte command line
+    # without strengthening the on-disk observation identity.
+    return "r" + hashlib.sha256(result_label.encode("ascii")).hexdigest()[:16]
 
 
 def observation_boot_token(config: dict) -> str:
@@ -782,7 +1123,7 @@ def observation_boot_token(config: dict) -> str:
         f"o={mode},{config['sample_shift']},{config['arena_mib']},"
         f"{config['run_id']}"
     )
-    if not re.fullmatch(r"o=[doas],[0-9]{1,2},[0-9]{1,2},r[0-9a-f]{24}", token):
+    if not re.fullmatch(r"o=[doas],[0-9]{1,2},[0-9]{1,2},r[0-9a-f]{16}", token):
         raise ValueError("observation boot token is not in its fixed bounded format")
     return token
 
@@ -796,6 +1137,12 @@ def guest_bootargs(
     serving_transport: str,
     cursor_mode: str,
     cq_wait_mode: str,
+    durability_profile: str,
+    payload_persistence_owner: str,
+    writer_persist_provider: str,
+    packed_small_segments: str,
+    small_segment_count: int,
+    close_batch_mode: str,
     observation: dict,
 ) -> str:
     cursor_token = {"legacy_shared": "l", "owned": "o"}[cursor_mode]
@@ -803,13 +1150,32 @@ def guest_bootargs(
         "timer_sleep": "s",
         "cooperative_yield": "y",
     }[cq_wait_mode]
+    durability_token = {
+        "d-before-v": "d",
+        "coherent-seal-no-writeback": "n",
+        "coherent-seal-needs-writeback": "w",
+    }[durability_profile]
+    payload_owner_token = {
+        ("authority-bi-acquire", "msync"): "a",
+        ("writer-receipt", "msync"): "r",
+        ("writer-receipt", "riscv-zicbom-dax"): "R",
+        ("placement-routed", "msync"): "h",
+        ("placement-routed", "riscv-zicbom-dax"): "H",
+        ("writer-before-visibility", "msync"): "v",
+    }[(payload_persistence_owner, writer_persist_provider)]
+    packed_token = 0 if packed_small_segments == "off" else small_segment_count
+    close_batch_token = {"immediate": 0, "batched": 1}[close_batch_mode]
     value = (
-        "earlycon=sbi console=hvc0 loglevel=5 cxl_core.pmem_as_dax=1 "
+        "earlycon=sbi console=hvc0 cxl_core.pmem_as_dax=1 "
         f"io500.role={role} io500.index={index} io500.stage={stage} "
         f"io500.server_count={server_count} io500.client_count={client_count} "
         f"io500.serving_transport={serving_transport} "
         f"c={cursor_token} "
         f"w={cq_wait_token} "
+        f"d={durability_token} "
+        f"u={payload_owner_token} "
+        f"p={packed_token} "
+        f"b={close_batch_token} "
         f"{observation_boot_token(observation)}"
     )
     command_bytes = len("setenv bootargs ''") + len(value)
@@ -910,8 +1276,27 @@ def parse_observation_frames(output: str) -> list[dict]:
                 "file": begin.group(3),
                 "bytes": size,
                 "sha256": begin.group(5),
-                "base64": [],
+                "encoding": begin.group(6) or "raw-base64-v1",
             }
+            if current["encoding"] == "gzip-base64-v1":
+                compressed_bytes = int(begin.group(7))
+                chunks = int(begin.group(9))
+                max_compressed_bytes = OBSERVATION_MAX_BYTES + 1024 * 1024
+                if compressed_bytes > max_compressed_bytes:
+                    raise ValueError("observation marker declares oversized compressed data")
+                expected_chars = ((compressed_bytes + 2) // 3) * 4
+                expected_chunks = (expected_chars + 1023) // 1024
+                if chunks == 0 or chunks != expected_chunks:
+                    raise ValueError("observation marker chunk count mismatch")
+                current.update({
+                    "compressed_bytes": compressed_bytes,
+                    "compressed_sha256": begin.group(8),
+                    "chunks": chunks,
+                    "chunk_data": {},
+                    "chunk_copies": {},
+                })
+            else:
+                current["base64"] = []
             encoded_chars = 0
             continue
         if end is not None:
@@ -920,12 +1305,43 @@ def parse_observation_frames(output: str) -> list[dict]:
             identity = (end.group(1), int(end.group(2)), end.group(3))
             if identity != (current["role"], current["endpoint"], current["file"]):
                 raise ValueError("observation begin/end identity mismatch")
-            try:
-                payload = base64.b64decode(
-                    "".join(current.pop("base64")), validate=True
-                )
-            except (binascii.Error, ValueError) as error:
-                raise ValueError(f"invalid observation base64: {error}") from error
+            if current["encoding"] == "gzip-base64-v1":
+                chunks = current.pop("chunk_data")
+                copies = current.pop("chunk_copies")
+                expected_sequences = set(range(current["chunks"]))
+                if set(chunks) != expected_sequences:
+                    raise ValueError("observation compressed frame has missing chunks")
+                if any(count > 2 for count in copies.values()):
+                    raise ValueError("observation compressed frame has excess chunk copies")
+                encoded = "".join(chunks[sequence] for sequence in range(current["chunks"]))
+                expected_chars = ((current["compressed_bytes"] + 2) // 3) * 4
+                if len(encoded) != expected_chars:
+                    raise ValueError("observation compressed base64 length mismatch")
+                try:
+                    compressed = base64.b64decode(encoded, validate=True)
+                except (binascii.Error, ValueError) as error:
+                    raise ValueError(f"invalid observation compressed base64: {error}") from error
+                if len(compressed) != current["compressed_bytes"]:
+                    raise ValueError("observation compressed length mismatch")
+                if hashlib.sha256(compressed).hexdigest() != current["compressed_sha256"]:
+                    raise ValueError("observation compressed digest mismatch")
+                try:
+                    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    payload = decompressor.decompress(compressed, current["bytes"] + 1)
+                    if decompressor.unconsumed_tail or len(payload) > current["bytes"]:
+                        raise ValueError("observation gzip expands beyond declared arena")
+                    payload += decompressor.flush()
+                    if not decompressor.eof or decompressor.unused_data:
+                        raise ValueError("observation gzip framing mismatch")
+                except zlib.error as error:
+                    raise ValueError(f"invalid observation gzip: {error}") from error
+            else:
+                try:
+                    payload = base64.b64decode(
+                        "".join(current.pop("base64")), validate=True
+                    )
+                except (binascii.Error, ValueError) as error:
+                    raise ValueError(f"invalid observation base64: {error}") from error
             if len(payload) != current["bytes"]:
                 raise ValueError("observation decoded length mismatch")
             if hashlib.sha256(payload).hexdigest() != current["sha256"]:
@@ -935,6 +1351,26 @@ def parse_observation_frames(output: str) -> list[dict]:
             current = None
             continue
         if current is not None:
+            if current["encoding"] == "gzip-base64-v1":
+                chunk = OBSERVATION_CHUNK_RE.fullmatch(line)
+                # Kernel and console diagnostics may arrive asynchronously.  A
+                # chunk is accepted only when its complete framed line parses;
+                # the guest emits two identical copies so one interrupted copy
+                # cannot invalidate an otherwise complete export.
+                if chunk is None:
+                    continue
+                sequence = int(chunk.group(1))
+                data = chunk.group(2)
+                if sequence >= current["chunks"] or len(data) > 1024:
+                    raise ValueError("observation compressed chunk is out of bounds")
+                previous = current["chunk_data"].get(sequence)
+                if previous is not None and previous != data:
+                    raise ValueError("observation compressed chunk copies disagree")
+                current["chunk_data"][sequence] = data
+                current["chunk_copies"][sequence] = (
+                    current["chunk_copies"].get(sequence, 0) + 1
+                )
+                continue
             if not line:
                 continue
             encoded_chars += len(line)
@@ -1267,6 +1703,12 @@ def boot_guest(
     serving_transport: str,
     cursor_mode: str,
     cq_wait_mode: str,
+    durability_profile: str,
+    payload_persistence_owner: str,
+    writer_persist_provider: str,
+    packed_small_segments: str,
+    small_segment_count: int,
+    close_batch_mode: str,
     observation: dict,
     timeout: int,
 ) -> None:
@@ -1293,6 +1735,12 @@ def boot_guest(
         serving_transport,
         cursor_mode,
         cq_wait_mode,
+        durability_profile,
+        payload_persistence_owner,
+        writer_persist_provider,
+        packed_small_segments,
+        small_segment_count,
+        close_batch_mode,
         observation,
     )
     console.command_until_prompt(f"setenv bootargs '{bootargs}'", timeout)
@@ -1534,6 +1982,116 @@ def _send_and_wait(
     }
 
 
+def parse_system_sync_probe(output: str, label: str) -> dict:
+    matches = list(SYSTEM_SYNC_PROBE_RE.finditer(output))
+    exits = list(PROXY_EXIT_RE.finditer(output))
+    if len(matches) != 1:
+        return {
+            "label": label,
+            "program_reached": False,
+            "proxy_rc": int(exits[-1].group(2)) if exits else None,
+            "raw_output": output,
+        }
+    match = matches[0]
+    if match.group(1) != label:
+        raise ValueError(
+            f"system-sync probe label mismatch: expected {label}, got {match.group(1)}"
+        )
+    if len(exits) != 1 or int(exits[0].group(1)) != 0:
+        raise ValueError("system-sync probe lacks one client0 proxy exit record")
+    names = (
+        "raw_status",
+        "errno",
+        "child_reached",
+        "exited",
+        "exit_status",
+        "signaled",
+        "term_signal",
+    )
+    values = [int(value) for value in match.groups()[1:]]
+    return {
+        "label": label,
+        "program_reached": True,
+        **dict(zip(names, values)),
+        "proxy_rc": int(exits[0].group(2)),
+    }
+
+
+def run_system_sync_probe(
+    console: Console, client_count: int, timeout: int
+) -> dict:
+    """Compare system(3) with no preload, libc-only patching, and all DSOs."""
+    first_endpoint = 2 * client_count + 2
+    if first_endpoint + 1 >= RECOVERY_CONTROL_LANE_BASE:
+        raise ValueError("system-sync diagnostic endpoints overlap reserved lanes")
+    commands = (
+        (
+            "control",
+            "LEGOFS_PROXY LD_PRELOAD= /payload/bin/system-sync-probe control",
+            None,
+        ),
+        (
+            "preload-libc",
+            "LEGOFS_PROXY "
+            f"BADFS_CLIENT_ENDPOINT_ID={first_endpoint} "
+            "BADFS_OBSERVATION_MODE=off "
+            "INTERCEPT_LOG=/tmp/system-sync-preload-libc.log "
+            "LD_PRELOAD=/payload/lib/libbadfs_intercept.so "
+            "/payload/bin/system-sync-probe preload-libc",
+            "/tmp/system-sync-preload-libc.log",
+        ),
+        (
+            "preload-all",
+            "LEGOFS_PROXY "
+            f"BADFS_CLIENT_ENDPOINT_ID={first_endpoint + 1} "
+            "BADFS_OBSERVATION_MODE=off INTERCEPT_ALL_OBJS=1 "
+            "INTERCEPT_LOG=/tmp/system-sync-preload-all.log "
+            "LD_PRELOAD=/payload/lib/libbadfs_intercept.so "
+            "/payload/bin/system-sync-probe preload-all",
+            "/tmp/system-sync-preload-all.log",
+        ),
+    )
+    records = []
+    for label, command, log_path in commands:
+        event = _send_and_wait(
+            console,
+            command,
+            "LEGOFS_IO500_PROXY_EXIT index=0 rc=",
+            timeout,
+        )
+        record = parse_system_sync_probe(event["output"], label)
+        record["elapsed_ns"] = event["elapsed_ns"]
+        if log_path is not None:
+            log_event = _send_and_wait(
+                console,
+                "LEGOFS_PROXY LD_PRELOAD= /bin/busybox grep -E "
+                "' -- (clone|execve|pipe2|wait4|fcntl)' "
+                + log_path,
+                "LEGOFS_IO500_PROXY_EXIT index=0 rc=0",
+                timeout,
+            )
+            record["syscall_log_tail"] = [
+                line.rstrip("\r")
+                for line in log_event["output"].splitlines()
+                if " -- " in line
+            ]
+        records.append(record)
+    control = records[0]
+    if not (
+        control.get("program_reached")
+        and control.get("raw_status") == 0
+        and control.get("child_reached") == 1
+        and control.get("proxy_rc") == 0
+    ):
+        raise ValueError(f"unpreloaded system-sync control failed: {control}")
+    return {
+        "schema_version": "legofs.system-sync-probe.v1",
+        "profile": "diagnose-system-sync",
+        "outside_io500_timing": True,
+        "records": records,
+    }
+
+
 def run_clean_restart_fault(
     server_console: Console,
     client_consoles: list[Console],
@@ -1744,59 +2302,20 @@ def launch_mpi(
             coordinator.wait(
                 f"LEGOFS_IO500_PREFLIGHT_RELEASED endpoint={endpoint}", 30
             )
-    # Oversubscribed TCG advances each VM's wall clock according to the host
-    # time that VM receives.  IO500's official find phase compares ctime from
-    # client0's result disk with ctime assigned by other guests, so a one-shot
-    # boot synchronization is insufficient.  Maintain a common wall-clock
-    # epoch while MPI runs; IO500 elapsed time remains MPI monotonic time.
-    maintain_clocks = stage == "tiny" and serving_transport == "cxl"
-    clock_stop = threading.Event()
-    clock_maintenance = []
-    clock_errors = []
-
-    def maintain_guest_clocks() -> None:
-        while not clock_stop.wait(1.0):
-            try:
-                clock_maintenance.append(
-                    synchronize_guest_clocks(
-                        server_consoles,
-                        client_consoles,
-                        client_count=client_count,
-                        # Under saturated TCG the date command can be queued
-                        # for several host seconds after all consoles receive
-                        # it.  The filesystem-level find predicate remains the
-                        # authoritative correctness check; this larger bound
-                        # only prevents that queueing delay from aborting the
-                        # diagnostic helper itself.
-                        allowed_receipt_lag_seconds=30,
-                    )
-                )
-            except BaseException as error:
-                clock_errors.append(error)
-                return
-
-    clock_thread = None
-    if maintain_clocks:
-        clock_thread = threading.Thread(
-            target=maintain_guest_clocks,
-            name="legofs-io500-clock-maintenance",
-            daemon=True,
-        )
-        clock_thread.start()
-    try:
-        rc = wait_mpi_exit(
-            coordinator,
-            stage,
-            timeout,
-            start,
-            monitored_guests=monitored_guests,
-        )
-    finally:
-        if clock_thread is not None:
-            clock_stop.set()
-            clock_thread.join(timeout=35)
-    if clock_thread is not None and clock_thread.is_alive():
-        raise TimeoutError("guest clock maintenance did not stop")
+    # Never step CLOCK_REALTIME after the measured workload is released.
+    # MPI/IO500 implementations may derive cross-rank phase boundaries from
+    # clocks that are not monotonic across `date -s`; periodic console-driven
+    # correction therefore corrupts elapsed time and also perturbs TCG.  The
+    # topology-wide synchronization above is the final clock mutation for this
+    # run.  Any later filesystem timestamp-coherence failure is a product bug
+    # to diagnose, not something the measurement harness may hide.
+    rc = wait_mpi_exit(
+        coordinator,
+        stage,
+        timeout,
+        start,
+        monitored_guests=monitored_guests,
+    )
     return {
         "launcher": "MPICH Hydra manual",
         "coordinator": "client0",
@@ -1804,10 +2323,11 @@ def launch_mpi(
         "proxy_commands": [by_proxy[index] for index in range(client_count)],
         "post_preflight_clock_sync": post_preflight_clock_sync,
         "clock_maintenance": {
-            "enabled": maintain_clocks,
-            "interval_seconds": 1.0 if maintain_clocks else None,
-            "synchronizations": clock_maintenance,
-            "errors": [str(error) for error in clock_errors],
+            "enabled": False,
+            "interval_seconds": None,
+            "synchronizations": [],
+            "errors": [],
+            "reason": "measurement-window clock mutation is forbidden",
         },
         "output_start": start,
         "output_end": len(coordinator.output),
@@ -1931,6 +2451,41 @@ def validate_cxl_path_summary(
         consumed = item.get("cqe_consumed")
         if not isinstance(submitted, int) or submitted <= 0 or consumed != submitted:
             raise ValueError("local CXL SQ/CQ counters are not balanced")
+        handoff = item.get("persistence_handoff")
+        handoff_fields = (
+            "request_generation",
+            "release_generation",
+            "grant_generation",
+        )
+        if not isinstance(handoff, dict) or any(
+            not isinstance(handoff.get(name), int) or handoff[name] < 0
+            for name in handoff_fields
+        ):
+            raise ValueError("CXL persistence-handoff snapshot is incomplete")
+        handoff_requests = item.get("persistence_handoff_requests")
+        handoff_grants = item.get("persistence_handoff_grants")
+        handoff_releases = item.get("persistence_handoff_releases")
+        handoff_wait_ns = item.get("persistence_handoff_wait_ns")
+        if any(
+            not isinstance(value, int) or value < 0
+            for value in (
+                handoff_requests,
+                handoff_grants,
+                handoff_releases,
+                handoff_wait_ns,
+            )
+        ):
+            raise ValueError("CXL persistence-handoff counters are incomplete")
+        if not (
+            handoff_requests == handoff_grants == handoff_releases
+            and handoff["request_generation"]
+            == handoff["grant_generation"]
+            == handoff["release_generation"]
+            == handoff_requests
+        ):
+            raise ValueError("CXL persistence-handoff generations are not balanced")
+        if (handoff_requests > 0) != (handoff_wait_ns > 0):
+            raise ValueError("CXL persistence-handoff wait evidence is inconsistent")
         sequences = item.get("shared_sequences")
         if not isinstance(sequences, dict) or any(
             sequences.get(name) != submitted
@@ -1987,6 +2542,23 @@ def validate_cxl_path_summary(
             or client_timing["cq_wait_ns"] <= 0
         ):
             raise ValueError("CXL client timing evidence does not cover every request")
+        cq_wait_by_opcode = item.get("cq_wait_ns_by_opcode")
+        if (
+            not isinstance(cq_wait_by_opcode, dict)
+            or not cq_wait_by_opcode
+            or any(
+                not isinstance(opcode, str)
+                or not opcode.isdigit()
+                or int(opcode) < 0
+                or int(opcode) > 255
+                or not isinstance(wait_ns, int)
+                or wait_ns <= 0
+                for opcode, wait_ns in cq_wait_by_opcode.items()
+            )
+            or sum(cq_wait_by_opcode.values()) != client_timing["cq_wait_ns"]
+            or not set(cq_wait_by_opcode).issubset(item.get("dispatches_by_opcode", {}))
+        ):
+            raise ValueError("per-opcode CQ wait evidence is inconsistent")
         cursor_mode = item.get("cursor_mode")
         if cursor_mode not in ("legacy_shared", "owned"):
             raise ValueError("CXL serving evidence has an invalid cursor mode")
@@ -2014,6 +2586,8 @@ def validate_cxl_path_summary(
         fused_close_snapshot_releases = item.get(
             "fused_close_snapshot_releases"
         )
+        batched_close_commands = item.get("batched_close_commands")
+        batched_close_items = item.get("batched_close_items")
         if any(
             not isinstance(value, int) or value < 0
             for value in (
@@ -2022,11 +2596,18 @@ def validate_cxl_path_summary(
                 fused_fallbacks,
                 fused_close_attempts,
                 fused_close_snapshot_releases,
+                batched_close_commands,
+                batched_close_items,
             )
         ) or fused_pins + fused_fallbacks > fused_attempts:
             raise ValueError("CXL fused-open evidence is inconsistent")
         if fused_close_snapshot_releases > fused_close_attempts:
             raise ValueError("CXL fused-close evidence is inconsistent")
+        if (
+            batched_close_commands > batched_close_items
+            or batched_close_items > fused_close_snapshot_releases
+        ):
+            raise ValueError("CXL batched-close evidence is inconsistent")
         lane_access = item.get("client_lane_access")
         access_fields = (
             "submit_calls",
@@ -2099,8 +2680,33 @@ def validate_cxl_path_summary(
             raise ValueError("direct metadata cold-outcome accounting is inconsistent")
         if cold_hits > direct_hits or cold_not_found > direct_not_found:
             raise ValueError("direct metadata cold outcomes exceed logical outcomes")
-        if direct_fallbacks != cold_fallbacks:
+        # Cold admission is one source of a real READ_METADATA command, but
+        # not the only one once direct-mutation overlays are enabled. A
+        # reader with an existing hint may correctly fail closed while the
+        # relevant catalog generation is odd or changes during joint
+        # validation. The total logical outcome and opcode checks below still
+        # account for every such command exactly; the cold subset may only be
+        # smaller than that total.
+        if cold_fallbacks > direct_fallbacks:
             raise ValueError("direct metadata fallback accounting is inconsistent")
+        unstable_retries = item["direct_metadata_unstable_read_retries"]
+        unstable_outcomes = (
+            item["direct_metadata_unstable_read_recoveries"]
+            + item["direct_metadata_unstable_read_exhaustions"]
+        )
+        if unstable_outcomes > unstable_retries:
+            raise ValueError("direct metadata unstable-read accounting is inconsistent")
+        unstable_reasons = sum(
+            item[name]
+            for name in (
+                "direct_metadata_unstable_root_unavailable",
+                "direct_metadata_unstable_dentry_decode",
+                "direct_metadata_unstable_inode_decode",
+                "direct_metadata_unstable_snapshot_changed",
+            )
+        )
+        if unstable_reasons != unstable_retries:
+            raise ValueError("direct metadata unstable-read reasons do not close")
         if direct_attempts == 0 and any(
             item[name] != 0
             for name in (
@@ -2109,6 +2715,13 @@ def validate_cxl_path_summary(
                 "direct_metadata_root_loads",
                 "direct_metadata_dentry_cell_loads",
                 "direct_metadata_inode_record_loads",
+                "direct_metadata_unstable_read_retries",
+                "direct_metadata_unstable_read_recoveries",
+                "direct_metadata_unstable_read_exhaustions",
+                "direct_metadata_unstable_root_unavailable",
+                "direct_metadata_unstable_dentry_decode",
+                "direct_metadata_unstable_inode_decode",
+                "direct_metadata_unstable_snapshot_changed",
             )
         ):
             raise ValueError("idle direct metadata reader reports memory accesses")
@@ -2119,6 +2732,62 @@ def validate_cxl_path_summary(
                 raise ValueError("rpc metadata mode executed the direct CXL reader")
         elif expected_direct_metadata_mode == "cxl" and not direct_capability:
             raise ValueError("direct metadata capability absent in cxl mode")
+        if any(
+            not isinstance(item.get(name), int) or item[name] < 0
+            for name in DIRECT_MUTATION_CLIENT_COUNTERS
+        ):
+            raise ValueError("CXL direct mutation evidence is incomplete")
+        mutation_attempts = item["direct_create_attempts"]
+        mutation_hits = item["direct_create_hits"]
+        mutation_fallbacks = item["direct_create_fallbacks"]
+        mutation_errors = item["direct_create_errors"]
+        mutation_installs = item["direct_mutation_lease_installs"]
+        mutation_replacements = item["direct_mutation_lease_replacements"]
+        mutation_handoffs = item["direct_mutation_generic_close_handoffs"]
+        if mutation_attempts != mutation_hits + mutation_fallbacks + mutation_errors:
+            raise ValueError("direct create attempt accounting is inconsistent")
+        if mutation_hits != (
+            item["direct_create_commands_elided"]
+            + item["direct_create_post_grant_retry_hits"]
+        ):
+            raise ValueError("direct create hit-origin accounting is inconsistent")
+        if mutation_fallbacks != (
+            item["direct_create_fallback_ineligible"]
+            + item["direct_create_fallback_no_parent_writer"]
+            + item["direct_create_fallback_existing"]
+            + item["direct_create_fallback_inode_exhausted"]
+        ):
+            raise ValueError("direct create fallback-reason accounting is inconsistent")
+        if mutation_installs > mutation_attempts or (mutation_hits > 0 and mutation_installs == 0):
+            raise ValueError("direct mutation lease accounting is inconsistent")
+        if mutation_replacements > max(0, mutation_installs - 1):
+            raise ValueError("direct mutation lease replacement accounting is inconsistent")
+        if mutation_handoffs > mutation_hits:
+            raise ValueError("direct mutation generic-close handoff accounting is inconsistent")
+        unlink_attempts = item["direct_unlink_attempts"]
+        unlink_elided = item["direct_unlink_commands_elided"]
+        unlink_fallbacks = item["direct_unlink_fallbacks"]
+        if unlink_attempts != (
+            unlink_elided
+            + unlink_fallbacks
+            + item["direct_unlink_not_found"]
+            + item["direct_unlink_membership_changing"]
+            + item["direct_unlink_lease_revoked"]
+        ):
+            raise ValueError("direct unlink outcome accounting is inconsistent")
+        if unlink_fallbacks != sum(
+            item[name]
+            for name in (
+                "direct_unlink_fallback_ineligible",
+                "direct_unlink_fallback_no_parent_writer",
+                "direct_unlink_fallback_unapplied_peer",
+                "direct_unlink_fallback_base_unavailable",
+                "direct_unlink_fallback_overlay_changed",
+                "direct_unlink_fallback_unsupported_target",
+                "direct_unlink_fallback_live_ofd",
+            )
+        ):
+            raise ValueError("direct unlink fallback-reason accounting is inconsistent")
         dispatches = item.get("dispatches_by_opcode")
         if not isinstance(dispatches, dict) or not dispatches:
             raise ValueError("CXL serving evidence lacks opcode dispatches")
@@ -2162,15 +2831,23 @@ def validate_posix_summaries(
     expected_cursor_mode: str | None = None,
     expected_cq_wait_mode: str | None = None,
     expected_direct_metadata_mode: str | None = None,
+    expected_close_mode: str = "batched",
+    expected_payload_persistence_owner: str | None = None,
 ) -> None:
+    if expected_close_mode not in ("immediate", "batched"):
+        raise ValueError("invalid expected lifecycle close mode")
     active_ranks = set()
     authority_count = None
     fused_open_attempts = 0
     fused_open_pins = 0
     fused_close_attempts = 0
     fused_close_snapshot_releases = 0
+    batched_close_commands = 0
+    batched_close_items = 0
     direct_attempts = 0
     direct_hits = 0
+    handoff_requests_by_rank = {rank: 0 for rank in range(client_count)}
+    direct_ro_totals = {name: 0 for name in DIRECT_RO_POSIX_COUNTERS}
     for record in records:
         rank = record.get("mpi_rank")
         endpoint = record.get("endpoint")
@@ -2191,10 +2868,36 @@ def validate_posix_summaries(
             fused_close_snapshot_releases += evidence[
                 "fused_close_snapshot_releases"
             ]
+            batched_close_commands += evidence["batched_close_commands"]
+            batched_close_items += evidence["batched_close_items"]
             direct_attempts += evidence["direct_metadata_attempts"]
             direct_hits += evidence["direct_metadata_hits"]
             direct_hits += evidence["direct_metadata_not_found_hits"]
+            handoff_requests_by_rank[rank] += evidence[
+                "persistence_handoff_requests"
+            ]
         stats = record.get("stats", {})
+        for name in DIRECT_RO_POSIX_COUNTERS:
+            value = stats.get(name, 0)
+            if not isinstance(value, int) or value < 0:
+                raise ValueError("direct RO POSIX evidence is incomplete")
+            direct_ro_totals[name] += value
+        if (
+            stats.get("direct_ro_open_hits", 0)
+            + stats.get("direct_ro_open_fallbacks", 0)
+            > stats.get("direct_ro_open_attempts", 0)
+            or stats.get("direct_ro_open_commands_elided", 0)
+            != stats.get("direct_ro_open_hits", 0)
+            or stats.get("direct_ro_layout_roots_loaded", 0)
+            != stats.get("direct_ro_open_hits", 0)
+            or stats.get("direct_ro_epoch_acquires", 0)
+            != stats.get("direct_ro_open_hits", 0)
+            or stats.get("direct_ro_epoch_releases", 0)
+            > stats.get("direct_ro_epoch_acquires", 0)
+            or stats.get("direct_ro_close_commands_elided", 0)
+            > stats.get("direct_ro_epoch_releases", 0)
+        ):
+            raise ValueError("direct RO POSIX evidence is inconsistent")
         totals = record.get("syscall_classification", {}).get("totals", {})
         if sum(stats.get(name, 0) for name in ("open_ops", "read_ops", "write_ops")) > 0:
             if totals.get("handled", 0) <= 0:
@@ -2205,19 +2908,43 @@ def validate_posix_summaries(
             f"active POSIX summaries do not cover ranks 0..{client_count - 1}: "
             f"{sorted(active_ranks)}"
         )
+    direct_ro_hits = direct_ro_totals["direct_ro_open_hits"]
+    direct_ro_releases = direct_ro_totals["direct_ro_epoch_releases"]
+    direct_ro_close_elided = direct_ro_totals[
+        "direct_ro_close_commands_elided"
+    ]
     if (
-        fused_open_attempts == 0
-        or fused_open_pins == 0
-        or fused_close_attempts == 0
-        or fused_close_snapshot_releases == 0
+        fused_open_attempts + direct_ro_totals["direct_ro_open_attempts"] == 0
+        or fused_open_pins + direct_ro_hits == 0
+        or fused_close_attempts + direct_ro_close_elided == 0
+        or fused_close_snapshot_releases + direct_ro_releases == 0
     ):
         raise ValueError(
-            "fused lifecycle mode did not pin and retire an existing regular file"
+            "lifecycle mode did not retain and retire an existing regular file"
         )
+    if expected_close_mode == "batched" and (
+        batched_close_commands == 0 or batched_close_items == 0
+    ) and direct_ro_close_elided == 0:
+        raise ValueError("batched lifecycle close mode produced no bounded close batch")
+    if expected_close_mode == "immediate" and (
+        batched_close_commands != 0 or batched_close_items != 0
+    ):
+        raise ValueError("immediate lifecycle close mode dispatched a close batch")
     if expected_direct_metadata_mode == "cxl" and (
         direct_attempts <= 0 or direct_hits <= 0
     ):
         raise ValueError("cxl metadata mode produced no direct metadata hit")
+    if expected_payload_persistence_owner == "WRITER_RECEIPT":
+        missing = [
+            rank
+            for rank in sorted(active_ranks)
+            if handoff_requests_by_rank[rank] <= 0
+        ]
+        if missing:
+            raise ValueError(
+                "writer-receipt run lacks completed CXL persistence handoff "
+                f"for active ranks {missing}"
+            )
 
 
 def validate_post_run_exporter_summary(
@@ -2286,6 +3013,8 @@ def dump_summaries(
     expected_cursor_mode: str | None = None,
     expected_cq_wait_mode: str | None = None,
     expected_direct_metadata_mode: str | None = None,
+    expected_close_mode: str = "batched",
+    expected_payload_persistence_owner: str | None = None,
 ) -> list[dict]:
     starts = [len(console.output) for console in consoles]
     for console in consoles:
@@ -2304,6 +3033,8 @@ def dump_summaries(
         expected_cursor_mode,
         expected_cq_wait_mode,
         expected_direct_metadata_mode,
+        expected_close_mode,
+        expected_payload_persistence_owner,
     )
     return records
 
@@ -2451,6 +3182,16 @@ def validate_recovery_control_checkpoints(
             or client_timing["cq_wait_ns"] <= 0
         ):
             raise ValueError("recovery-control client evidence is incomplete")
+        cq_wait_by_opcode = transport.get("cq_wait_ns_by_opcode")
+        if (
+            not isinstance(cq_wait_by_opcode, dict)
+            or not cq_wait_by_opcode
+            or sum(cq_wait_by_opcode.values()) != client_timing["cq_wait_ns"]
+            or not set(cq_wait_by_opcode).issubset(
+                transport.get("dispatches_by_opcode", {})
+            )
+        ):
+            raise ValueError("recovery-control per-opcode CQ wait evidence is inconsistent")
         if transport.get("dispatches_by_opcode") != {"1": 1, "2": 1}:
             raise ValueError(
                 "recovery-control checkpoint/retirement opcodes were not dispatched exactly once"
@@ -2473,8 +3214,12 @@ def inspect_servers(
     server_count: int,
     *,
     require_direct_read: bool = True,
+    command_free_direct_read_ops: int = 0,
     require_recovery_control: bool = True,
     expected_direct_metadata_mode: str | None = None,
+    expected_packed_small_segments: bool | None = None,
+    expected_durability_profile: str = "D_BEFORE_V",
+    expected_payload_persistence_owner: str | None = None,
 ) -> dict:
     start = len(console.output)
     console.send("LEGOFS_INSPECT")
@@ -2483,16 +3228,62 @@ def inspect_servers(
         console.output[start:],
         server_count,
         require_direct_read=require_direct_read,
+        command_free_direct_read_ops=command_free_direct_read_ops,
         require_recovery_control=require_recovery_control,
         expected_direct_metadata_mode=expected_direct_metadata_mode,
+        expected_packed_small_segments=expected_packed_small_segments,
+        expected_durability_profile=expected_durability_profile,
+        expected_payload_persistence_owner=expected_payload_persistence_owner,
     )
 
 
 def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
-    """Validate the two legal payload-durability paths without conflating them."""
+    """Validate each legal payload-durability path without conflating them."""
+    owner = audit.get("payload_persistence_owner")
+    if owner not in (
+        "AUTHORITY_BI_ACQUIRE",
+        "WRITER_RECEIPT",
+        "PLACEMENT_ROUTED",
+        "WRITER_BEFORE_VISIBILITY",
+    ):
+        raise ValueError(
+            f"lifecycle server {server} lacks a valid payload persistence owner"
+        )
     direct_items = audit["direct_write_commit_items"]
     writer_items = audit["writer_persisted_direct_items"]
     writer_bytes = audit["writer_persisted_direct_bytes"]
+    receipt_items = audit.get("host_persist_receipts_accepted", 0)
+    receipt_duplicates = audit.get("host_persist_receipts_duplicate", 0)
+    receipt_rejections = audit.get("host_persist_receipts_rejected", 0)
+    pending_receipts = audit.get("pending_payload_dependencies", 0)
+    authority = {
+        name: audit.get(name, 0)
+        for name in (
+            "authority_coherent_acquire_jobs",
+            "authority_coherent_acquire_ranges",
+            "authority_coherent_acquire_bytes",
+            "authority_coherent_acquire_ns",
+            "authority_payload_persist_jobs",
+            "authority_payload_persist_ranges",
+            "authority_payload_persist_bytes",
+            "authority_payload_persist_ns",
+        )
+    }
+    for name, value in (
+        ("host_persist_receipts_accepted", receipt_items),
+        ("host_persist_receipts_duplicate", receipt_duplicates),
+        ("host_persist_receipts_rejected", receipt_rejections),
+        ("pending_payload_dependencies", pending_receipts),
+    ):
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"lifecycle server {server} lacks valid {name} evidence"
+            )
+    for name, value in authority.items():
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"lifecycle server {server} lacks valid {name} evidence"
+            )
     if writer_items > direct_items:
         raise ValueError(
             f"lifecycle server {server} reports more writer-persisted items "
@@ -2516,22 +3307,234 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
         and writer_items == direct_items
         and writer_bytes > 0
     )
-    if direct_items > writer_items and not provider:
+    writer_host_receipt_complete = (
+        direct_items > 0
+        and writer_items + receipt_items == direct_items
+        and receipt_items > 0
+        and receipt_rejections == 0
+        and pending_receipts == 0
+    )
+    authority_jobs = authority["authority_coherent_acquire_jobs"]
+    authority_complete = (
+        authority_jobs > 0
+        and authority["authority_payload_persist_jobs"] == authority_jobs
+        and authority["authority_coherent_acquire_ranges"]
+        == authority["authority_payload_persist_ranges"]
+        > 0
+        and authority["authority_coherent_acquire_bytes"]
+        == authority["authority_payload_persist_bytes"]
+        > 0
+        and authority["authority_coherent_acquire_ns"] > 0
+        and authority["authority_payload_persist_ns"] > 0
+    )
+    if authority_jobs > 0 and not authority_complete:
         raise ValueError(
-            f"lifecycle server {server} has direct-write items without payload "
-            "persistence evidence"
+            f"lifecycle server {server} has incomplete authority payload evidence"
         )
-    if direct_items > 0 and not (provider or writer_complete):
+    if receipt_items > direct_items - writer_items:
         raise ValueError(
-            f"lifecycle server {server} lacks payload persistence evidence"
+            f"lifecycle server {server} reports receipts beyond deferred direct items"
         )
+    authority_dependency_items = direct_items - writer_items
+    if owner == "PLACEMENT_ROUTED":
+        authority_dependency_items -= receipt_items
+    if owner == "AUTHORITY_BI_ACQUIRE":
+        if receipt_items != 0 or receipt_duplicates != 0 or receipt_rejections != 0:
+            raise ValueError(
+                f"lifecycle server {server} mixed writer receipts into authority ownership"
+            )
+        if pending_receipts != 0:
+            raise ValueError(
+                f"lifecycle server {server} has pending authority payload dependencies"
+            )
+        if authority_dependency_items > 0 and not (
+            provider
+            and authority_complete
+            and authority["authority_coherent_acquire_ranges"]
+            >= authority_dependency_items
+        ):
+            raise ValueError(
+                f"lifecycle server {server} lacks complete authority-owned payload evidence"
+            )
+    elif owner not in ("PLACEMENT_ROUTED",) and any(authority.values()):
+        raise ValueError(
+            f"lifecycle server {server} used authority persistence under owner {owner}"
+        )
+    if owner == "WRITER_RECEIPT":
+        if direct_items > 0 and not writer_host_receipt_complete:
+            raise ValueError(
+                f"lifecycle server {server} lacks payload persistence evidence"
+            )
+    elif owner == "PLACEMENT_ROUTED":
+        if pending_receipts != 0 or receipt_rejections != 0:
+            raise ValueError(
+                f"lifecycle server {server} has incomplete placement-routed receipts"
+            )
+        if authority_dependency_items > 0 and not (
+            provider
+            and authority_complete
+            and authority["authority_coherent_acquire_ranges"]
+            >= authority_dependency_items
+        ):
+            raise ValueError(
+                f"lifecycle server {server} lacks placement-routed authority evidence"
+            )
+        if receipt_items == 0 and authority_dependency_items == 0 and direct_items > writer_items:
+            raise ValueError(
+                f"lifecycle server {server} did not close placement-routed dependencies"
+            )
+    elif owner == "WRITER_BEFORE_VISIBILITY":
+        if direct_items > 0 and not (provider or writer_complete):
+            raise ValueError(
+                f"lifecycle server {server} has direct-write items without payload "
+                "persistence evidence"
+            )
     return {
+        "owner": owner,
         "provider_payload_barrier": provider,
+        "authority_complete": authority_complete,
+        **authority,
         "writer_persisted_complete": writer_complete,
+        "writer_host_receipt_complete": writer_host_receipt_complete,
+        "placement_routed_complete": owner == "PLACEMENT_ROUTED"
+        and pending_receipts == 0
+        and receipt_rejections == 0
+        and (authority_dependency_items == 0 or authority_complete),
         "direct_write_commit_items": direct_items,
         "writer_persisted_direct_items": writer_items,
         "writer_persisted_direct_bytes": writer_bytes,
+        "host_persist_receipts_accepted": receipt_items,
+        "host_persist_receipts_duplicate": receipt_duplicates,
+        "host_persist_receipts_rejected": receipt_rejections,
+        "pending_payload_dependencies": pending_receipts,
+        "authority_dependency_items": authority_dependency_items,
     }
+
+
+def validate_packed_small_segment_audit(
+    audit: dict,
+    server: int,
+    *,
+    expected_packed_small_segments: bool | None,
+) -> None:
+    """Fail closed unless the selected small-object allocator actually ran."""
+    for name in PACKED_SMALL_SEGMENT_SERVER_COUNTERS:
+        if not isinstance(audit.get(name), int) or audit[name] < 0:
+            raise ValueError(
+                f"lifecycle server {server} lacks packed-small-segment {name} evidence"
+            )
+    if expected_packed_small_segments is None:
+        return
+
+    packed_values = {
+        name: audit[name]
+        for name in PACKED_SMALL_SEGMENT_SERVER_COUNTERS
+        if not name.startswith("legacy_small_arena_")
+    }
+    if expected_packed_small_segments:
+        for name in (
+            "backend_fresh_format_scan_bytes",
+            "backend_publication_slots_reset",
+            "startup_small_runtime_segments",
+            "startup_small_runtime_cells",
+        ):
+            if audit[name] != 0:
+                raise ValueError(
+                    f"lifecycle server {server} fresh layout-v7 startup reports {name}={audit[name]}"
+                )
+        if audit["small_segment_claims"] <= 0:
+            raise ValueError(
+                f"lifecycle server {server} observed no packed segment claim"
+            )
+        if audit["small_segment_claim_persist_ns"] <= 0:
+            raise ValueError(
+                f"lifecycle server {server} lacks packed segment claim persistence timing"
+            )
+        if audit["small_cell_grants"] <= 0:
+            raise ValueError(
+                f"lifecycle server {server} observed no packed small-cell grants"
+            )
+        if (
+            audit["small_cell_commits"] <= 0
+            or audit["small_cell_commits"] > audit["small_cell_grants"]
+        ):
+            raise ValueError(
+                f"lifecycle server {server} has inconsistent packed small-cell commits"
+            )
+        if audit["small_cell_payload_bytes"] <= 0:
+            raise ValueError(
+                f"lifecycle server {server} observed no packed small-cell payload"
+            )
+        if (
+            audit["small_cell_payload_persist_bytes"]
+            > audit["small_cell_payload_bytes"]
+        ):
+            raise ValueError(
+                f"lifecycle server {server} over-counted packed payload persistence"
+            )
+        durable_payload_bytes = (
+            audit["small_cell_payload_persist_bytes"]
+            + int(audit.get("writer_persisted_direct_bytes", 0))
+        )
+        if durable_payload_bytes < audit["small_cell_payload_bytes"]:
+            raise ValueError(
+                f"lifecycle server {server} lacks packed payload durability evidence"
+            )
+        if audit["small_cell_allocator_persist_barriers"] != 0:
+            raise ValueError(
+                f"lifecycle server {server} persisted allocator metadata per small cell"
+            )
+        if (
+            audit["legacy_small_arena_reserve_calls"] != 0
+            or audit["legacy_small_arena_reserve_ns"] != 0
+        ):
+            raise ValueError(
+                f"lifecycle server {server} reached the legacy 4 KiB reserve path"
+            )
+    else:
+        if any(packed_values.values()):
+            raise ValueError(
+                f"lifecycle server {server} used packed-small-segment work in v6 mode"
+            )
+        if (
+            audit["legacy_small_arena_reserve_calls"] <= 0
+            or audit["legacy_small_arena_reserve_ns"] <= 0
+        ):
+            raise ValueError(
+                f"lifecycle server {server} observed no legacy 4 KiB reserve"
+            )
+
+
+def validate_packed_small_segment_client_evidence(
+    summaries: list[dict], *, expected_packed_small_segments: bool | None
+) -> None:
+    totals = {
+        name: sum(
+            int(record.get("stats", {}).get(name, 0)) for record in summaries
+        )
+        for name in PACKED_SMALL_SEGMENT_CLIENT_COUNTERS
+    }
+    if expected_packed_small_segments is None:
+        return
+    if expected_packed_small_segments:
+        if totals["small_segment_dynamic_mmap_calls"] <= 0:
+            raise ValueError("packed client observed no dynamic mmap")
+        if (
+            totals["small_segment_dynamic_mmap_calls"]
+            != totals["small_segment_mapped_owner_segments"]
+        ):
+            raise ValueError("packed client observed a duplicate dynamic mmap")
+        if totals["small_segment_dynamic_mmap_ns"] <= 0:
+            raise ValueError("packed client lacks dynamic mmap elapsed time")
+        if totals["small_segment_cache_hits"] <= 0:
+            raise ValueError("packed client observed no segment-cache reuse")
+        if (
+            totals["small_segment_protection_calls"] <= 0
+            or totals["small_segment_protection_ns"] <= 0
+        ):
+            raise ValueError("packed client lacks protection-transition evidence")
+    elif any(totals.values()):
+        raise ValueError("v6 client unexpectedly used packed-small-segment mapping")
 
 
 def parse_server_inspection(
@@ -2539,9 +3542,13 @@ def parse_server_inspection(
     server_count: int,
     *,
     require_direct_read: bool = True,
+    command_free_direct_read_ops: int = 0,
     expected_active_client_lanes: int = 0,
     require_recovery_control: bool = True,
     expected_direct_metadata_mode: str | None = None,
+    expected_packed_small_segments: bool | None = None,
+    expected_durability_profile: str = "D_BEFORE_V",
+    expected_payload_persistence_owner: str | None = None,
 ) -> dict:
     marker = "badfs_lifecycle_inspection "
     recovery_marker = "badfs_recovery_control_checkpoint "
@@ -2577,8 +3584,15 @@ def parse_server_inspection(
         key: sum(record.get("fabric", {}).get(key, 0) for record in records)
         for key in records[0].get("fabric", {})
     }
+    if (
+        not isinstance(command_free_direct_read_ops, int)
+        or command_free_direct_read_ops < 0
+    ):
+        raise ValueError("invalid command-free direct-read evidence")
     if fabric.get("trusted_direct_write_ops", 0) == 0 or (
-        require_direct_read and fabric.get("trusted_direct_read_ops", 0) == 0
+        require_direct_read
+        and fabric.get("trusted_direct_read_ops", 0) == 0
+        and command_free_direct_read_ops == 0
     ):
         raise ValueError("lifecycle inspection lacks direct write/read operations")
     forbidden_fabric = (
@@ -2595,6 +3609,15 @@ def parse_server_inspection(
     validate_authority_internal_fabric(fabric, server_count)
     for record in records:
         audit = record.get("audit", {})
+        if (
+            expected_payload_persistence_owner is not None
+            and audit.get("payload_persistence_owner")
+            != expected_payload_persistence_owner
+        ):
+            raise ValueError(
+                f"lifecycle server {record['server']} reported unexpected "
+                "payload persistence owner"
+            )
         for name in ("pending_operations", "quarantined_extents", "active_read_leases"):
             if audit.get(name, 0) != 0:
                 raise ValueError(
@@ -2644,6 +3667,32 @@ def parse_server_inspection(
             "direct_write_commit_items",
             "writer_persisted_direct_items",
             "writer_persisted_direct_bytes",
+            "host_persist_receipts_accepted",
+            "host_persist_receipts_duplicate",
+            "host_persist_receipts_rejected",
+            "pending_payload_dependencies",
+            "pending_payload_bytes",
+            "authority_coherent_acquire_jobs",
+            "authority_coherent_acquire_ranges",
+            "authority_coherent_acquire_bytes",
+            "authority_coherent_acquire_ns",
+            "authority_payload_persist_jobs",
+            "authority_payload_persist_ranges",
+            "authority_payload_persist_bytes",
+            "authority_payload_persist_ns",
+            "state_log_lock_wait_ns",
+            "state_log_delta_ns",
+            "state_log_encode_ns",
+            "state_log_metadata_ns",
+            "state_log_write_ns",
+            "state_log_fsync_ns",
+            "deferred_state_capture_lock_wait_ns",
+            "deferred_state_clone_ns",
+            "deferred_state_dependency_close_ns",
+            "deferred_state_receipt_wait_ns",
+            "deferred_state_append_ns",
+            "deferred_state_not_ready_cuts",
+            "deferred_state_resumed_cuts",
             "provider_allocator_barriers",
             "provider_allocator_bytes",
             "foreground_checkpoint_waits",
@@ -2660,11 +3709,29 @@ def parse_server_inspection(
             "arena_acquire_state_persist_ns",
             "arena_acquire_trace_ns",
             "arena_acquire_total_ns",
+            "backend_fresh_format_scan_bytes",
+            "backend_publication_slots_reset",
+            "startup_small_runtime_segments",
+            "startup_small_runtime_cells",
+            "small_segment_claims",
+            "small_segment_claim_persist_ns",
+            "small_cell_grants",
+            "small_cell_commits",
+            "small_cell_payload_bytes",
+            "small_cell_payload_persist_bytes",
+            "small_cell_allocator_persist_barriers",
+            "legacy_small_arena_reserve_calls",
+            "legacy_small_arena_reserve_ns",
         ):
             if not isinstance(audit.get(name), int) or audit[name] < 0:
                 raise ValueError(
                     f"lifecycle server {record['server']} lacks {name} evidence"
                 )
+        validate_packed_small_segment_audit(
+            audit,
+            record["server"],
+            expected_packed_small_segments=expected_packed_small_segments,
+        )
         if audit["metadata_wal_persist_barriers"] <= 0:
             raise ValueError(
                 f"lifecycle server {record['server']} observed no metadata WAL barrier"
@@ -2673,6 +3740,17 @@ def parse_server_inspection(
             raise ValueError(
                 f"lifecycle server {record['server']} has fewer WAL records than barriers"
             )
+        for name in (
+            "metadata_wal_deferred_appends",
+            "metadata_wal_deferred_records",
+            "metadata_wal_deferred_bytes",
+            "metadata_wal_pending_records",
+            "metadata_wal_durable_lsn",
+        ):
+            if not isinstance(audit.get(name), int) or audit[name] < 0:
+                raise ValueError(
+                    f"lifecycle server {record['server']} lacks metadata WAL field {name}"
+                )
         if (
             audit["provider_persist_barriers"] <= 0
             or audit["provider_persist_bytes"] <= 0
@@ -2699,6 +3777,13 @@ def parse_server_inspection(
             "semantic_batches",
             "semantic_batch_operations",
             "semantic_batch_bytes",
+            "persistence_batches",
+            "persistence_batch_operations",
+            "persistence_metadata_records",
+            "persistence_metadata_bytes",
+            "persistence_worker_ns",
+            "persistence_worker_metadata_ns",
+            "persistence_worker_lifecycle_ns",
             "dependency_closure_waits",
             "dependency_closure_wait_ns",
         ):
@@ -2706,30 +3791,58 @@ def parse_server_inspection(
                 raise ValueError(
                     f"lifecycle server {record['server']} lacks V/D field {name}"
                 )
-        if vd.get("provider_profile") != "D_BEFORE_V":
+        if vd.get("provider_profile") != expected_durability_profile:
             raise ValueError(
-                f"lifecycle server {record['server']} did not retain D_BEFORE_V"
+                f"lifecycle server {record['server']} reported unexpected durability profile"
             )
         logical = vd["logical_mutations"]
-        if logical <= 0 or vd["semantic_batches"] <= 0 or vd["foreground_d_waits"] <= 0:
+        if logical <= 0 or vd["semantic_batches"] <= 0:
             raise ValueError(
                 f"lifecycle server {record['server']} observed no syscall-first V/D evidence"
             )
-        if not (
-            vd["published_v"]
-            == vd["durable_d"]
-            == vd["visible_sequence"]
-            == vd["durable_sequence"]
-            == vd["semantic_batch_operations"]
-            == logical
-        ):
-            raise ValueError(
-                f"lifecycle server {record['server']} has inconsistent D-before-V counters"
-            )
-        if vd["v_to_d_lag"] != 0 or vd["max_v_to_d_lag"] != 0:
-            raise ValueError(
-                f"lifecycle server {record['server']} accumulated V/D lag in D_BEFORE_V"
-            )
+        if expected_durability_profile == "D_BEFORE_V":
+            if vd["foreground_d_waits"] <= 0 or not (
+                vd["published_v"]
+                == vd["durable_d"]
+                == vd["visible_sequence"]
+                == vd["durable_sequence"]
+                == vd["semantic_batch_operations"]
+                == logical
+            ):
+                raise ValueError(
+                    f"lifecycle server {record['server']} has inconsistent D-before-V counters"
+                )
+            if vd["v_to_d_lag"] != 0 or vd["max_v_to_d_lag"] != 0:
+                raise ValueError(
+                    f"lifecycle server {record['server']} accumulated V/D lag in D_BEFORE_V"
+                )
+        else:
+            if not (
+                vd["published_v"]
+                == vd["visible_sequence"]
+                == vd["semantic_batch_operations"]
+                == logical
+                and vd["durable_d"] == vd["durable_sequence"] <= vd["visible_sequence"]
+                and vd["v_to_d_lag"]
+                == vd["visible_sequence"] - vd["durable_sequence"]
+                and vd["max_v_to_d_lag"] >= vd["v_to_d_lag"]
+                and vd["max_v_to_d_lag"] > 0
+                and vd["durable_d"] > 0
+            ):
+                raise ValueError(
+                    f"lifecycle server {record['server']} has inconsistent V-before-D counters"
+                )
+            if (
+                vd["persistence_batches"] <= 0
+                or vd["persistence_batch_operations"] != vd["durable_sequence"]
+                or vd["persistence_worker_ns"] <= 0
+                or vd["persistence_worker_metadata_ns"] <= 0
+                or vd["persistence_worker_lifecycle_ns"] <= 0
+                or audit["metadata_wal_deferred_records"] <= 0
+            ):
+                raise ValueError(
+                    f"lifecycle server {record['server']} lacks batched authority D evidence"
+                )
         if (
             vd["dependency_closure_waits"] != vd["foreground_d_waits"]
             or vd["dependency_closure_wait_ns"] != vd["foreground_d_wait_ns"]
@@ -2760,6 +3873,7 @@ def parse_server_inspection(
                 f"lifecycle server {record['server']} has inconsistent arena timing evidence"
             )
     if server_count == 1:
+        records[0]["command_free_direct_read_ops"] = command_free_direct_read_ops
         records[0]["recovery_control"] = (
             recovery_records[0] if require_recovery_control else None
         )
@@ -2799,6 +3913,7 @@ def parse_server_inspection(
         "fabric": fabric,
         "audit": audit,
         "servers": records,
+        "command_free_direct_read_ops": command_free_direct_read_ops,
         "recovery_control": recovery_records,
     }
 
@@ -2859,7 +3974,15 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
     for event in client_events:
         marker = "BADFS_DIRECT_MAP_TRACE_JSON "
         record = decode_selected_trace_event(
-            event["line"], marker, ("persisted", "drop", "unmap")
+            event["line"],
+            marker,
+            (
+                "persisted",
+                "coherent_sealed",
+                "writer_host_persisted",
+                "drop",
+                "unmap",
+            ),
         )
         if record is None:
             continue
@@ -2873,7 +3996,14 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
     for event in server_events:
         marker = "BADFS_LIFECYCLE_TRACE_JSON "
         record = decode_selected_trace_event(
-            event["line"], marker, ("store_direct_begin", "store_direct_success")
+            event["line"],
+            marker,
+            (
+                "store_direct_begin",
+                "store_direct_success",
+                "payload_dependency_acquired",
+                "payload_dependency_persisted",
+            ),
         )
         if record is None:
             continue
@@ -2890,6 +4020,26 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
         record.get("snoop_id"): record
         for record in coherence if record.get("event") == "dirty_completion"
     }
+    fence_completions = {
+        (record.get("src_host"), record.get("session_id"), record.get("request_id")): record
+        for record in coherence
+        if record.get("event") == "persistence_fence_completion"
+        and record.get("opcode") == "FENCE"
+    }
+    fence_requests = [
+        record for record in coherence
+        if record.get("event") == "request" and record.get("opcode") == "FENCE"
+    ]
+    gets_by_line = {}
+    snoops_by_line = {}
+    for record in coherence:
+        line_address = record.get("line_address")
+        if not isinstance(line_address, int):
+            continue
+        if record.get("event") == "request" and record.get("opcode") == "GETS":
+            gets_by_line.setdefault(line_address, []).append(record)
+        elif record.get("event") == "snoop_send":
+            snoops_by_line.setdefault(line_address, []).append(record)
     begin = {
         (record.get("owner"), record.get("op_id")): (record, capture)
         for record, capture in lifecycle if record.get("event") == "store_direct_begin"
@@ -2899,7 +4049,76 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
         for record, capture in lifecycle if record.get("event") == "store_direct_success"
     }
     writer_proofs = []
+    authority_proofs = []
     bi_proofs = []
+
+    writer_host_persisted = {}
+    for record, capture in direct:
+        if record.get("event") != "writer_host_persisted":
+            continue
+        key = (record.get("owner"), record.get("op_id"))
+        if key in writer_host_persisted:
+            # More than one success event for one operation cannot establish
+            # an unambiguous one-shot provider completion.
+            writer_host_persisted[key] = None
+        else:
+            writer_host_persisted[key] = (record, capture)
+
+    def dependency_key(record):
+        numeric_fields = (
+            "owner",
+            "op_id",
+            "extent_id",
+            "extent_generation",
+            "layout_epoch",
+            "mapping_offset",
+            "mapping_length",
+            "dependency_range_index",
+            "dependency_range_count",
+            "dependency_range_bytes",
+        )
+        if any(not isinstance(record.get(field), int) for field in numeric_fields):
+            return None
+        if (
+            record["owner"] <= 0
+            or record["op_id"] <= 0
+            or record["extent_id"] <= 0
+            or record["extent_generation"] <= 0
+            or record["layout_epoch"] <= 0
+            or record["mapping_length"] <= 0
+            or record["dependency_range_count"] <= 0
+            or record["dependency_range_index"] >= record["dependency_range_count"]
+            or record["dependency_range_bytes"] <= 0
+        ):
+            return None
+        digest = record.get("dependency_range_set_digest")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return None
+        return tuple(record[field] for field in numeric_fields) + (digest,)
+
+    acquired_dependencies = {}
+    persisted_dependencies = {}
+    for record, capture in lifecycle:
+        if record.get("event") not in (
+            "payload_dependency_acquired",
+            "payload_dependency_persisted",
+        ):
+            continue
+        key = dependency_key(record)
+        if key is None:
+            continue
+        target = (
+            acquired_dependencies
+            if record.get("event") == "payload_dependency_acquired"
+            else persisted_dependencies
+        )
+        if key in target:
+            # A duplicate exact stage makes the sample ambiguous and therefore
+            # cannot establish a one-shot acquire/persist chain.
+            target[key] = None
+        else:
+            target[key] = (record, capture)
+
     for direct_record, unmap_capture in direct:
         key = (direct_record.get("owner"), direct_record.get("op_id"))
         if key not in begin or key not in success or key[0] not in owner_endpoint:
@@ -2932,6 +4151,197 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
                 "store_success_capture_ns": success_capture,
             })
             continue
+        writer_host_value = writer_host_persisted.get(key)
+        if (
+            direct_record.get("event") == "coherent_sealed"
+            and begin_record.get("fault_point") == "coherent_seal"
+            and unmap_capture < begin[key][1] <= success_capture
+            and writer_host_value is not None
+        ):
+            writer_host_record, writer_host_capture = writer_host_value
+            if (
+                writer_host_record.get("offset") == offset
+                and writer_host_record.get("length") == length
+                and success_capture < writer_host_capture
+            ):
+                writer_proofs.append({
+                    "owner": key[0],
+                    "op_id": key[1],
+                    "endpoint": owner_endpoint[key[0]],
+                    "mapping_offset": offset,
+                    "mapping_length": length,
+                    "coherent_seal_capture_ns": unmap_capture,
+                    "store_begin_capture_ns": begin[key][1],
+                    "store_success_capture_ns": success_capture,
+                    "persisted_capture_ns": writer_host_capture,
+                    "proof_kind": "writer_host_receipt",
+                })
+                continue
+        if (
+            direct_record.get("event") == "coherent_sealed"
+            and begin_record.get("fault_point") == "coherent_seal"
+            and unmap_capture < begin[key][1] <= success_capture
+        ):
+            for dependency_key_value, acquired_value in acquired_dependencies.items():
+                if acquired_value is None:
+                    continue
+                acquired_record, acquired_capture = acquired_value
+                if (
+                    acquired_record.get("owner") != key[0]
+                    or acquired_record.get("op_id") != key[1]
+                    or acquired_record.get("fault_point") != "authority_coherent_acquire"
+                    or acquired_record.get("persist_state") != "not_persisted"
+                    or acquired_capture <= success_capture
+                ):
+                    continue
+                persisted_value = persisted_dependencies.get(dependency_key_value)
+                if persisted_value is None:
+                    continue
+                persisted_record, persisted_capture = persisted_value
+                if (
+                    persisted_record.get("fault_point") != "authority_payload_persist"
+                    or persisted_record.get("persist_state") != "persisted"
+                    or persisted_capture <= acquired_capture
+                ):
+                    continue
+                dependency_offset = acquired_record["mapping_offset"]
+                dependency_length = acquired_record["mapping_length"]
+                dependency_end = dependency_offset + dependency_length
+                if (
+                    dependency_offset < offset
+                    or dependency_end > offset + length
+                    or dependency_end <= dependency_offset
+                ):
+                    continue
+
+                authority_gets = None
+                line = dependency_offset // 64 * 64
+                while line < dependency_end and authority_gets is None:
+                    for request in gets_by_line.get(line, ()):
+                        request_ns = request.get("monotonic_ns")
+                        request_host = request.get("src_host")
+                        if (
+                            isinstance(request_ns, int)
+                            and isinstance(request_host, int)
+                            and 0 <= request_host < server_count
+                            and request.get("status") == "OK"
+                            and success_capture < request_ns < acquired_capture
+                        ):
+                            authority_gets = request
+                            break
+                    line += 64
+                if authority_gets is None:
+                    continue
+
+                fence_pair = None
+                authority_host = authority_gets["src_host"]
+                for request in fence_requests:
+                    request_ns = request.get("monotonic_ns")
+                    if (
+                        request.get("src_host") != authority_host
+                        or request.get("status") != "OK"
+                        or not isinstance(request_ns, int)
+                        or not (acquired_capture < request_ns < persisted_capture)
+                    ):
+                        continue
+                    completion = fence_completions.get((
+                        request.get("src_host"),
+                        request.get("session_id"),
+                        request.get("request_id"),
+                    ))
+                    completion_ns = completion.get("monotonic_ns") if completion else None
+                    if (
+                        completion is not None
+                        and completion.get("status") == "OK"
+                        and isinstance(completion_ns, int)
+                        and request_ns <= completion_ns < persisted_capture
+                    ):
+                        fence_pair = (request, completion)
+                        break
+                if fence_pair is None:
+                    continue
+
+                dirty_transfer = None
+                cxl_host = owner_endpoint[key[0]] + server_count
+                gets_ns = authority_gets["monotonic_ns"]
+                for snoop in snoops_by_line.get(authority_gets["line_address"], ()):
+                    snoop_ns = snoop.get("monotonic_ns")
+                    if (
+                        snoop.get("opcode") not in ("SNP_DATA_DOWNGRADE", "SNP_DATA_INV")
+                        or snoop.get("dst_host") != cxl_host
+                        or not isinstance(snoop_ns, int)
+                        or not (gets_ns <= snoop_ns < acquired_capture)
+                    ):
+                        continue
+                    snoop_id = snoop.get("snoop_id")
+                    ack = acks.get(snoop_id)
+                    completion = completions.get(snoop_id)
+                    if not ack or not completion:
+                        continue
+                    ack_ns = ack.get("monotonic_ns")
+                    completion_ns = completion.get("monotonic_ns")
+                    if (
+                        ack.get("opcode") == "SNOOP_ACK"
+                        and ack.get("src_host") == cxl_host
+                        and ack.get("ack_strength") == "MODEL"
+                        and ack.get("dirty_data") is True
+                        and ack.get("payload_len") == 64
+                        and ack.get("status") == "OK"
+                        and completion.get("opcode") == "SNOOP_ACK"
+                        and completion.get("src_host") == cxl_host
+                        and completion.get("ack_strength") == "MODEL"
+                        and completion.get("dirty_data") is True
+                        and completion.get("payload_len") == 64
+                        and completion.get("status") == "OK"
+                        and ack.get("session_id") == snoop.get("session_id")
+                        and completion.get("session_id") == snoop.get("session_id")
+                        and ack.get("epoch") == snoop.get("epoch")
+                        and completion.get("epoch") == snoop.get("epoch")
+                        and isinstance(ack_ns, int)
+                        and isinstance(completion_ns, int)
+                        and snoop_ns <= ack_ns <= completion_ns < acquired_capture
+                    ):
+                        dirty_transfer = {
+                            "opcode": snoop.get("opcode"),
+                            "snoop_id": snoop_id,
+                            "snoop_send_ns": snoop_ns,
+                            "snoop_ack_ns": ack_ns,
+                            "dirty_completion_ns": completion_ns,
+                        }
+                        break
+
+                fence_request, fence_completion = fence_pair
+                authority_proofs.append({
+                    "owner": key[0],
+                    "op_id": key[1],
+                    "endpoint": owner_endpoint[key[0]],
+                    "cxl_host_id": cxl_host,
+                    "authority_host_id": authority_host,
+                    "mapping_offset": offset,
+                    "mapping_length": length,
+                    "dependency_offset": dependency_offset,
+                    "dependency_length": dependency_length,
+                    "dependency_range_index": acquired_record["dependency_range_index"],
+                    "dependency_range_count": acquired_record["dependency_range_count"],
+                    "dependency_range_bytes": acquired_record["dependency_range_bytes"],
+                    "dependency_range_set_digest": acquired_record[
+                        "dependency_range_set_digest"
+                    ],
+                    "sealed_capture_ns": unmap_capture,
+                    "store_begin_capture_ns": begin[key][1],
+                    "store_success_capture_ns": success_capture,
+                    "gets_ns": authority_gets["monotonic_ns"],
+                    "gets_line_address": authority_gets["line_address"],
+                    "acquired_capture_ns": acquired_capture,
+                    "fence_request_ns": fence_request["monotonic_ns"],
+                    "fence_completion_ns": fence_completion["monotonic_ns"],
+                    "persisted_capture_ns": persisted_capture,
+                    "dirty_transfer": dirty_transfer,
+                })
+                break
+            if authority_proofs and authority_proofs[-1]["owner"] == key[0] \
+                    and authority_proofs[-1]["op_id"] == key[1]:
+                continue
         if begin_record.get("fault_point") != "dirty_range_ownership":
             continue
         cxl_host = owner_endpoint[key[0]] + server_count
@@ -3003,13 +4413,23 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
         raise ValueError(
             "legacy direct writes lack exact unmap < SNP_DATA_INV < dirty ACK < completion < store success proof"
         )
-    if not writer_proofs and not bi_proofs:
-        raise ValueError("no exact writer-persisted or back-invalidation persistency proof")
+    if not writer_proofs and not authority_proofs and not bi_proofs:
+        raise ValueError(
+            "no exact writer-persisted, authority-acquired, or "
+            "back-invalidation persistency proof"
+        )
     return {
-        "count": len(writer_proofs) + len(bi_proofs),
+        "count": len(writer_proofs) + len(authority_proofs) + len(bi_proofs),
         "writer_persisted": {
             "count": len(writer_proofs),
             "first": writer_proofs[0] if writer_proofs else None,
+        },
+        "authority_acquired": {
+            "count": len(authority_proofs),
+            "dirty_transfer_count": sum(
+                proof["dirty_transfer"] is not None for proof in authority_proofs
+            ),
+            "first": authority_proofs[0] if authority_proofs else None,
         },
         "backinvalidation": {
             "count": len(bi_proofs),
@@ -3020,6 +4440,9 @@ def strict_persistency_proof(paths: Paths, summaries: list[dict], server_count: 
 
 def validate_tiny_provider_counters(final_stats: dict, proof: dict) -> None:
     writer_count = proof.get("writer_persisted", {}).get("count", 0)
+    authority = proof.get("authority_acquired", {})
+    authority_count = authority.get("count", 0)
+    authority_dirty_transfers = authority.get("dirty_transfer_count", 0)
     bi_count = proof.get("backinvalidation", {}).get("count", 0)
     if writer_count > 0:
         for name in ("request_fence", "persistence_fence_completions"):
@@ -3029,6 +4452,26 @@ def validate_tiny_provider_counters(final_stats: dict, proof: dict) -> None:
                 )
         if final_stats.get("putm", 0) <= 0:
             raise ValueError("writer-persisted proof lacks a line PUTM")
+    if authority_count > 0:
+        for name in ("gets", "request_fence", "persistence_fence_completions"):
+            if final_stats.get(name, 0) <= 0:
+                raise ValueError(
+                    f"authority-acquired proof lacks provider counter: {name}"
+                )
+        if authority_dirty_transfers > 0:
+            if (
+                final_stats.get("snp_data_downgrade", 0)
+                + final_stats.get("snp_data_inv", 0)
+                <= 0
+            ):
+                raise ValueError(
+                    "authority-acquired proof lacks a dirty-data snoop counter"
+                )
+            for name in ("model_acks", "dirty_data_completions"):
+                if final_stats.get(name, 0) <= 0:
+                    raise ValueError(
+                        f"authority-acquired proof lacks provider counter: {name}"
+                    )
     if bi_count > 0:
         for name in ("snp_data_inv", "model_acks", "dirty_data_completions"):
             if final_stats.get(name, 0) <= 0:
@@ -3292,6 +4735,31 @@ def functional_model_evidence() -> dict:
     }
 
 
+def resolve_payload_persistence_owner(
+    durability_profile: str, requested_owner: str
+) -> str:
+    if requested_owner == "auto":
+        requested_owner = (
+            "placement-routed"
+            if durability_profile == "coherent-seal-no-writeback"
+            else "writer-before-visibility"
+        )
+    legal_payload_owners = {
+        "d-before-v": {"writer-before-visibility"},
+        "coherent-seal-needs-writeback": {"writer-before-visibility"},
+        "coherent-seal-no-writeback": {
+            "authority-bi-acquire",
+            "writer-receipt",
+            "placement-routed",
+        },
+    }
+    if requested_owner not in legal_payload_owners[durability_profile]:
+        raise ValueError(
+            "payload persistence owner is incompatible with durability profile"
+        )
+    return requested_owner
+
+
 def execute(
     paths: Paths,
     timeout: int,
@@ -3304,11 +4772,43 @@ def execute(
     serving_transport: str = "legacy",
     cursor_mode: str = "owned",
     cq_wait_mode: str = "timer_sleep",
+    durability_profile: str = "d-before-v",
+    payload_persistence_owner: str = "auto",
+    writer_persist_provider: str = "msync",
+    packed_small_segments: str = "on",
+    small_segment_count: int = 2048,
     fault_profile: str = "none",
     observation_config: dict | None = None,
     host_profiler: str = "off",
+    close_batch_mode: str = "batched",
 ) -> dict:
     direct_metadata_validation_mode = "cxl" if serving_transport == "cxl" else None
+    durability_validation_profile = {
+        "d-before-v": "D_BEFORE_V",
+        "coherent-seal-no-writeback": "COHERENT_SEAL_NO_WRITEBACK",
+        "coherent-seal-needs-writeback": "COHERENT_SEAL_NEEDS_WRITEBACK",
+    }[durability_profile]
+    payload_persistence_owner = resolve_payload_persistence_owner(
+        durability_profile, payload_persistence_owner
+    )
+    if writer_persist_provider == "riscv-zicbom-dax" and (
+        durability_profile != "coherent-seal-no-writeback"
+        or payload_persistence_owner not in {"writer-receipt", "placement-routed"}
+        or serving_transport != "cxl"
+    ):
+        raise ValueError(
+            "riscv-zicbom-dax requires CXL serving, coherent-seal-no-writeback, "
+            "and a writer-receipt payload owner"
+        )
+    payload_owner_validation = {
+        "authority-bi-acquire": "AUTHORITY_BI_ACQUIRE",
+        "writer-receipt": "WRITER_RECEIPT",
+        "placement-routed": "PLACEMENT_ROUTED",
+        "writer-before-visibility": "WRITER_BEFORE_VISIBILITY",
+    }[payload_persistence_owner]
+    packed_small_segment_validation_mode = packed_small_validation_expectation(
+        paths.stage, packed_small_segments, fault_profile
+    )
     if observation_config is None:
         observation_config = {
             "mode": "default",
@@ -3361,6 +4861,18 @@ def execute(
             ),
             "legofs_cursor_mode": cursor_mode,
             "legofs_cq_wait_mode": cq_wait_mode,
+            "legofs_durability_profile": durability_profile,
+            "legofs_payload_persistence_owner": payload_persistence_owner,
+            "legofs_writer_persist_provider": writer_persist_provider,
+            "legofs_close_mode": close_batch_mode,
+            "lifecycle_pool_layout": (
+                "v7-packed-small-segments"
+                if packed_small_segments == "on"
+                else "v6-variable-extents"
+            ),
+            "small_segment_count_per_authority": (
+                small_segment_count if packed_small_segments == "on" else 0
+            ),
             "legofs_open_mode": "fused_pin",
             "fault_profile": fault_profile,
             "allocator_partitions": [
@@ -3469,6 +4981,12 @@ def execute(
                         serving_transport,
                         cursor_mode,
                         cq_wait_mode,
+                        durability_profile,
+                        payload_persistence_owner,
+                        writer_persist_provider,
+                        packed_small_segments,
+                        small_segment_count,
+                        close_batch_mode,
                         observation_config,
                         timeout,
                     )
@@ -3515,6 +5033,12 @@ def execute(
                         serving_transport,
                         cursor_mode,
                         cq_wait_mode,
+                        durability_profile,
+                        payload_persistence_owner,
+                        writer_persist_provider,
+                        packed_small_segments,
+                        small_segment_count,
+                        close_batch_mode,
                         observation_config,
                         timeout,
                     )
@@ -3554,6 +5078,10 @@ def execute(
                 result["fault_injection"] = run_unauthorized_clean_restart_probe(
                     server_consoles[0], timeout
                 )
+            elif fault_profile == "diagnose-system-sync":
+                result["system_sync_probe"] = run_system_sync_probe(
+                    client_consoles[0], client_count, timeout
+                )
             result["commands"]["mpi"] = launch_mpi(
                 server_consoles,
                 client_consoles,
@@ -3561,6 +5089,13 @@ def execute(
                 timeout,
                 client_count,
                 serving_transport,
+            )
+            record_host_process_cost_window(
+                result,
+                cost_before,
+                sample_named_processes(metered_processes),
+                cost_started_ns,
+                time.monotonic_ns(),
             )
             if paths.stage in ("scc", "standard") and serving_transport == "cxl":
                 mpi_command = result["commands"]["mpi"]
@@ -3592,6 +5127,13 @@ def execute(
                     client_consoles, timeout
                 )
         except MpiStageError:
+            record_host_process_cost_window(
+                result,
+                cost_before,
+                sample_named_processes(metered_processes),
+                cost_started_ns,
+                time.monotonic_ns(),
+            )
             diagnostics = {}
             if "observation" not in result:
                 result["observation"] = dump_observations_safely(
@@ -3618,6 +5160,8 @@ def execute(
                     cursor_mode,
                     cq_wait_mode,
                     direct_metadata_validation_mode,
+                    close_batch_mode,
+                    payload_owner_validation,
                 )
             except Exception as error:
                 diagnostics["posix_path_summary_error"] = str(error)
@@ -3630,15 +5174,20 @@ def execute(
                         serving_transport == "cxl" and server_count == 1
                     ),
                     expected_direct_metadata_mode=direct_metadata_validation_mode,
+                    expected_durability_profile=durability_validation_profile,
+                    expected_payload_persistence_owner=payload_owner_validation,
                 )
             except Exception as error:
                 diagnostics["lifecycle_inspection_error"] = str(error)
             result["failed_mpi_diagnostics"] = diagnostics
             raise
         finally:
-            cost_after = sample_named_processes(metered_processes)
-            result["host_process_cost"] = host_process_cost_window(
-                cost_before, cost_after, cost_started_ns, time.monotonic_ns()
+            record_host_process_cost_window(
+                result,
+                cost_before,
+                sample_named_processes(metered_processes),
+                cost_started_ns,
+                time.monotonic_ns(),
             )
 
         if paths.stage == "hello":
@@ -3667,6 +5216,19 @@ def execute(
                 cursor_mode,
                 cq_wait_mode,
                 direct_metadata_validation_mode,
+                close_batch_mode,
+                payload_owner_validation,
+            )
+            validate_packed_small_segment_client_evidence(
+                summaries,
+                expected_packed_small_segments=packed_small_segment_validation_mode,
+            )
+            command_free_direct_read_ops = sum(
+                min(
+                    int(record.get("stats", {}).get("direct_ro_open_hits", 0)),
+                    int(record.get("stats", {}).get("direct_read_data_maps", 0)),
+                )
+                for record in summaries
             )
             if fault_profile == "reject-active-clean-retirement":
                 inspection = result["fault_injection"]["lifecycle_inspection"]
@@ -3674,10 +5236,16 @@ def execute(
                 inspection = inspect_servers(
                     client_consoles[0],
                     server_count,
+                    command_free_direct_read_ops=command_free_direct_read_ops,
                     require_recovery_control=not (
                         serving_transport == "cxl" and server_count == 1
                     ),
                     expected_direct_metadata_mode=direct_metadata_validation_mode,
+                    expected_packed_small_segments=(
+                        packed_small_segment_validation_mode
+                    ),
+                    expected_durability_profile=durability_validation_profile,
+                    expected_payload_persistence_owner=payload_owner_validation,
                 )
             verifier = verify_io500(client_consoles[0], paths.stage)
             result["rank_placement"] = rank_records
@@ -3687,6 +5255,7 @@ def execute(
                 result["direct_metadata"] = direct_metadata_breakdown(
                     summaries, inspection, direct_metadata_validation_mode
                 )
+                result["direct_mutation"] = direct_mutation_breakdown(summaries)
             result["verifier"] = verifier
             result["legofs_timing"] = legofs_timing_breakdown(
                 summaries,
@@ -3694,11 +5263,22 @@ def execute(
                 result["host_process_cost"]["wall_ns"],
                 client_count,
             )
-            if paths.stage == "tiny":
-                result["strict_persistency_proof"] = strict_persistency_proof(
-                    paths, summaries, server_count
-                )
-
+            writer_host = result["legofs_timing"]["persistence"]["writer_host"]
+            if writer_host["writer_host_persist_jobs_completed"]:
+                if writer_persist_provider == "riscv-zicbom-dax" and (
+                    writer_host["writer_host_zicbom_persist_jobs"] == 0
+                    or writer_host["writer_host_msync_persist_jobs"] != 0
+                ):
+                    raise ValueError(
+                        "selected riscv-zicbom-dax writer provider was not used exclusively"
+                    )
+                if writer_persist_provider == "msync" and (
+                    writer_host["writer_host_msync_persist_jobs"] == 0
+                    or writer_host["writer_host_zicbom_persist_jobs"] != 0
+                ):
+                    raise ValueError(
+                        "selected msync writer provider was not used exclusively"
+                    )
         for console in client_consoles:
             console.send("LEGOFS_POWEROFF")
         for console in server_consoles:
@@ -3766,6 +5346,9 @@ def execute(
             if paths.stage != "hello":
                 validate_inspection_provider_counters(final_stats, inspection)
             if paths.stage == "tiny":
+                result["strict_persistency_proof"] = strict_persistency_proof(
+                    paths, summaries, server_count
+                )
                 validate_tiny_provider_counters(
                     final_stats, result["strict_persistency_proof"]
                 )
@@ -3858,12 +5441,58 @@ def parse_args(argv=None):
         default="timer_sleep",
     )
     parser.add_argument(
+        "--durability-profile",
+        choices=(
+            "d-before-v",
+            "coherent-seal-no-writeback",
+            "coherent-seal-needs-writeback",
+        ),
+        default="d-before-v",
+    )
+    parser.add_argument(
+        "--payload-persistence-owner",
+        choices=(
+            "auto",
+            "authority-bi-acquire",
+            "writer-receipt",
+            "placement-routed",
+            "writer-before-visibility",
+        ),
+        default="auto",
+        help="select the host that closes immutable payload durability dependencies",
+    )
+    parser.add_argument(
+        "--writer-persist-provider",
+        choices=("msync", "riscv-zicbom-dax"),
+        default="msync",
+        help="select the writer-host persistent-DAX cache-clean provider",
+    )
+    parser.add_argument(
+        "--packed-small-segments",
+        choices=("off", "on"),
+        default="on",
+        help="select the v7 product layout or explicit v6 diagnostic layout",
+    )
+    parser.add_argument(
+        "--close-batch-mode",
+        choices=("immediate", "batched"),
+        default="batched",
+        help="select immediate or bounded-batch clean read-only close commands",
+    )
+    parser.add_argument(
+        "--small-segment-count",
+        type=int,
+        default=2048,
+        help="number of 2 MiB packed segments per authority when v7 is enabled",
+    )
+    parser.add_argument(
         "--fault-profile",
         choices=(
             "none",
             "clean-server-restart",
             "reject-unauthorized-clean-restart",
             "reject-active-clean-retirement",
+            "diagnose-system-sync",
         ),
         default="none",
     )
@@ -3891,6 +5520,12 @@ def main(argv=None) -> int:
         raise ValueError("coherence-cache-mib must be between 1 and 4095")
     if not 1 <= args.ssd_cache_mib <= 65536:
         raise ValueError("ssd-cache-mib must be between 1 and 65536")
+    partition_bytes = ENDPOINT_BYTES // args.server_count
+    max_small_segments = partition_bytes // (2 * 1024**2) - 1
+    if not 1 <= args.small_segment_count <= max_small_segments:
+        raise ValueError(
+            f"small-segment-count must be between 1 and {max_small_segments}"
+        )
     if (
         args.observation_sample_shift is not None
         and not 0 <= args.observation_sample_shift <= 20
@@ -3914,6 +5549,22 @@ def main(argv=None) -> int:
         raise ValueError(
             f"{args.fault_profile} requires --stage tiny --server-count 1 "
             "--client-count 2 --serving-transport cxl"
+        )
+    if args.fault_profile == "diagnose-system-sync" and (
+        args.stage != "metadata-smoke"
+        or args.server_count != 1
+        or args.client_count != 2
+        or args.serving_transport != "cxl"
+    ):
+        raise ValueError(
+            "diagnose-system-sync requires --stage metadata-smoke "
+            "--server-count 1 --client-count 2 --serving-transport cxl"
+        )
+    if args.durability_profile != "d-before-v" and args.serving_transport != "cxl":
+        raise ValueError("coherent durability profiles require --serving-transport cxl")
+    if args.durability_profile != "d-before-v" and args.fault_profile != "none":
+        raise ValueError(
+            "coherent durability profiles currently require --fault-profile none"
         )
     if args.result_label is not None and not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]*", args.result_label
@@ -3939,9 +5590,15 @@ def main(argv=None) -> int:
             args.serving_transport,
             args.cursor_mode,
             args.cq_wait_mode,
+            args.durability_profile,
+            args.payload_persistence_owner,
+            args.writer_persist_provider,
+            args.packed_small_segments,
+            args.small_segment_count,
             args.fault_profile,
             observation_config,
             args.host_profiler,
+            args.close_batch_mode,
         )
     except BaseException as error:
         print(f"error: {error}", file=sys.stderr)

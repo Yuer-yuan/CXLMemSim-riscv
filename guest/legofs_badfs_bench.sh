@@ -36,5 +36,6 @@ export BADFS_LIFECYCLE_COHERENT_PUBLICATION=1
 export BADFS_TRACK_OPEN_SET=1
 export BADFS_DISABLE_FABRIC_MMAP=0
 export BADFS_FABRIC_STAGED_IO=0
+export BADFS_LIFECYCLE_CLOSE_BATCH="$(cat /run/close-batch-mode)"
 
 exec /payload/bin/badfs-bench.real "$@"
