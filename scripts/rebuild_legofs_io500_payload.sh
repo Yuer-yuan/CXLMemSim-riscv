@@ -114,7 +114,7 @@ require_file "$SOURCES/io500/io500-verify"
 require_file "$MPICH_PREFIX/bin/mpiexec.hydra"
 require_file "$MPICH_PREFIX/bin/hydra_pmi_proxy"
 require_file "$TARGET_ROOT/mpi-hello"
-require_file "$TARGET_ROOT/export-io500-results"
+require_file "$ROOT/guest/export_io500_results.c"
 require_file "$ROOT/guest/system_sync_probe.c"
 require_file "$LIBUNWIND_PREFIX/lib/libunwind.so.1"
 require_file "$BUILTINS_ARCHIVE"
@@ -129,7 +129,7 @@ require_executable "$STATIC_MUSL_CC"
 require_executable "$MUSL_CC"
 require_executable "$NOV_GCC"
 
-for stage in tiny easy-smoke hard-smoke metadata-smoke rnd4k scc standard; do
+for stage in tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard; do
 	require_file "$ROOT/configs/io500-$stage.ini"
 done
 
@@ -195,9 +195,16 @@ require_file "$BADFS_INTERCEPT"
 printf '%s\n' '[io500-payload] dynamic system(3) sync regression probe'
 "$MUSL_CC" -O2 -Wall -Wextra -Werror \
 	-march=rv64imafdc -mabi=lp64d \
+	"$ROOT/guest/export_io500_results.c" \
+	-o "$TARGET_ROOT/export-io500-results"
+"$MUSL_CC" -O2 -Wall -Wextra -Werror \
+	-march=rv64imafdc -mabi=lp64d \
 	"$ROOT/guest/system_sync_probe.c" \
 	-o "$TARGET_ROOT/system-sync-probe"
 require_file "$TARGET_ROOT/system-sync-probe"
+"$MUSL_CC" -O2 -Wall -Wextra -Werror -pthread \
+	-march=rv64imafdc -mabi=lp64d \
+	"$ROOT/guest/thread_exit_probe.c" -o "$TARGET_ROOT/thread-exit-probe"
 
 PAYLOAD_STAGE="$(mktemp -d "$TARGET_ROOT/.payload-build.XXXXXX")"
 PAYLOAD_TREE="$PAYLOAD_STAGE/root"
@@ -212,6 +219,7 @@ install -m 0755 "$TARGET_ROOT/export-io500-results" \
 	"$PAYLOAD_TREE/bin/export-io500-results"
 install -m 0755 "$TARGET_ROOT/system-sync-probe" \
 	"$PAYLOAD_TREE/bin/system-sync-probe"
+install -m 0755 "$TARGET_ROOT/thread-exit-probe" "$PAYLOAD_TREE/bin/thread-exit-probe"
 install -m 0755 "$ROOT/guest/legofs_io500_rank.sh" \
 	"$PAYLOAD_TREE/bin/run-io500-rank"
 install -m 0755 "$ROOT/guest/legofs_io500_init.sh" \
@@ -227,7 +235,7 @@ cp -a "${mpi_libraries[@]}" "$PAYLOAD_TREE/lib/"
 cp -a "${sysint_libraries[@]}" "$PAYLOAD_TREE/lib/"
 cp -a "${unwind_libraries[@]}" "$PAYLOAD_TREE/lib/"
 
-for stage in tiny easy-smoke hard-smoke metadata-smoke rnd4k scc standard; do
+for stage in tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard; do
 	install -m 0644 "$ROOT/configs/io500-$stage.ini" \
 		"$PAYLOAD_TREE/etc/io500-$stage.ini"
 done
@@ -337,7 +345,7 @@ require_unwind_provider()
 for binary in "$PAYLOAD_TREE/bin/io500" "$PAYLOAD_TREE/bin/io500-verify" \
 	"$PAYLOAD_TREE/bin/mpiexec.hydra" "$PAYLOAD_TREE/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_TREE/bin/mpi-hello" "$PAYLOAD_TREE/bin/export-io500-results" \
-	"$PAYLOAD_TREE/bin/system-sync-probe" \
+	"$PAYLOAD_TREE/bin/system-sync-probe" "$PAYLOAD_TREE/bin/thread-exit-probe" \
 	"$PAYLOAD_TREE/bin/badfs-server.real" "$PAYLOAD_TREE/bin/badfs-bench.real" \
 	"$PAYLOAD_TREE/lib/libmpi.so" "$PAYLOAD_TREE/lib/libunwind.so" \
 	"$PAYLOAD_TREE/lib/libsyscall_intercept.so" \
@@ -348,7 +356,7 @@ done
 
 for binary in "$PAYLOAD_TREE/bin/io500" \
 	"$PAYLOAD_TREE/bin/export-io500-results" \
-	"$PAYLOAD_TREE/bin/system-sync-probe"; do
+	"$PAYLOAD_TREE/bin/system-sync-probe" "$PAYLOAD_TREE/bin/thread-exit-probe"; do
 	"${CROSS_COMPILE}readelf" -l "$binary" |
 		grep -q '/lib/ld-musl-riscv64.so.1' ||
 		die "$binary does not use the clean musl loader"
@@ -357,7 +365,7 @@ done
 for binary in "$PAYLOAD_TREE/bin/io500" "$PAYLOAD_TREE/bin/io500-verify" \
 	"$PAYLOAD_TREE/bin/mpiexec.hydra" "$PAYLOAD_TREE/bin/hydra_pmi_proxy" \
 	"$PAYLOAD_TREE/bin/mpi-hello" "$PAYLOAD_TREE/bin/export-io500-results" \
-	"$PAYLOAD_TREE/bin/system-sync-probe" \
+	"$PAYLOAD_TREE/bin/system-sync-probe" "$PAYLOAD_TREE/bin/thread-exit-probe" \
 	"$PAYLOAD_TREE/lib/libmpi.so" "$PAYLOAD_TREE/lib/libunwind.so" \
 	"$PAYLOAD_TREE/lib/libsyscall_intercept.so" \
 	"$PAYLOAD_TREE/lib/libbadfs_intercept.so"; do
@@ -371,6 +379,7 @@ require_needed "$PAYLOAD_TREE/lib/libbadfs_intercept.so" libc.so
 require_needed "$PAYLOAD_TREE/lib/libunwind.so" libc.so
 require_needed "$PAYLOAD_TREE/bin/export-io500-results" libc.so
 require_needed "$PAYLOAD_TREE/bin/system-sync-probe" libc.so
+require_needed "$PAYLOAD_TREE/bin/thread-exit-probe" libc.so
 require_unwind_provider "$PAYLOAD_TREE/lib/libbadfs_intercept.so" \
 	"$PAYLOAD_TREE/lib/libunwind.so"
 for binary in "$PAYLOAD_TREE/bin/badfs-server.real" "$PAYLOAD_TREE/bin/badfs-bench.real"; do
@@ -425,6 +434,7 @@ python3 "$ROOT/scripts/write_manifest.py" --root "$ROOT" \
 	--artifact "hydra_proxy=$PAYLOAD_ROOT/bin/hydra_pmi_proxy" \
 	--artifact "io500_result_export=$PAYLOAD_ROOT/bin/export-io500-results" \
 	--artifact "system_sync_probe=$PAYLOAD_ROOT/bin/system-sync-probe" \
+	--artifact "thread_exit_probe=$PAYLOAD_ROOT/bin/thread-exit-probe" \
 	--artifact "compiler_rt_builtins=$BUILTINS_ARCHIVE" \
 	--artifact "libunwind=$PAYLOAD_ROOT/lib/libunwind.so.1" \
 	--artifact "badfs_server=$PAYLOAD_ROOT/bin/badfs-server.real" \

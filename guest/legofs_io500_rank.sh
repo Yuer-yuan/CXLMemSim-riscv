@@ -13,7 +13,7 @@ cmdline_value()
 }
 
 stage="${1:?missing IO500 stage}"
-case "$stage" in tiny|easy-smoke|hard-smoke|metadata-smoke|rnd4k|scc|standard) ;; *) exit 64 ;; esac
+case "$stage" in tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard) ;; *) exit 64 ;; esac
 
 endpoint_id="$(cat /run/endpoint-id)"
 mkdir -p /tmp/posix
@@ -127,7 +127,7 @@ if [ "$stage" = tiny ] && [ "$serving_transport" = cxl ]; then
 	echo "LEGOFS_IO500_PREFLIGHT_RELEASED endpoint=$endpoint_id"
 fi
 case "$stage" in
-tiny|easy-smoke|hard-smoke|metadata-smoke|rnd4k)
+tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k)
 	exec /payload/bin/io500 "/payload/etc/io500-$stage.ini"
 	;;
 esac

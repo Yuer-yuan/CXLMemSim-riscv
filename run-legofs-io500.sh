@@ -41,7 +41,7 @@ Usage: ./run-legofs-io500.sh [OPTIONS]
   --build-only             build the RISC-V platform and current LegoFS payload
   --run-only               use the existing workspace build
   --payload-only           rebuild only the LegoFS guest payload
-  --stage hello|tiny|easy-smoke|hard-smoke|metadata-smoke|rnd4k|scc|standard
+  --stage hello|tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard
   --server-count 1|2       LegoFS server guests (default: 1)
   --client-count N         client guests / MPI ranks, 1..10 (default: 10)
   --result-label LABEL     separate runtime/result directory name
@@ -120,7 +120,7 @@ done
 
 ((BUILD_ONLY + RUN_ONLY + PAYLOAD_ONLY <= 1)) ||
 	die '--build-only, --run-only and --payload-only are mutually exclusive'
-case "$STAGE" in hello|tiny|easy-smoke|hard-smoke|metadata-smoke|rnd4k|scc|standard) ;; *) die "invalid stage: $STAGE" ;; esac
+case "$STAGE" in hello|tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard) ;; *) die "invalid stage: $STAGE" ;; esac
 [[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die 'timeout must be a positive integer'
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die 'jobs must be a positive integer'
 case "$SERVER_COUNT" in 1|2) ;; *) die 'server-count must be 1 or 2' ;; esac

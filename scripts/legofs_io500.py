@@ -9,6 +9,7 @@ import hashlib
 import concurrent.futures
 import datetime
 import json
+import math
 import os
 import pathlib
 import re
@@ -27,6 +28,12 @@ from legofs_type3_2node import Console, OwnedProcess, qemu_environment
 
 
 DEFAULT_CLIENTS = 10
+STANDARD_IO500_PHASES = frozenset({
+    "ior-easy-write", "mdtest-easy-write", "ior-hard-write",
+    "mdtest-hard-write", "find", "ior-easy-read", "mdtest-easy-stat",
+    "ior-hard-read", "mdtest-hard-stat", "mdtest-easy-delete",
+    "mdtest-hard-read", "mdtest-hard-delete", "ior-rnd4K-easy-read",
+})
 DEFAULT_COHERENCE_CACHE_MIB = 32
 DEFAULT_SSD_CACHE_MIB = 512
 DEFAULT_OBSERVATION_SAMPLE_SHIFT = 4
@@ -94,7 +101,13 @@ OBSERVATION_END_RE = re.compile(
 )
 MPI_FATAL_MARKERS = (
     "BADFS_STRICT_LIFECYCLE_DIRECT_INIT_FAILED",
+    "BADFS_DIRECT_MUTATION_WORKER_FAILED",
+    "BADFS_DIRECT_MUTATION_APPLY_FAILED",
+    "BADFS_DIRECT_MUTATION_MARK_FAILED",
+    "LEGOFS_WRITER_PERSIST_FAILURE",
     "LEGOFS_IO500_FATAL",
+    "application called MPI_Abort(",
+    "MPI_ABORT was invoked",
 )
 # TCG oversubscription can delay an otherwise live guest long enough for RCU
 # or kthread watchdog diagnostics.  Those lines are measurement-noise evidence,
@@ -108,23 +121,34 @@ PERFORMANCE_INVALIDATING_GUEST_MARKERS = (
 PERFORMANCE_NOISE_GUEST_MARKERS = (
     "rcu_sched detected stalls",
     "rcu_preempt detected stalls",
+    "rcu_sched self-detected stall",
+    "rcu_preempt self-detected stall",
     "kthread starved for",
 )
 GUEST_PROCESS_FAULT_MARKERS = (
     "Segmentation fault",
     "Bus error",
     "Illegal instruction",
+    "unhandled signal ",
     # RISC-V synchronous load and store/AMO access faults.  Linux prints the
     # register frame even when QEMU itself remains alive, so process polling
     # alone cannot detect this otherwise terminal MPI failure.
     "cause: 0000000000000005",
     "cause: 0000000000000007",
+    # Instruction/load/store page faults, including a detached musl thread
+    # unmapping the interceptor's active stack during otherwise rc=0 teardown.
+    "cause: 000000000000000c",
+    "cause: 000000000000000d",
+    "cause: 000000000000000f",
 )
 SEMANTIC_SMOKE_STAGES = (
     "tiny",
+    "stress-tiny",
+    "rollover-smoke",
     "easy-smoke",
     "hard-smoke",
     "metadata-smoke",
+    "small-close-smoke",
     "rnd4k",
 )
 
@@ -133,7 +157,10 @@ SEMANTIC_SMOKE_STAGES = (
 # that the configured layout failed to initialize.
 PACKED_SMALL_WORKLOAD_STAGES = (
     "tiny",
+    "stress-tiny",
+    "rollover-smoke",
     "metadata-smoke",
+    "small-close-smoke",
     "scc",
     "standard",
 )
@@ -206,6 +233,7 @@ DIRECT_MUTATION_CLIENT_COUNTERS = (
     "direct_create_fallback_no_parent_writer",
     "direct_create_fallback_existing",
     "direct_create_fallback_inode_exhausted",
+    "direct_create_fallback_unproven_namespace",
     "direct_create_errors",
     "direct_unlink_attempts",
     "direct_unlink_commands_elided",
@@ -739,19 +767,41 @@ def legofs_timing_breakdown(
             "writer_host_persist_jobs_completed",
             "writer_host_persist_jobs_failed",
             "writer_host_local_persist_ns",
+            "writer_host_local_clean_ns",
+            "writer_host_local_drain_ns",
             "writer_host_receipt_submit_ns",
             "writer_host_queue_wait_ns",
             "writer_host_msync_persist_jobs",
             "writer_host_zicbom_persist_jobs",
+            "writer_host_persist_cohorts",
+            "writer_host_provider_drains",
+            "writer_host_cohort_jobs",
             "writer_host_local_persist_ranges",
             "writer_host_local_persist_bytes",
             "writer_host_receipt_batches_submitted",
             "writer_host_receipt_items_submitted",
-            "writer_host_quiescent_handoffs",
+            "writer_host_pipeline_drain_waits",
+            "writer_host_pipeline_drain_wait_ns",
             "writer_host_authority_apply_wait_polls",
             "writer_host_authority_apply_wait_ns",
         )
     }
+    writer_host_persistence.update(
+        {
+            field: max(
+                (
+                    int(record.get("stats", {}).get(field, 0))
+                    for record in summaries
+                ),
+                default=0,
+            )
+            for field in (
+                "writer_host_max_pending_jobs",
+                "writer_host_max_pending_bytes",
+                "writer_host_max_cohort_jobs",
+            )
+        }
+    )
     io_envelope = {
         field: sum(
             int(record.get("stats", {}).get(field, 0)) for record in summaries
@@ -1166,8 +1216,11 @@ def guest_bootargs(
     packed_token = 0 if packed_small_segments == "off" else small_segment_count
     close_batch_token = {"immediate": 0, "batched": 1}[close_batch_mode]
     value = (
-        "earlycon=sbi console=hvc0 cxl_core.pmem_as_dax=1 "
-        f"io500.role={role} io500.index={index} io500.stage={stage} "
+        # One supported Linux CPU prevents a second hart from detaching this
+        # functional provider's global pending queue while its flush is in flight.
+        # Keep the machine unchanged; compact only our private stage boot token.
+        "earlycon=sbi console=hvc0 nr_cpus=1 cxl_core.pmem_as_dax=1 "
+        f"io500.role={role} io500.index={index} s={stage} "
         f"io500.server_count={server_count} io500.client_count={client_count} "
         f"io500.serving_transport={serving_transport} "
         f"c={cursor_token} "
@@ -1184,6 +1237,17 @@ def guest_bootargs(
             f"U-Boot bootargs command exceeds its 255-byte input bound: {command_bytes}"
         )
     return value
+
+
+def parse_persistence_execution(output: str, role: str, index: int) -> dict:
+    """Require affirmative execution-domain evidence, never infer it from -smp."""
+    records = [line for line in output.splitlines()
+               if line.startswith("LEGOFS_PERSIST_EXECUTION")]
+    expected = (f"LEGOFS_PERSIST_EXECUTION role={role} index={index} "
+                "possible=0 online=0 nr_cpus=1")
+    if records != [expected]:
+        raise ValueError(f"unproven single-agent persistence execution for {role}{index}: {records!r}")
+    return {"role": role, "index": index, "possible": "0", "online": "0", "nr_cpus": 1}
 
 
 def decode_observation_header(data: bytes) -> dict:
@@ -1820,6 +1884,177 @@ def registrations(records: list[dict], host_count: int) -> list[dict]:
     return [by_host[index] for index in range(host_count)]
 
 
+class IO500PhaseWatchdog:
+    """Bound standard-phase silence and reject reported durations over 600 s.
+
+    Consume each console byte once. The banner begins the first window;
+    completed RESULT lines begin the next. These conservative host windows
+    include inter-phase overhead; reported phase time is checked separately.
+    """
+
+    result_pattern = re.compile(
+        # MPI merges stderr with stdout between IO500's separate label/body
+        # writes. Match the complete known-phase/rate/time body even when a
+        # diagnostic detached [RESULT]. A diagnostic tag alone is not progress.
+        r"\b(" + "|".join(re.escape(name) for name in sorted(STANDARD_IO500_PHASES))
+        + r")\s+\S+\s+(?:GiB/s|kIOPS)\s*:\s*time\s+([0-9.]+)\s+seconds"
+    )
+
+    def __init__(self, required_phases=STANDARD_IO500_PHASES):
+        self.required_phases = frozenset(required_phases)
+        if not self.required_phases or not self.required_phases <= STANDARD_IO500_PHASES:
+            raise ValueError("phase watchdog requires known nonempty IO500 phases")
+        self.offset = 0
+        self.partial = ""
+        self.window_started = None
+        self.last_phase = "before-first-result"
+        self.completed = set()
+
+    def observe(self, output: str, now: float) -> None:
+        new = self.partial + output[self.offset:]
+        self.offset = len(output)
+        lines = new.split("\n")
+        self.partial = lines.pop()
+        for line in lines:
+            if "IO500 version " in line and self.window_started is None:
+                self.window_started = now
+            match = self.result_pattern.search(line)
+            if match is None:
+                continue
+            phase, elapsed = match.group(1), float(match.group(2))
+            # timestamp is auxiliary. In particular, do not let it replace
+            # the final scored ior-rnd4K-easy-read phase in the completion set.
+            if phase not in self.required_phases:
+                continue
+            if elapsed > 600:
+                raise TimeoutError(
+                    f"IO500 phase {phase} exceeded 600 s: reported={elapsed:.3f} s"
+                )
+            if phase not in self.completed:
+                self.completed.add(phase)
+                self.last_phase = phase
+                self.window_started = now
+                print(f"LEGOFS_IO500_PHASE_GATE phase={phase} elapsed={elapsed:.3f} completed={len(self.completed)}/{len(self.required_phases)}", flush=True)
+        if (self.window_started is not None and self.completed != self.required_phases
+                and now - self.window_started > 600):
+            raise TimeoutError(
+                f"IO500 phase window exceeded 600 s after {self.last_phase}: "
+                f"host_elapsed={now - self.window_started:.3f} s; "
+                f"completed={len(self.completed)}/{len(self.required_phases)}"
+            )
+
+
+PRESSURE_SMOKE_RANKS = {"stress-tiny": 10, "rollover-smoke": 2}
+PRESSURE_SMOKE_PHASES = {
+    "stress-tiny": STANDARD_IO500_PHASES - {"ior-rnd4K-easy-read"},
+    "rollover-smoke": frozenset({"mdtest-hard-write", "mdtest-hard-stat",
+                                "mdtest-hard-read", "mdtest-hard-delete", "find"}),
+}
+
+
+def validate_pressure_smoke_options(args) -> None:
+    ranks = PRESSURE_SMOKE_RANKS.get(args.stage)
+    if ranks is None:
+        return
+    if (args.client_count != ranks or args.server_count != 1
+            or args.serving_transport != "cxl"
+            or args.durability_profile != "coherent-seal-no-writeback"
+            or args.payload_persistence_owner != "writer-receipt"
+            or args.writer_persist_provider != "riscv-zicbom-dax"
+            or args.packed_small_segments != "on"):
+        raise ValueError(
+            f"{args.stage} requires --client-count {ranks} --server-count 1 "
+            "--serving-transport cxl --durability-profile coherent-seal-no-writeback "
+            "--payload-persistence-owner writer-receipt "
+            "--writer-persist-provider riscv-zicbom-dax --packed-small-segments on"
+        )
+
+
+def pressure_smoke_coverage(stage, summaries, client_output, server_outputs,
+                            *, exporter_validated=False) -> dict:
+    """O(console bytes + ranks) diagnostic, from one non-duplicated log/guest.
+
+    Caller retains this report before failing missing coverage. Existing path,
+    receipt, verifier and exporter validators remain independent prerequisites.
+    Workload shape alone is not proof that a boundary was actually exercised.
+    """
+    ranks = PRESSURE_SMOKE_RANKS[stage]
+    missing = []
+    if sorted(record.get("mpi_rank", -1) for record in summaries) != list(range(ranks)):
+        missing.append("exact unique MPI rank coverage")
+    full, tail = set(), set()
+    flush_pattern = re.compile(
+        r"LEGOFS_WRITER_FLUSH_TIMING owner=(\d+) jobs=\d+ bytes=(\d+)"
+        r"[^\r\n]* success=true\b"
+    )
+    for match in flush_pattern.finditer(client_output):
+        owner, size = map(int, match.groups())
+        if size == 4 * 1024**2:
+            full.add(owner)
+        elif 0 < size < 4 * 1024**2:
+            tail.add(owner)
+    per_rank = []
+    for record in summaries:
+        rank, owner = record.get("mpi_rank"), record.get("owner")
+        stats = record.get("stats", {})
+        observed = {"rank": rank, "owner": owner}
+        if stage == "stress-tiny":
+            observed.update(write_bytes=int(stats.get("write_bytes", 0)),
+                            full_cohort=owner in full, tail_cohort=owner in tail,
+                            max_pending_jobs=int(stats.get("writer_host_max_pending_jobs", 0)),
+                            small_writes=int(stats.get("write_size_le_4k_ops", 0)))
+            if (observed["write_bytes"] < 5 * 1024**2 or owner not in full
+                    or owner not in tail or observed["max_pending_jobs"] != 64
+                    or observed["small_writes"] < 102):
+                missing.append(f"rank {rank}: 5 MiB write / full cohort / tail / 64-job credit / 102 small writes")
+        else:
+            observed.update(
+                small_writes=int(stats.get("write_size_le_4k_ops", 0)),
+                inode_exhaustions=sum(int(e.get("direct_create_fallback_inode_exhausted", 0))
+                                      for e in record.get("cxl_serving_evidence", [])))
+            if observed["small_writes"] < 1024 or observed["inode_exhaustions"] == 0:
+                missing.append(f"rank {rank}: 1024 small writes / inode grant exhaustion")
+        per_rank.append(observed)
+    apply_pattern = re.compile(
+        r"BADFS_DIRECT_MUTATION_APPLY_TIMING records=(\d+) creates=\d+"
+        r" terminals=\d+ unlinks=\d+ max_in_flight=(\d+)"
+    )
+    rollover_pattern = re.compile(
+        r"BADFS_DIRECT_MUTATION_ROLLOVER_COMPLETE lane=(\d+)"
+        r" mode=(physical-reuse|fresh-lane) applied=(\d+) durable=(\d+)"
+    )
+    max_records = max_in_flight = max_tail = 0
+    rollover_lanes = set()
+    for output in server_outputs:
+        for match in apply_pattern.finditer(output):
+            records, in_flight = map(int, match.groups())
+            max_records = max(max_records, records)
+            max_in_flight = max(max_in_flight, in_flight)
+        for match in rollover_pattern.finditer(output):
+            rollover_lanes.add(int(match.group(1)))
+            max_tail = max(max_tail, int(match.group(3)))
+    if not 0 < max_records <= 32 or not 0 < max_in_flight <= 32:
+        missing.append("observed authority apply batch/in-flight bound <=32")
+    if stage == "rollover-smoke" and (len(rollover_lanes) < ranks or max_tail != 0):
+        missing.append("two distinct rollover lanes / zero foreground apply")
+    if stage == "stress-tiny" and not exporter_validated:
+        missing.append("validated LegoFS result-directory exporter")
+    return {"stage": stage, "passed": not missing, "missing": missing,
+            "per_rank": per_rank, "max_apply_records": max_records,
+            "max_apply_in_flight": max_in_flight,
+            "rollover_lanes": sorted(rollover_lanes), "max_rollover_tail": max_tail,
+            "backpressure_observed": "BADFS_DIRECT_MUTATION_APPLY_BACKPRESSURE" in client_output,
+            "exporter_validated": exporter_validated,
+            "scope": "intentionally INVALID pressure coverage; not an official IO500 score"}
+
+
+def validate_guest_process_faults(guest: str, output: str) -> None:
+    """Final O(console bytes) check, independent of MPI/verification success."""
+    for marker in GUEST_PROCESS_FAULT_MARKERS:
+        if marker in output:
+            raise RuntimeError(f"guest {guest} reported fatal process fault: {marker}")
+
+
 def wait_mpi_exit(
     console: Console,
     stage: str,
@@ -1831,12 +2066,24 @@ def wait_mpi_exit(
         rf"LEGOFS_IO500_MPI_EXIT stage={re.escape(stage)} rc=(-?\d+)(?=[^0-9])"
     )
     deadline = time.monotonic() + timeout
+    phase_watchdog = (
+        IO500PhaseWatchdog(PRESSURE_SMOKE_PHASES.get(stage, STANDARD_IO500_PHASES))
+        if stage == "standard" or stage in PRESSURE_SMOKE_RANKS else None
+    )
     if monitored_guests is None:
         monitored_guests = [("coordinator", console, start)]
     with console.condition:
         while True:
+            if phase_watchdog is not None:
+                phase_watchdog.observe(console.output[start:], time.monotonic())
             for guest, monitored, guest_start in monitored_guests:
                 stage_output = monitored.output[guest_start:]
+                for proxy_exit in PROXY_EXIT_RE.finditer(stage_output):
+                    if int(proxy_exit.group(2)) != 0:
+                        raise RuntimeError(
+                            f"MPI stage {stage} guest {guest} proxy "
+                            f"{proxy_exit.group(1)} exited with rc={proxy_exit.group(2)}"
+                        )
                 for marker in MPI_FATAL_MARKERS:
                     if marker in stage_output:
                         raise RuntimeError(
@@ -1869,6 +2116,33 @@ def wait_mpi_exit(
             if remaining <= 0:
                 raise TimeoutError(f"timed out waiting for MPI stage {stage} exit")
             console.condition.wait(min(remaining, 0.5))
+
+
+def stop_run_processes_in_dependency_order(
+    server_consoles: list[Console],
+    client_consoles: list[Console],
+    cxlmemsim_owned: OwnedProcess | None,
+    all_owned: list[OwnedProcess],
+) -> None:
+    """Stop CXL accessors before endpoints and the shared-memory provider.
+
+    This is the fail-closed teardown path.  It does not certify a clean
+    retirement or permit takeover/reuse; it only prevents a still-running
+    authority from dereferencing CXL mappings after client guests disappear.
+    Runtime is linear in the number of owned processes.
+    """
+    ordered = [console.owned for console in server_consoles]
+    ordered.extend(console.owned for console in client_consoles)
+    if cxlmemsim_owned is not None:
+        ordered.append(cxlmemsim_owned)
+    ordered.extend(all_owned)
+    stopped: set[int] = set()
+    for owned in ordered:
+        identity = id(owned)
+        if identity in stopped:
+            continue
+        stopped.add(identity)
+        stop_process(owned)
 
 
 def wait_verify_exit(console: Console, stage: str, timeout: int, start: int) -> int:
@@ -1993,12 +2267,19 @@ def synchronize_guest_clocks(
 
 
 def _send_and_wait(
-    console: Console, command: str, marker: str, timeout: int
+    console: Console, command: str, marker: str, timeout: int, *, complete_line: bool = False
 ) -> dict:
     start = len(console.output)
     started_ns = time.monotonic_ns()
     console.send(command)
     console.wait(marker, timeout, start)
+    if complete_line:
+        # Serial chunks can end at "rc=". Do not parse an incomplete exit
+        # code (or accept the leading zero of a longer token). Share the same
+        # original deadline; this is framing, not another timeout allowance.
+        line_start = console.output.index(marker, start)
+        remaining = timeout - (time.monotonic_ns() - started_ns) / 1e9
+        console.wait("\n", max(0.0, remaining), line_start)
     completed_ns = time.monotonic_ns()
     return {
         "command": command,
@@ -2043,6 +2324,43 @@ def parse_system_sync_probe(output: str, label: str) -> dict:
         **dict(zip(names, values)),
         "proxy_rc": int(exits[0].group(2)),
     }
+
+
+def parse_thread_exit_probe(output: str, label: str) -> dict:
+    matches = re.findall(
+        r"LEGOFS_THREAD_EXIT_PROBE label=(\S+) raw_status=(-?\d+) exited=([01]) "
+        r"exit_code=(-?\d+) signaled=([01]) term_signal=(-?\d+) "
+        r"joinable=(\d+) detached=(\d+) passed=([01])", output
+    )
+    exits = list(PROXY_EXIT_RE.finditer(output))
+    if len(matches) != 1 or matches[0][0] != label or len(exits) != 1:
+        raise ValueError(f"thread-exit probe {label} lacks exact result/proxy evidence")
+    values = [int(value) for value in matches[0][1:]]
+    keys = ("raw_status", "exited", "exit_code", "signaled", "term_signal",
+            "joinable", "detached", "passed")
+    return {"label": label, **dict(zip(keys, values)),
+            "proxy_rc": int(exits[0].group(2))}
+
+
+def run_thread_exit_probe(console: Console, timeout: int, records: list) -> None:
+    """Pre-MPI ABI gate, no LegoFS endpoint or measured filesystem traffic."""
+    for label, preload in (("control", ""), ("preload", "/payload/lib/libsyscall_intercept.so")):
+        event = _send_and_wait(
+            console,
+            f"LEGOFS_PROXY LD_PRELOAD={preload} /payload/bin/thread-exit-probe {label}",
+            "LEGOFS_IO500_PROXY_EXIT index=0 rc=", min(timeout, 60),
+            complete_line=True,
+        )
+        record = parse_thread_exit_probe(event["output"], label)
+        record["elapsed_ns"] = event["elapsed_ns"]
+        records.append(record)
+        validate_guest_process_faults("client0", event["output"])
+        if (record["raw_status"] != 0 or record["exited"] != 1
+                or record["exit_code"] != 0 or record["signaled"] != 0
+                or record["term_signal"] != -1 or record["joinable"] != 32
+                or record["detached"] != 32 or record["passed"] != 1
+                or record["proxy_rc"] != 0):
+            raise RuntimeError(f"thread-exit probe failed: {record}")
 
 
 def run_system_sync_probe(
@@ -2784,6 +3102,7 @@ def validate_cxl_path_summary(
             + item["direct_create_fallback_no_parent_writer"]
             + item["direct_create_fallback_existing"]
             + item["direct_create_fallback_inode_exhausted"]
+            + item["direct_create_fallback_unproven_namespace"]
         ):
             raise ValueError("direct create fallback-reason accounting is inconsistent")
         if mutation_installs > mutation_attempts or (mutation_hits > 0 and mutation_installs == 0):
@@ -2875,6 +3194,7 @@ def validate_posix_summaries(
     direct_attempts = 0
     direct_hits = 0
     handoff_requests_by_rank = {rank: 0 for rank in range(client_count)}
+    writer_receipts_by_rank = {rank: 0 for rank in range(client_count)}
     direct_ro_totals = {name: 0 for name in DIRECT_RO_POSIX_COUNTERS}
     for record in records:
         rank = record.get("mpi_rank")
@@ -2905,6 +3225,10 @@ def validate_posix_summaries(
                 "persistence_handoff_requests"
             ]
         stats = record.get("stats", {})
+        writer_receipts = stats.get("writer_host_receipt_items_submitted", 0)
+        if not isinstance(writer_receipts, int) or writer_receipts < 0:
+            raise ValueError("writer receipt POSIX evidence is incomplete")
+        writer_receipts_by_rank[rank] += writer_receipts
         for name in DIRECT_RO_POSIX_COUNTERS:
             value = stats.get(name, 0)
             if not isinstance(value, int) or value < 0:
@@ -2962,16 +3286,26 @@ def validate_posix_summaries(
         direct_attempts <= 0 or direct_hits <= 0
     ):
         raise ValueError("cxl metadata mode produced no direct metadata hit")
-    if expected_payload_persistence_owner == "WRITER_RECEIPT":
+    if expected_payload_persistence_owner in ("WRITER_RECEIPT", "PLACEMENT_ROUTED"):
         missing = [
+            rank
+            for rank in sorted(active_ranks)
+            if writer_receipts_by_rank[rank] <= 0
+        ]
+        if missing:
+            raise ValueError(
+                "writer-receipt run lacks a completed persist-fence receipt "
+                f"for active ranks {missing}"
+            )
+        missing_handoffs = [
             rank
             for rank in sorted(active_ranks)
             if handoff_requests_by_rank[rank] <= 0
         ]
-        if missing:
+        if missing_handoffs:
             raise ValueError(
-                "writer-receipt run lacks completed CXL persistence handoff "
-                f"for active ranks {missing}"
+                "writer-receipt pipeline lacks a completed persistence handoff "
+                f"for active ranks {missing_handoffs}"
             )
 
 
@@ -3284,6 +3618,10 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
     receipt_duplicates = audit.get("host_persist_receipts_duplicate", 0)
     receipt_rejections = audit.get("host_persist_receipts_rejected", 0)
     pending_receipts = audit.get("pending_payload_dependencies", 0)
+    dependencies_created = audit.get("deferred_payload_dependencies_created")
+    dependencies_completed = audit.get("deferred_payload_dependencies_completed")
+    authority_dependencies = audit.get("authority_payload_dependencies_completed")
+    writer_dependencies = audit.get("writer_payload_dependencies_completed")
     authority = {
         name: audit.get(name, 0)
         for name in (
@@ -3302,11 +3640,23 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
         ("host_persist_receipts_duplicate", receipt_duplicates),
         ("host_persist_receipts_rejected", receipt_rejections),
         ("pending_payload_dependencies", pending_receipts),
+        ("deferred_payload_dependencies_created", dependencies_created),
+        ("deferred_payload_dependencies_completed", dependencies_completed),
+        ("authority_payload_dependencies_completed", authority_dependencies),
+        ("writer_payload_dependencies_completed", writer_dependencies),
     ):
         if not isinstance(value, int) or value < 0:
             raise ValueError(
                 f"lifecycle server {server} lacks valid {name} evidence"
             )
+    if dependencies_created != dependencies_completed + pending_receipts:
+        raise ValueError(
+            f"lifecycle server {server} has an unbalanced payload dependency lifecycle"
+        )
+    if dependencies_completed != authority_dependencies + writer_dependencies:
+        raise ValueError(
+            f"lifecycle server {server} has an unclassified payload dependency closure"
+        )
     for name, value in authority.items():
         if not isinstance(value, int) or value < 0:
             raise ValueError(
@@ -3336,9 +3686,8 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
         and writer_bytes > 0
     )
     writer_host_receipt_complete = (
-        direct_items > 0
-        and writer_items + receipt_items == direct_items
-        and receipt_items > 0
+        writer_dependencies > 0
+        and receipt_items == writer_dependencies
         and receipt_rejections == 0
         and pending_receipts == 0
     )
@@ -3363,11 +3712,13 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
         raise ValueError(
             f"lifecycle server {server} reports receipts beyond deferred direct items"
         )
-    authority_dependency_items = direct_items - writer_items
-    if owner == "PLACEMENT_ROUTED":
-        authority_dependency_items -= receipt_items
     if owner == "AUTHORITY_BI_ACQUIRE":
-        if receipt_items != 0 or receipt_duplicates != 0 or receipt_rejections != 0:
+        if (
+            writer_dependencies != 0
+            or receipt_items != 0
+            or receipt_duplicates != 0
+            or receipt_rejections != 0
+        ):
             raise ValueError(
                 f"lifecycle server {server} mixed writer receipts into authority ownership"
             )
@@ -3375,11 +3726,11 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
             raise ValueError(
                 f"lifecycle server {server} has pending authority payload dependencies"
             )
-        if authority_dependency_items > 0 and not (
+        if authority_dependencies > 0 and not (
             provider
             and authority_complete
             and authority["authority_coherent_acquire_ranges"]
-            >= authority_dependency_items
+            >= authority_dependencies
         ):
             raise ValueError(
                 f"lifecycle server {server} lacks complete authority-owned payload evidence"
@@ -3389,7 +3740,11 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
             f"lifecycle server {server} used authority persistence under owner {owner}"
         )
     if owner == "WRITER_RECEIPT":
-        if direct_items > 0 and not writer_host_receipt_complete:
+        if authority_dependencies != 0:
+            raise ValueError(
+                f"lifecycle server {server} used authority persistence under owner {owner}"
+            )
+        if dependencies_created > 0 and not writer_host_receipt_complete:
             raise ValueError(
                 f"lifecycle server {server} lacks payload persistence evidence"
             )
@@ -3398,20 +3753,32 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
             raise ValueError(
                 f"lifecycle server {server} has incomplete placement-routed receipts"
             )
-        if authority_dependency_items > 0 and not (
+        if receipt_items != writer_dependencies:
+            raise ValueError(
+                f"lifecycle server {server} has unmatched placement-routed receipts"
+            )
+        if authority_dependencies > 0 and not (
             provider
             and authority_complete
             and authority["authority_coherent_acquire_ranges"]
-            >= authority_dependency_items
+            >= authority_dependencies
         ):
             raise ValueError(
                 f"lifecycle server {server} lacks placement-routed authority evidence"
             )
-        if receipt_items == 0 and authority_dependency_items == 0 and direct_items > writer_items:
+        if (
+            dependencies_created > 0
+            and authority_dependencies == 0
+            and writer_dependencies == 0
+        ):
             raise ValueError(
                 f"lifecycle server {server} did not close placement-routed dependencies"
             )
     elif owner == "WRITER_BEFORE_VISIBILITY":
+        if dependencies_created != 0:
+            raise ValueError(
+                f"lifecycle server {server} deferred payload under owner {owner}"
+            )
         if direct_items > 0 and not (provider or writer_complete):
             raise ValueError(
                 f"lifecycle server {server} has direct-write items without payload "
@@ -3427,7 +3794,8 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
         "placement_routed_complete": owner == "PLACEMENT_ROUTED"
         and pending_receipts == 0
         and receipt_rejections == 0
-        and (authority_dependency_items == 0 or authority_complete),
+        and receipt_items == writer_dependencies
+        and (authority_dependencies == 0 or authority_complete),
         "direct_write_commit_items": direct_items,
         "writer_persisted_direct_items": writer_items,
         "writer_persisted_direct_bytes": writer_bytes,
@@ -3435,7 +3803,10 @@ def lifecycle_payload_persistence_evidence(audit: dict, server: int) -> dict:
         "host_persist_receipts_duplicate": receipt_duplicates,
         "host_persist_receipts_rejected": receipt_rejections,
         "pending_payload_dependencies": pending_receipts,
-        "authority_dependency_items": authority_dependency_items,
+        "deferred_payload_dependencies_created": dependencies_created,
+        "deferred_payload_dependencies_completed": dependencies_completed,
+        "authority_dependency_items": authority_dependencies,
+        "writer_dependency_items": writer_dependencies,
     }
 
 
@@ -3700,6 +4071,10 @@ def parse_server_inspection(
             "host_persist_receipts_rejected",
             "pending_payload_dependencies",
             "pending_payload_bytes",
+            "deferred_payload_dependencies_created",
+            "deferred_payload_dependencies_completed",
+            "authority_payload_dependencies_completed",
+            "writer_payload_dependencies_completed",
             "authority_coherent_acquire_jobs",
             "authority_coherent_acquire_ranges",
             "authority_coherent_acquire_bytes",
@@ -4623,6 +4998,31 @@ def parse_io500_metrics(text: str) -> dict:
     }
 
 
+def validate_standard_phase_metrics(metrics: dict) -> None:
+    """Final artifact gate, independent of possibly interleaved console lines."""
+    phases = metrics["phases"]
+    names = [phase["name"] for phase in phases]
+    if len(names) != 13 or set(names) != STANDARD_IO500_PHASES:
+        raise ValueError(f"standard result lacks exactly 13 actual IO500 phases: {names}")
+    for phase in phases:
+        seconds = phase["seconds"]
+        if not math.isfinite(seconds) or not 0 < seconds <= 600:
+            raise ValueError(
+                f"IO500 phase {phase['name']} violates final 600 s gate: seconds={seconds}"
+            )
+
+
+def validate_pressure_phase_metrics(stage: str, metrics: dict) -> None:
+    required = PRESSURE_SMOKE_PHASES[stage]
+    phases = [phase for phase in metrics["phases"] if phase["name"] in required]
+    if len(phases) != len(required) or {phase["name"] for phase in phases} != required:
+        raise ValueError(f"{stage} lacks exactly {len(required)} required phase results")
+    for phase in phases:
+        seconds = phase["seconds"]
+        if not math.isfinite(seconds) or not 0 < seconds <= 600:
+            raise ValueError(f"pressure phase {phase['name']} violates final 600 s gate: {seconds}")
+
+
 def parse_io500_utc_timestamp(value: str | None) -> int | None:
     if value is None:
         return None
@@ -4871,6 +5271,12 @@ def execute(
             "client_guests": client_count,
             "mpi_ranks": client_count,
             "qemu_machine": "sifive_u",
+            "machine_harts_per_guest": 5,
+            "linux_supported_cpus_per_guest": 1,
+            "persistence_execution_scope": (
+                "single Linux ordering agent per QEMU; private file-backed "
+                "functional provider, not physical persistence certification"
+            ),
             "type3_endpoints": host_count,
             "type3_bytes_per_endpoint": ENDPOINT_BYTES,
             "shared_cxlmemsim_region_bytes": ENDPOINT_BYTES,
@@ -4913,6 +5319,7 @@ def execute(
             ],
         },
         "validity": {},
+        "persistence_execution": [],
         "commands": {},
         "observation_config": observation_config,
         "host_profiler": {
@@ -5030,6 +5437,9 @@ def execute(
                 console,
                 f"LEGOFS_IO500_SERVER_READY index={server_index}", timeout
             )
+            result["persistence_execution"].append(
+                parse_persistence_execution(console.output, "server", server_index)
+            )
 
         boot_futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=client_count) as pool:
@@ -5082,10 +5492,17 @@ def execute(
             wait_guest_marker(
                 console, f"LEGOFS_IO500_CLIENT_READY index={index}", timeout
             )
+            result["persistence_execution"].append(
+                parse_persistence_execution(console.output, "client", index)
+            )
 
         result["clock_sync"] = synchronize_guest_clocks(
             server_consoles, client_consoles, client_count=client_count
         )
+
+        # Exercise libc thread teardown before the timed MPI cost window.
+        result["thread_exit_probe"] = []
+        run_thread_exit_probe(client_consoles[0], timeout, result["thread_exit_probe"])
 
         trace_records = parse_trace(paths.coherence) if use_proof_trace else []
         registration_records = (
@@ -5131,7 +5548,7 @@ def execute(
                 cost_started_ns,
                 time.monotonic_ns(),
             )
-            if paths.stage in ("scc", "standard") and serving_transport == "cxl":
+            if paths.stage in ("scc", "standard", "stress-tiny") and serving_transport == "cxl":
                 mpi_command = result["commands"]["mpi"]
                 mpi_output = client_consoles[0].output[
                     mpi_command["output_start"]:mpi_command["output_end"]
@@ -5297,6 +5714,15 @@ def execute(
                 result["host_process_cost"]["wall_ns"],
                 client_count,
             )
+            if paths.stage in PRESSURE_SMOKE_RANKS:
+                coverage = pressure_smoke_coverage(
+                    paths.stage, summaries, client_consoles[0].output,
+                    [console.output for console in server_consoles],
+                    exporter_validated="post_run_exporter_summary" in result,
+                )
+                result["pressure_coverage"] = coverage
+                if not coverage["passed"]:
+                    raise ValueError(f"pressure smoke missing required coverage: {coverage['missing']}")
             writer_host = result["legofs_timing"]["persistence"]["writer_host"]
             if writer_host["writer_host_persist_jobs_completed"]:
                 if writer_persist_provider == "riscv-zicbom-dax" and (
@@ -5313,11 +5739,15 @@ def execute(
                     raise ValueError(
                         "selected msync writer provider was not used exclusively"
                     )
-        for console in client_consoles:
-            console.send("LEGOFS_POWEROFF")
+        # Rank and exporter processes have already retired their lanes.  Stop
+        # authorities before client guests so no server-side mapping access
+        # can outlive an endpoint during the final machine teardown.
         for console in server_consoles:
             console.send("LEGOFS_POWEROFF")
-        finish_guest_processes(client_consoles + server_consoles)
+        finish_guest_processes(server_consoles)
+        for console in client_consoles:
+            console.send("LEGOFS_POWEROFF")
+        finish_guest_processes(client_consoles)
         server_process.send_signal(signal.SIGINT)
         try:
             server_process.wait(timeout=30)
@@ -5329,6 +5759,10 @@ def execute(
         if paths.stage != "hello":
             io500 = extract_results(paths)
             result["io500"] = io500
+            if paths.stage == "standard":
+                validate_standard_phase_metrics(io500["metrics"])
+            elif paths.stage in PRESSURE_SMOKE_RANKS:
+                validate_pressure_phase_metrics(paths.stage, io500["metrics"])
             no_invalid = not io500["invalid"]
             expected_no_invalid = paths.stage in ("scc", "standard")
             result["validity"] = {
@@ -5392,19 +5826,41 @@ def execute(
                 raise RuntimeError(verifier["failure"])
             if expected_no_invalid and not no_invalid:
                 raise ValueError(f"{paths.stage} result contains [INVALID]")
+        # A worker/exporter can fault after writing its summary or MPI status.
+        # Recheck the complete guest logs before accepting the final verdict.
+        for role, consoles in (("client", client_consoles), ("server", server_consoles)):
+            for index, console in enumerate(consoles):
+                validate_guest_process_faults(f"{role}{index}", console.output)
         result["filesystem_valid"] = True
         result["io500_validity"] = result["validity"]
         result["status"] = "passed"
         return result
     except BaseException as error:
-        result["first_failure"] = str(error)
+        result["first_failure"] = str(error) or type(error).__name__
         raise
     finally:
+        if paths.stage in PRESSURE_SMOKE_RANKS and "pressure_coverage" not in result:
+            # Keep observed boundaries even when MPI times out before summaries.
+            # This is explicitly partial, never a substitute for final gates.
+            try:
+                partial = pressure_smoke_coverage(
+                    paths.stage, result.get("posix_path_summaries", []),
+                    client_consoles[0].output if client_consoles else "",
+                    [console.output for console in server_consoles],
+                    exporter_validated="post_run_exporter_summary" in result,
+                )
+                partial.update(partial=True, passed=False)
+                result["pressure_coverage"] = partial
+            except Exception as diagnostic_error:
+                result["pressure_coverage"] = {
+                    "partial": True, "passed": False, "error": str(diagnostic_error)
+                }
         if tcp is not None:
             tcp.close()
         multicast.release()
-        for item in reversed(all_owned):
-            stop_process(item)
+        stop_run_processes_in_dependency_order(
+            server_consoles, client_consoles, server_owned, all_owned
+        )
         if server_log_handle is not None and not server_log_handle.closed:
             server_log_handle.close()
         for console in client_consoles + server_consoles:
@@ -5424,9 +5880,12 @@ def parse_args(argv=None):
         choices=(
             "hello",
             "tiny",
+            "stress-tiny",
+            "rollover-smoke",
             "easy-smoke",
             "hard-smoke",
             "metadata-smoke",
+            "small-close-smoke",
             "rnd4k",
             "scc",
             "standard",
@@ -5546,6 +6005,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    validate_pressure_smoke_options(args)
     if args.timeout <= 0:
         raise ValueError("timeout must be positive")
     if not 1 <= args.client_count <= DEFAULT_CLIENTS:

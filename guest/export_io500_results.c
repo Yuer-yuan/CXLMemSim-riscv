@@ -70,10 +70,15 @@ int main(int argc, char **argv)
     unsigned int copied = 0;
     int copied_config = 0;
     int copied_result = 0;
+    int partial = 0;
 
-    if (argc != 2 || (strcmp(argv[1], "scc") != 0 &&
-                      strcmp(argv[1], "standard") != 0)) {
-        fprintf(stderr, "usage: %s scc|standard\n", argv[0]);
+    if (argc == 3 && strcmp(argv[2], "--allow-partial") == 0) {
+        partial = 1;
+    }
+    if (!((argc == 2) || partial) ||
+        (strcmp(argv[1], "scc") != 0 && strcmp(argv[1], "standard") != 0 &&
+         strcmp(argv[1], "stress-tiny") != 0)) {
+        fprintf(stderr, "usage: %s scc|standard|stress-tiny [--allow-partial]\n", argv[0]);
         return 64;
     }
     if (snprintf(source_directory, sizeof(source_directory),
@@ -127,7 +132,17 @@ int main(int argc, char **argv)
         copied_result |= strcmp(entry->d_name, "result.txt") == 0;
         copied++;
     }
-    if (closedir(directory) != 0 || !copied_config || !copied_result) {
+    if (closedir(directory) != 0) {
+        perror(source_directory);
+        return 1;
+    }
+    if (partial && copied > 0 && copied_config) {
+        printf("LEGOFS_IO500_PARTIAL_RESULTS_EXPORTED stage=%s source=%s destination=%s artifacts=%u config=%d result=%d\n",
+               argv[1], source_directory, destination_directory, copied,
+               copied_config, copied_result);
+        return 0;
+    }
+    if (!copied_config || !copied_result) {
         fprintf(stderr,
                 "incomplete IO500 result export: copied=%u config=%d result=%d\n",
                 copied, copied_config, copied_result);

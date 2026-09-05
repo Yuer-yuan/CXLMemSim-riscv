@@ -42,6 +42,17 @@ set_guest_time()
 	echo "LEGOFS_IO500_TIME_SYNC role=$role index=$index requested=$requested observed=$observed"
 }
 
+check_persistence_execution()
+{
+	# This is an execution restriction for the inherited private provider, not
+	# a hardware persistence guarantee. nr_cpus bounds possible hotplug CPUs too.
+	[ "$1" = 0 ] && [ "$2" = 0 ] && [ "$3" = 1 ] || {
+		echo "LEGOFS_PERSIST_EXECUTION_ERROR role=$role index=$index possible=$1 online=$2 nr_cpus=$3"
+		fail persistence-execution-domain
+	}
+	echo "LEGOFS_PERSIST_EXECUTION role=$role index=$index possible=$1 online=$2 nr_cpus=$3"
+}
+
 if [ "${LEGOFS_PAYLOAD_RUNTIME:-0}" != 1 ]; then
 	mkdir -p /proc /sys /dev /run /tmp /payload /state /results /etc
 	mount -t proc proc /proc || fail mount-proc
@@ -59,7 +70,7 @@ fi
 
 role="$(cmdline_value io500.role=)" || fail missing-role
 index="$(cmdline_value io500.index=)" || fail missing-index
-stage="$(cmdline_value io500.stage=)" || fail missing-stage
+stage="$(cmdline_value s=)" || fail missing-stage
 server_count="$(cmdline_value io500.server_count=)" || fail missing-server-count
 client_count="$(cmdline_value io500.client_count=)" || fail missing-client-count
 serving_transport="$(cmdline_value io500.serving_transport=)" || fail missing-serving-transport
@@ -141,6 +152,11 @@ case "$client_count" in 1|2|3|4|5|6|7|8|9|10) ;; *) fail invalid-client-count ;;
 if [ "$role" = server ] && [ "$index" -ge "$server_count" ]; then
 	fail invalid-server-index
 fi
+
+possible_cpus="$(cat /sys/devices/system/cpu/possible)" || fail possible-cpus
+online_cpus="$(cat /sys/devices/system/cpu/online)" || fail online-cpus
+cpu_cap="$(cmdline_value nr_cpus=)" || fail missing-cpu-cap
+check_persistence_execution "$possible_cpus" "$online_cpus" "$cpu_cap"
 
 if [ "$role" = server ]; then
 	# Product WAL/state writers issue their own fsyncs.  A synchronous mount also
@@ -336,6 +352,13 @@ export BADFS_FSYNC_ON_CLOSE=1
 export BADFS_TRACK_OPEN_SET=1
 export BADFS_FABRIC_STAGED_IO=0
 export BADFS_DISABLE_FABRIC_MMAP=0
+# IO500 measures serving operations, not metadata-log compaction. Durability
+# remains mandatory through per-phase fsync/sync and the authority durable-
+# prefix worker. A periodic checkpoint must not occupy the sole storage
+# executor while waiting for writer-host receipts whose cohort needs later
+# commits to make progress.
+export BADFS_SNAPSHOT_INTERVAL_SECS=0
+export BADFS_SNAPSHOT_EVERY=1000000000
 export BADFS_LIFECYCLE_COHERENT_PUBLICATION=1
 export BADFS_LIFECYCLE_COHERENT_READ_CACHE=1
 export BADFS_LIFECYCLE_PACKED_SMALL_SEGMENTS="$packed_small_segments"
@@ -381,6 +404,7 @@ if [ "$role" = server ]; then
 	# Keep the high-frequency audit trace off the durable metadata disk.  Tiny
 	# still streams it to the console for the strict lifecycle/BI proof.
 	export BADFS_LIFECYCLE_TRACE=/tmp/lifecycle.jsonl
+	echo "LEGOFS_IO500_CHECKPOINT_POLICY periodic_interval_secs=$BADFS_SNAPSHOT_INTERVAL_SECS operation_threshold=$BADFS_SNAPSHOT_EVERY foreground_wait=forbidden"
 	if [ "$stage" = tiny ]; then
 		export BADFS_LIFECYCLE_TRACE_MODE=ordering
 		export BADFS_LIFECYCLE_TRACE_STDOUT=1
@@ -499,7 +523,7 @@ while IFS= read -r line; do
 		hello)
 			application=/payload/bin/mpi-hello
 			;;
-		tiny|easy-smoke|hard-smoke|metadata-smoke|rnd4k|scc|standard)
+		tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard)
 			application=/payload/bin/run-io500-rank
 			;;
 		*)
@@ -509,10 +533,37 @@ while IFS= read -r line; do
 		esac
 		(
 			export IO500_STAGE="$mpi_stage"
+			set +e
 			/payload/bin/mpiexec.hydra -iface eth0 -launcher manual \
 				-f /payload/etc/clients -ppn 1 -n "$client_count" \
 				"$application" "$mpi_stage"
 			rc=$?
+			case "$mpi_stage:$rc" in
+			scc:0|standard:0|stress-tiny:0) ;;
+			scc:*|standard:*|stress-tiny:*)
+				# MPI_Abort terminates the rank scripts before their normal
+				# exporter can run.  Preserve the benchmark's own error files
+				# through a fresh CLIENT_FS lane while every authority and CXL
+				# endpoint is still alive.  This is failure-only and performs
+				# ordinary LegoFS reads over CXL serving; TCP remains bootstrap.
+				exporter_endpoint="$((2 * client_count + 1))"
+				serving_reserved_control_lanes=20
+				serving_client_lane_count="$((BADFS_SERVING_MAX_CLIENTS - serving_reserved_control_lanes))"
+				export_rc=64
+				if [ "$exporter_endpoint" -lt "$serving_client_lane_count" ]; then
+					/bin/busybox mkdir -p /tmp/posix-failed-export
+					BADFS_OBSERVATION_MODE=off \
+					BADFS_CLIENT_ENDPOINT_ID="$exporter_endpoint" \
+					BADFS_SERVING_TRANSPORT="$serving_transport" \
+					BADFS_POSIX_TRACE_DIR=/tmp/posix-failed-export \
+					PMI_RANK= PMIX_RANK= OMPI_COMM_WORLD_RANK= \
+					LD_PRELOAD=/payload/lib/libbadfs_intercept.so \
+						/payload/bin/export-io500-results "$mpi_stage" --allow-partial
+					export_rc=$?
+				fi
+				echo "LEGOFS_IO500_FAILED_RESULTS_EXPORT stage=$mpi_stage endpoint=$exporter_endpoint rc=$export_rc"
+				;;
+			esac
 			echo "LEGOFS_IO500_MPI_EXIT stage=$mpi_stage rc=$rc"
 		) &
 		echo "LEGOFS_IO500_MPI_STARTED stage=$mpi_stage pid=$!"

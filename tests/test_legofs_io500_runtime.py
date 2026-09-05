@@ -10,6 +10,7 @@ import struct
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -26,6 +27,7 @@ SERVER_WRAPPER = ROOT / "guest" / "legofs_badfs_server.sh"
 INIT_SCRIPT = ROOT / "guest" / "legofs_io500_init.sh"
 BOOTSTRAP_INIT_SCRIPT = ROOT / "guest" / "legofs_io500_bootstrap_init.sh"
 SYSTEM_SYNC_PROBE_SOURCE = ROOT / "guest" / "system_sync_probe.c"
+RESULT_EXPORT_SOURCE = ROOT / "guest" / "export_io500_results.c"
 LEGOFS_SERVER_SOURCE = ROOT / "components" / "legofs" / "badfs-server" / "src" / "lib.rs"
 
 
@@ -136,6 +138,7 @@ def cxl_serving_evidence(
         "direct_create_fallback_no_parent_writer": 0,
         "direct_create_fallback_existing": 0,
         "direct_create_fallback_inode_exhausted": 0,
+        "direct_create_fallback_unproven_namespace": 0,
         "direct_create_errors": 0,
         "direct_unlink_attempts": 0,
         "direct_unlink_commands_elided": 0,
@@ -248,6 +251,65 @@ def recovery_checkpoint(server=0):
 
 
 class Io500RuntimeTest(unittest.TestCase):
+    def test_blocking_payload_wait_propagates_caller_and_dependency_identity(self):
+        common = (ROOT / "components/legofs/badfs-common/src/lifecycle.rs").read_text()
+        for name in ("wait_for_payload_receipts", "close_payload_dependencies", "persist_locked_with_barrier", "persist_locked"):
+            self.assertIn(f"#[track_caller]\n    fn {name}(", common)
+        self.assertIn("BADFS_PAYLOAD_RECEIPT_STALL caller={}", common)
+        self.assertIn("first_writer_domain={}", common)
+        client = (ROOT / "components/legofs/badfs-client/src/cxl_serving.rs").read_text()
+        self.assertIn("if cq_stall_diagnostic_checkpoint(sleep_calls)", client)
+        self.assertIn("elapsed >= Duration::from_secs(10)", client)
+
+    def test_payload_credit_reservation_uses_exclusive_client_drain(self):
+        source = (ROOT / "components/legofs/badfs-client/src/lib.rs").read_text()
+        reservation = source.split("async fn reserve_writer_host_receipt_batch(", 1)[1].split(
+            "async fn drain_writer_host_persistence", 1)[0]
+        denial = reservation.split("Err(Error::NoSpace)", 1)[1].split("Err(error)", 1)[0]
+        self.assertIn("self.drain_writer_host_persistence().await?", denial)
+        self.assertNotIn("request_flush", denial)
+        self.assertNotIn("changed.await", denial)
+        self.assertNotIn("async fn reserve_receipt_batch(", source)
+        self.assertEqual(source.count(".reserve_writer_host_receipt_batch("), 2)
+        diagnostic = source.split("fn writer_persist_diagnostic(", 1)[1].split("#[inline]", 1)[0]
+        self.assertIn('format!("{args}\\n")', diagnostic)
+        self.assertIn("write_all(line.as_bytes())", diagnostic)
+
+    def test_direct_mutation_apply_credit_gates_all_prepare_kinds(self):
+        common = (ROOT / "components/legofs/badfs-common/src/serving_transport/direct_mutation.rs").read_text()
+        self.assertEqual(common.count("self.check_apply_credit(visible)?;"), 4)
+        client = (ROOT / "components/legofs/badfs-client/src/cxl_serving.rs").read_text()
+        for kind in ("create", "unlink", "empty-close", "small-close"):
+            self.assertIn(f'with_apply_credit_retry("{kind}",', client)
+        create = client.split("    fn direct_create_with_origin(", 1)[1].split("    fn try_direct_create_with_origin(", 1)
+        self.assertIn("self.direct_create_attempts.fetch_add", create[0])
+        self.assertNotIn("self.direct_create_attempts.fetch_add", create[1])
+        unlink = client.split("    fn try_direct_unlink(", 1)[1]
+        self.assertNotIn("self.direct_unlink_attempts.fetch_add", unlink)
+        self.assertIn("BADFS_DIRECT_MUTATION_APPLY_BACKPRESSURE", client)
+
+    def test_writer_checkpoint_uses_os_clock_without_firmware_access_assumptions(self):
+        # An RHCT/DT timebase describes frequency, not permission to execute
+        # TIME in userspace. Keep this restored scheduling path on the OS API.
+        source_root = ROOT / "components/legofs/badfs-client/src"
+        self.assertFalse((source_root / "writer_clean_clock.rs").exists())
+        source = (source_root / "lib.rs").read_text()
+        clean_batch = source.split("    fn clean_batch(", 1)[1].split(
+            "    fn persist_msync_batch(", 1
+        )[0]
+        self.assertIn("Instant::now()", clean_batch)
+        self.assertIn("std::thread::yield_now()", clean_batch)
+        self.assertIn("clean_local_range_sets_with_checkpoint", clean_batch)
+        callback = clean_batch.split("                            || {", 1)[1]
+        self.assertLess(callback.index("writer_clean_checkpoint_due"), callback.index("Instant::now()"))
+        self.assertIn("checkpoint_quantum_blocks={}", clean_batch)
+        self.assertIn("max_quantum_ns={}", clean_batch)
+        self.assertNotIn("max_block_ns", clean_batch)
+        self.assertNotIn("clock_hz=", clean_batch)
+        for shortcut in ("rdtime", "rdcycle", "writer_clean_clock", "timebase-frequency", "RHCT"):
+            self.assertNotIn(shortcut, clean_batch)
+        self.assertNotIn("LEGOFS_TIMEBASE", INIT_SCRIPT.read_text())
+
     @classmethod
     def setUpClass(cls):
         cls.runner = load_runner()
@@ -528,6 +590,8 @@ class Io500RuntimeTest(unittest.TestCase):
             {**config, "run_id": compact_run_id},
         )
         self.assertIn(" u=H ", zicbom_bootargs)
+        self.assertIn(" nr_cpus=1 ", zicbom_bootargs)
+        self.assertIn(" s=tiny ", zicbom_bootargs)
         self.assertNotIn(" z=", zicbom_bootargs)
 
         for shift in (-1, 21):
@@ -546,6 +610,36 @@ class Io500RuntimeTest(unittest.TestCase):
                 self.runner.resolve_observation_config(
                     bad, pathlib.Path(self.temporary.name), "bad"
                 )
+
+    def test_persistence_execution_requires_unique_exact_guest_evidence(self):
+        good = "LEGOFS_PERSIST_EXECUTION role=client index=2 possible=0 online=0 nr_cpus=1"
+        record = self.runner.parse_persistence_execution("boot\r\n" + good + "\r\n", "client", 2)
+        self.assertEqual(record, {"role": "client", "index": 2, "possible": "0", "online": "0", "nr_cpus": 1})
+        for bad in ("", good + "\n" + good, good.replace("index=2", "index=1"),
+                    good.replace("role=client", "role=server"),
+                    good.replace("possible=0", "possible=0-3"),
+                    good.replace("online=0", "online=0,1"),
+                    good.replace("nr_cpus=1", "nr_cpus=4"), good + " extra=1"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.runner.parse_persistence_execution(bad, "client", 2)
+
+    def test_guest_persistence_execution_guard_fails_closed(self):
+        source = INIT_SCRIPT.read_text()
+        guard = source.split("check_persistence_execution()\n", 1)[1].split("\n}\n", 1)[0]
+        shell = 'fail() { exit 73; }; role=client; index=2; check_persistence_execution()\n' + guard + '\n}\ncheck_persistence_execution "$1" "$2" "$3"\n'
+        for possible, online, cap, expected in (
+            ("0", "0", "1", 0), ("0-3", "0", "1", 73),
+            ("0", "0,1", "1", 73), ("0", "0", "4", 73),
+            ("", "0", "1", 73), ("0", "", "1", 73), ("0", "0", "", 73),
+        ):
+            with self.subTest(possible=possible, online=online, cap=cap):
+                checked = subprocess.run(["sh", "-c", shell, "guard", possible, online, cap], text=True, capture_output=True)
+                self.assertEqual(checked.returncode, expected, checked.stderr)
+                self.assertEqual("LEGOFS_PERSIST_EXECUTION " in checked.stdout, expected == 0)
+        self.assertIn('/sys/devices/system/cpu/possible', source)
+        self.assertIn('/sys/devices/system/cpu/online', source)
+        self.assertIn('cmdline_value nr_cpus=', source)
+        self.assertLess(source.index('check_persistence_execution "$possible_cpus"'), source.index('mount -t ext2 -o rw /dev/vdb /state'))
 
     def test_observation_profile_hash_is_checked_before_execute(self):
         profile = {
@@ -1245,6 +1339,63 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn('PMI_RANK= PMIX_RANK= OMPI_COMM_WORLD_RANK=', rank)
         self.assertIn("LEGOFS_IO500_EXPORT_POSIX_SUMMARY", rank)
 
+    def test_failed_official_run_exports_partial_results_before_mpi_exit(self):
+        init = INIT_SCRIPT.read_text(encoding="utf-8")
+        failure_export = init.index("LEGOFS_IO500_FAILED_RESULTS_EXPORT")
+        mpi_exit = init.index(
+            'echo "LEGOFS_IO500_MPI_EXIT stage=$mpi_stage rc=$rc"'
+        )
+        self.assertLess(failure_export, mpi_exit)
+        self.assertIn('exporter_endpoint="$((2 * client_count + 1))"', init)
+        self.assertIn('BADFS_CLIENT_ENDPOINT_ID="$exporter_endpoint"', init)
+        self.assertIn('BADFS_SERVING_TRANSPORT="$serving_transport"', init)
+        self.assertIn(
+            '/payload/bin/export-io500-results "$mpi_stage" --allow-partial',
+            init,
+        )
+
+        exporter = RESULT_EXPORT_SOURCE.read_text(encoding="utf-8")
+        self.assertIn('strcmp(argv[2], "--allow-partial") == 0', exporter)
+        self.assertIn("partial && copied > 0 && copied_config", exporter)
+        self.assertIn("LEGOFS_IO500_PARTIAL_RESULTS_EXPORTED", exporter)
+
+    def test_first_error_probe_has_no_success_path_clock_read(self):
+        source = (ROOT / "components/legofs/badfs-intercept/src/lib.rs").read_text()
+        dispatch = source[
+            source.index("fn dispatch_syscall(") : source.index("fn observation_result(")
+        ]
+        self.assertNotIn("Instant::now()", dispatch)
+        self.assertIn("if let DispatchResult::Errno(errno) = &dispatch", dispatch)
+        self.assertIn("report_first_badfs_error(num, *errno)", dispatch)
+
+    def test_abnormal_cleanup_stops_authorities_before_client_guests(self):
+        stopped = []
+
+        class FakeOwned:
+            def __init__(self, name):
+                self.name = name
+
+        server = [type("Console", (), {"owned": FakeOwned("server0")})()]
+        clients = [
+            type("Console", (), {"owned": FakeOwned("client0")})(),
+            type("Console", (), {"owned": FakeOwned("client1")})(),
+        ]
+        cxl = FakeOwned("cxlmemsim")
+        unrelated = FakeOwned("unrelated")
+        original = self.runner.stop_process
+        self.runner.stop_process = lambda owned: stopped.append(owned.name)
+        try:
+            self.runner.stop_run_processes_in_dependency_order(
+                server, clients, cxl, [cxl, *[item.owned for item in server],
+                                      *[item.owned for item in clients], unrelated]
+            )
+        finally:
+            self.runner.stop_process = original
+        self.assertEqual(
+            stopped,
+            ["server0", "client0", "client1", "cxlmemsim", "unrelated"],
+        )
+
     def test_post_run_exporter_summary_accepts_supported_client_counts(self):
         for client_count in (2, 4, 6, 10):
             endpoint = 2 * client_count + 1
@@ -1493,6 +1644,11 @@ class Io500RuntimeTest(unittest.TestCase):
         build = BUILD_SCRIPT.read_text()
         self.assertIn('"$MUSL_CC" -O2 -Wall -Wextra -Werror', build)
         self.assertIn('io500_result_export=$PAYLOAD_ROOT/bin/export-io500-results', build)
+        payload_rebuild = (
+            ROOT / "scripts" / "rebuild_legofs_io500_payload.sh"
+        ).read_text()
+        self.assertIn('"$ROOT/guest/export_io500_results.c"', payload_rebuild)
+        self.assertIn('-o "$TARGET_ROOT/export-io500-results"', payload_rebuild)
         exporter = (ROOT / "guest" / "export_io500_results.c").read_text()
         self.assertIn("opendir(source_directory)", exporter)
         self.assertIn("while ((entry = readdir(directory)) != NULL)", exporter)
@@ -1507,6 +1663,9 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("export BADFS_LIFECYCLE_TRACE=/tmp/lifecycle.jsonl", init)
         self.assertIn("export BADFS_FSYNC_ON_CLOSE=1", init)
         self.assertIn("export BADFS_FSYNC_ON_CLOSE=1", rank)
+        self.assertIn("export BADFS_SNAPSHOT_INTERVAL_SECS=0", init)
+        self.assertIn("export BADFS_SNAPSHOT_EVERY=1000000000", init)
+        self.assertIn("LEGOFS_IO500_CHECKPOINT_POLICY", init)
         self.assertIn("export BADFS_LIFECYCLE_BLOB=0", init)
         self.assertIn("export BADFS_LIFECYCLE_BLOB=0", rank)
         self.assertIn('[ "$dax_align" -ge 4096 ]', init)
@@ -1530,6 +1689,71 @@ class Io500RuntimeTest(unittest.TestCase):
         consoles = [FakeConsole() for _ in range(3)]
         self.runner.finish_guest_processes(consoles, grace_seconds=0.5)
         self.assertEqual([item.process.timeout for item in consoles], [0.5] * 3)
+
+    def test_standard_phase_gate_checks_silence_and_reported_time(self):
+        gate = self.runner.IO500PhaseWatchdog()
+        output = "IO500 version test (standard)\n"
+        gate.observe(output, 10.0)
+        gate.observe(output, 609.0)
+        with self.assertRaisesRegex(TimeoutError, "before-first-result"):
+            gate.observe(output, 611.0)
+
+        gate = self.runner.IO500PhaseWatchdog()
+        gate.observe(output, 0.0)
+        output += "[RESULT] ior-easy-write 0.001 GiB/s : time 523."
+        gate.observe(output, 523.0)
+        self.assertEqual(gate.completed, set())
+        output += "692 seconds\r\n"
+        gate.observe(output, 524.0)
+        self.assertEqual(gate.completed, {"ior-easy-write"})
+        gate.observe(output, 1100.0)
+        with self.assertRaisesRegex(TimeoutError, "after ior-easy-write"):
+            gate.observe(output, 1125.0)
+
+        gate = self.runner.IO500PhaseWatchdog()
+        gate.observe("[      ] timestamp 0.0 kIOPS : time 0.003 seconds\n", 0.0)
+        self.assertEqual(gate.completed, set())
+
+        gate = self.runner.IO500PhaseWatchdog()
+        with self.assertRaisesRegex(TimeoutError, "mdtest-easy-write.*reported=601"):
+            gate.observe("[RESULT] mdtest-easy-write 1.0 kIOPS : time 601.001 seconds\n", 0.0)
+
+    def test_standard_gate_covers_final_random_read_and_final_artifact(self):
+        names = (
+            "ior-easy-write", "mdtest-easy-write", "ior-hard-write",
+            "mdtest-hard-write", "find", "ior-easy-read", "mdtest-easy-stat",
+            "ior-hard-read", "mdtest-hard-stat", "mdtest-easy-delete",
+            "mdtest-hard-read", "mdtest-hard-delete", "ior-rnd4K-easy-read",
+        )
+        self.assertEqual(self.runner.STANDARD_IO500_PHASES, frozenset(names))
+        gate = self.runner.IO500PhaseWatchdog()
+        output = "IO500 version test (standard)\n"
+        for name in names[:-1]:
+            output += f"[RESULT] {name} 1.0 kIOPS : time 300.000 seconds\n"
+        output += "[      ] timestamp 0.0 kIOPS : time 0.003 seconds\n"
+        gate.observe(output, 0.0)
+        self.assertEqual(len(gate.completed), 12)
+        with self.assertRaisesRegex(TimeoutError, "completed=12/13"):
+            gate.observe(output, 601.0)
+        gate = self.runner.IO500PhaseWatchdog()
+        with self.assertRaisesRegex(TimeoutError, "ior-rnd4K-easy-read.*reported=601"):
+            gate.observe("[RESULT] ior-rnd4K-easy-read 1.0 GiB/s : time 601.001 seconds\n", 0.0)
+        gate = self.runner.IO500PhaseWatchdog()
+        complete = output + "[RESULT] ior-rnd4K-easy-read 1.0 GiB/s : time 300.000 seconds\n"
+        gate.observe(complete, 0.0)
+        self.assertEqual(gate.completed, set(names))
+        gate.observe(complete, 9000.0)
+        good = {"phases": [{"name": name, "seconds": 300.0} for name in names]}
+        self.runner.validate_standard_phase_metrics(good)
+        for phases in (good["phases"][:-1], good["phases"] + [good["phases"][0]],
+                       good["phases"][:-1] + [{"name": "timestamp", "seconds": 0.01}]):
+            with self.assertRaisesRegex(ValueError, "13 actual"):
+                self.runner.validate_standard_phase_metrics({"phases": phases})
+        for seconds in (600.001, float("nan"), float("inf"), 0, -1):
+            with self.subTest(seconds=seconds), self.assertRaisesRegex(ValueError, "ior-rnd4K-easy-read"):
+                self.runner.validate_standard_phase_metrics({
+                    "phases": good["phases"][:-1] + [{"name": names[-1], "seconds": seconds}]
+                })
 
     def test_nonzero_mpi_exit_is_reported_immediately(self):
         class FakeProcess:
@@ -1558,6 +1782,19 @@ class Io500RuntimeTest(unittest.TestCase):
             self.runner.wait_mpi_exit(console, "tiny", timeout=1, start=0), 0
         )
 
+        console.output = "application called MPI_Abort(MPI_COMM_WORLD, -1) - process 3\r\n"
+        with self.assertRaisesRegex(RuntimeError, "fatal marker"):
+            self.runner.wait_mpi_exit(console, "tiny", timeout=1, start=0)
+
+        console.output = "LEGOFS_IO500_PROXY_EXIT index=3 rc=7\r\n"
+        with self.assertRaisesRegex(RuntimeError, "proxy 3 exited with rc=7"):
+            self.runner.wait_mpi_exit(console, "tiny", timeout=1, start=0)
+
+        console.output = "LEGOFS_IO500_PROXY_EXIT index=0 rc=0\r\nLEGOFS_IO500_MPI_EXIT stage=tiny rc=0\r\n"
+        self.assertEqual(
+            self.runner.wait_mpi_exit(console, "tiny", timeout=1, start=0), 0
+        )
+
         console.output = (
             "BADFS_STRICT_LIFECYCLE_DIRECT_INIT_FAILED: refusing fallback\r\n"
         )
@@ -1565,6 +1802,14 @@ class Io500RuntimeTest(unittest.TestCase):
             self.runner.wait_mpi_exit(console, "tiny", timeout=3600, start=0)
 
         console.output = "LEGOFS_IO500_MPI_EXIT stage=metadata-smoke rc=0\r\n"
+        for marker in ("BADFS_DIRECT_MUTATION_WORKER_FAILED", "BADFS_DIRECT_MUTATION_APPLY_FAILED", "BADFS_DIRECT_MUTATION_MARK_FAILED", "LEGOFS_WRITER_PERSIST_FAILURE"):
+            with self.subTest(marker=marker):
+                server = FakeConsole(marker + " lane=7 error=EIO\r\n")
+                with self.assertRaisesRegex(RuntimeError, "server0.*fatal marker"):
+                    self.runner.wait_mpi_exit(
+                        console, "metadata-smoke", timeout=3600, start=0,
+                        monitored_guests=[("client0", console, 0), ("server0", server, 0)],
+                    )
         server = FakeConsole("rcu: rcu_sched detected stalls on CPUs/tasks:\r\n")
         self.assertEqual(
             self.runner.wait_mpi_exit(
@@ -1609,6 +1854,87 @@ class Io500RuntimeTest(unittest.TestCase):
                     ("server0", server, 0),
                 ],
             )
+
+    def test_zero_mpi_exit_does_not_hide_thread_teardown_fault(self):
+        class FakeProcess:
+            @staticmethod
+            def poll():
+                return None
+
+        class FakeConsole:
+            def __init__(self, output):
+                self.output = output
+                self.condition = threading.Condition()
+                self.process = FakeProcess()
+
+        coordinator = FakeConsole("LEGOFS_IO500_MPI_EXIT stage=tiny rc=0\n")
+        for marker in (
+            "badfs-writer-pe[128]: unhandled signal 11 code 0x1",
+            "cause: 000000000000000c",
+            "cause: 000000000000000d",
+            "cause: 000000000000000f",
+        ):
+            with self.subTest(marker=marker):
+                worker = FakeConsole(marker + "\n")
+                with self.assertRaisesRegex(RuntimeError, "client1.*fatal process fault"):
+                    self.runner.wait_mpi_exit(
+                        coordinator, "tiny", timeout=1, start=0,
+                        monitored_guests=[("client0", coordinator, 0), ("client1", worker, 0)],
+                    )
+
+    def test_thread_exit_probe_waits_for_complete_split_status_line(self):
+        class SplitConsole:
+            output = ""
+            waits = []
+            def send(self, command):
+                self.output = "LEGOFS_IO500_PROXY_EXIT index=0 rc="
+            def wait(self, marker, timeout, start):
+                self.waits.append((marker, timeout, start))
+                if marker == "\n":
+                    self.output += "0\r\n"
+        console = SplitConsole()
+        result = self.runner._send_and_wait(
+            console, "probe", "LEGOFS_IO500_PROXY_EXIT index=0 rc=", 10,
+            complete_line=True,
+        )
+        self.assertTrue(result["output"].endswith("rc=0\r\n"))
+        self.assertEqual(len(console.waits), 2)
+        self.assertLessEqual(console.waits[1][1], 10)
+
+    def test_thread_exit_preflight_requires_retired_threads_and_kernel_status(self):
+        def event(label, *, status=0, signaled=0, signal=-1, detached=32, proxy=0):
+            return {"elapsed_ns": 42, "output": (
+                f"LEGOFS_THREAD_EXIT_PROBE label={label} raw_status={status} exited=1 "
+                f"exit_code=0 signaled={signaled} term_signal={signal} joinable=32 "
+                f"detached={detached} passed=1\n"
+                f"LEGOFS_IO500_PROXY_EXIT index=0 rc={proxy}\n"
+            )}
+        records = []
+        with mock.patch.object(self.runner, "_send_and_wait", side_effect=[event("control"), event("preload")]):
+            self.runner.run_thread_exit_probe(None, 300, records)
+        self.assertEqual([r["label"] for r in records], ["control", "preload"])
+        for change in ({"status": 11}, {"signaled": 1, "signal": 11},
+                       {"detached": 31}, {"proxy": 1}):
+            with self.subTest(change=change):
+                records = []
+                with mock.patch.object(self.runner, "_send_and_wait", side_effect=[event("control"), event("preload", **change)]):
+                    with self.assertRaisesRegex(RuntimeError, "thread-exit probe failed"):
+                        self.runner.run_thread_exit_probe(None, 300, records)
+                self.assertEqual(len(records), 2)  # preserve negative evidence
+        with self.assertRaisesRegex(ValueError, "exact result"):
+            self.runner.parse_thread_exit_probe(event("control")["output"], "preload")
+
+    def test_final_fault_scan_rejects_post_export_worker_crash(self):
+        output = (
+            "LEGOFS_IO500_MPI_EXIT stage=tiny rc=0\n"
+            "LEGOFS_IO500_RESULTS_EXPORTED stage=tiny artifacts=28\n"
+            "badfs-writer-pe[135]: unhandled signal 11 code 0x1\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "client0.*fatal process fault"):
+            self.runner.validate_guest_process_faults("client0", output)
+        self.runner.validate_guest_process_faults(
+            "client0", "rcu_sched self-detected stall\ncause: 8000000000000005\n"
+        )
 
     def test_guest_readiness_fatal_is_reported_immediately(self):
         class FakeProcess:
@@ -1753,13 +2079,26 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("[ior-hard-read]\nAPI = POSIX\nrun = TRUE\n", config)
         self.assertIn("[ior-easy]\nrun = FALSE\n", config)
         self.assertIn(
-            "tiny|easy-smoke|hard-smoke|metadata-smoke|rnd4k|scc|standard",
+            "tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard",
             RANK_SCRIPT.read_text(),
         )
         self.assertIn(
-            "tiny easy-smoke hard-smoke metadata-smoke rnd4k scc standard",
+            "tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard",
             BUILD_SCRIPT.read_text(),
         )
+
+    def test_small_close_smoke_is_separate_and_never_a_score(self):
+        config = (ROOT / "configs" / "io500-small-close-smoke.ini").read_text()
+        self.assertIn("n = 128\n", config)
+        self.assertIn("files-per-dir = 128\n", config)
+        self.assertIn("[ior-hard]\nrun = FALSE\n", config)
+        self.assertIn("[mdtest-hard-write]\nAPI = POSIX\nrun = TRUE\n", config)
+        self.assertIn("small-close-smoke", self.runner.SEMANTIC_SMOKE_STAGES)
+        self.assertIn("small-close-smoke", self.runner.PACKED_SMALL_WORKLOAD_STAGES)
+        args = self.runner.parse_args(["--stage", "small-close-smoke"])
+        self.assertEqual(args.stage, "small-close-smoke")
+        self.assertIn("small-close-smoke", PAYLOAD_REBUILD_SCRIPT.read_text())
+        self.assertIn("small-close-smoke", INIT_SCRIPT.read_text())
 
     def test_fixed_easy_and_metadata_smokes_isolate_official_phase_shapes(self):
         easy = (ROOT / "configs" / "io500-easy-smoke.ini").read_text()
@@ -1841,6 +2180,10 @@ class Io500RuntimeTest(unittest.TestCase):
             "host_persist_receipts_duplicate": 0,
             "host_persist_receipts_rejected": 0,
             "pending_payload_dependencies": 0,
+            "deferred_payload_dependencies_created": 0,
+            "deferred_payload_dependencies_completed": 0,
+            "authority_payload_dependencies_completed": 0,
+            "writer_payload_dependencies_completed": 0,
             "provider_payload_barriers": 1,
             "provider_payload_bytes": 8192,
             "authority_coherent_acquire_jobs": 0,
@@ -1875,6 +2218,9 @@ class Io500RuntimeTest(unittest.TestCase):
             "provider_payload_barriers": 0,
             "provider_payload_bytes": 0,
             "host_persist_receipts_accepted": 2,
+            "deferred_payload_dependencies_created": 2,
+            "deferred_payload_dependencies_completed": 2,
+            "writer_payload_dependencies_completed": 2,
         })
         receipt_evidence = self.runner.lifecycle_payload_persistence_evidence(
             receipt, 0
@@ -1892,6 +2238,9 @@ class Io500RuntimeTest(unittest.TestCase):
             "authority_payload_persist_ranges": 2,
             "authority_payload_persist_bytes": 8192,
             "authority_payload_persist_ns": 200,
+            "deferred_payload_dependencies_created": 2,
+            "deferred_payload_dependencies_completed": 2,
+            "authority_payload_dependencies_completed": 2,
         })
         authority_evidence = self.runner.lifecycle_payload_persistence_evidence(
             authority, 0
@@ -1902,15 +2251,20 @@ class Io500RuntimeTest(unittest.TestCase):
         placement = dict(
             authority,
             payload_persistence_owner="PLACEMENT_ROUTED",
+            # One additional overwrite was materialized and persisted before
+            # V, so it never belongs to the deferred dependency domain.
+            direct_write_commit_items=3,
             host_persist_receipts_accepted=1,
             authority_coherent_acquire_ranges=1,
             authority_payload_persist_ranges=1,
+            authority_payload_dependencies_completed=1,
+            writer_payload_dependencies_completed=1,
         )
         placement_evidence = self.runner.lifecycle_payload_persistence_evidence(
             placement, 0
         )
         self.assertTrue(placement_evidence["placement_routed_complete"])
-        self.assertFalse(placement_evidence["writer_host_receipt_complete"])
+        self.assertTrue(placement_evidence["writer_host_receipt_complete"])
         self.assertEqual(placement_evidence["authority_dependency_items"], 1)
 
         undercovered_authority = dict(
@@ -2010,7 +2364,7 @@ class Io500RuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rank/endpoint mismatch"):
             self.runner.validate_posix_summaries(records)
 
-    def test_writer_receipt_gate_requires_completed_cxl_persistence_handoff(self):
+    def test_writer_receipt_gate_requires_receipt_and_endpoint_handoff(self):
         records = []
         for rank in range(2):
             evidence = cxl_serving_evidence(rank)[0]
@@ -2031,7 +2385,11 @@ class Io500RuntimeTest(unittest.TestCase):
                 "endpoint": rank,
                 "intercept_enabled": True,
                 "cxl_serving_evidence": [evidence],
-                "stats": {"open_ops": 1, "write_ops": 1},
+                "stats": {
+                    "open_ops": 1,
+                    "write_ops": 1,
+                    "writer_host_receipt_items_submitted": 1,
+                },
                 "syscall_classification": {
                     "totals": {
                         "handled": 1,
@@ -2050,8 +2408,16 @@ class Io500RuntimeTest(unittest.TestCase):
         )
 
         missing = json.loads(json.dumps(records))
-        evidence = missing[1]["cxl_serving_evidence"][0]
-        evidence.update({
+        missing[1]["stats"]["writer_host_receipt_items_submitted"] = 0
+        with self.assertRaisesRegex(ValueError, r"active ranks \[1\]"):
+            self.runner.validate_posix_summaries(
+                missing,
+                client_count=2,
+                expected_payload_persistence_owner="WRITER_RECEIPT",
+            )
+
+        missing_handoff = json.loads(json.dumps(records))
+        missing_handoff[0]["cxl_serving_evidence"][0].update({
             "persistence_handoff": {
                 "request_generation": 0,
                 "release_generation": 0,
@@ -2062,20 +2428,9 @@ class Io500RuntimeTest(unittest.TestCase):
             "persistence_handoff_releases": 0,
             "persistence_handoff_wait_ns": 0,
         })
-        with self.assertRaisesRegex(ValueError, r"active ranks \[1\]"):
+        with self.assertRaisesRegex(ValueError, r"active ranks \[0\]"):
             self.runner.validate_posix_summaries(
-                missing,
-                client_count=2,
-                expected_payload_persistence_owner="WRITER_RECEIPT",
-            )
-
-        unbalanced = json.loads(json.dumps(records))
-        unbalanced[0]["cxl_serving_evidence"][0][
-            "persistence_handoff_releases"
-        ] = 0
-        with self.assertRaisesRegex(ValueError, "generations are not balanced"):
-            self.runner.validate_posix_summaries(
-                unbalanced,
+                missing_handoff,
                 client_count=2,
                 expected_payload_persistence_owner="WRITER_RECEIPT",
             )
@@ -2394,6 +2749,15 @@ class Io500RuntimeTest(unittest.TestCase):
                 "cxl_serving_evidence": cxl_serving_evidence(rank, 2),
             })
 
+        mutation = records[3]["cxl_serving_evidence"][0]
+        mutation["direct_create_attempts"] = 1
+        mutation["direct_create_fallbacks"] = 1
+        mutation["direct_create_fallback_unproven_namespace"] = 1
+        self.runner.validate_posix_summaries(records)
+        mutation["direct_create_fallback_unproven_namespace"] = 0
+        with self.assertRaisesRegex(ValueError, "fallback-reason accounting"):
+            self.runner.validate_posix_summaries(records)
+        records[3]["cxl_serving_evidence"] = cxl_serving_evidence(3, 2)
         records[3]["cxl_serving_evidence"][0]["shared_sequences"]["sq_consumed"] = 1
         with self.assertRaisesRegex(ValueError, "shared CXL SQ/CQ"):
             self.runner.validate_posix_summaries(records)
@@ -2552,6 +2916,8 @@ hash = DCBA4321
                     "writer_host_local_persist_bytes": 40960,
                     "writer_host_receipt_batches_submitted": 1,
                     "writer_host_receipt_items_submitted": 10,
+                    "writer_host_max_pending_jobs": 10,
+                    "writer_host_max_pending_bytes": 40960,
                     "writer_host_authority_apply_wait_polls": 7,
                     "writer_host_authority_apply_wait_ns": 41,
                 }
@@ -2584,6 +2950,8 @@ hash = DCBA4321
                     "writer_host_local_persist_bytes": 24576,
                     "writer_host_receipt_batches_submitted": 1,
                     "writer_host_receipt_items_submitted": 6,
+                    "writer_host_max_pending_jobs": 6,
+                    "writer_host_max_pending_bytes": 24576,
                     "writer_host_authority_apply_wait_polls": 5,
                     "writer_host_authority_apply_wait_ns": 29,
                 }
@@ -2658,6 +3026,8 @@ hash = DCBA4321
         self.assertEqual(writer_host["writer_host_local_persist_bytes"], 65536)
         self.assertEqual(writer_host["writer_host_receipt_batches_submitted"], 2)
         self.assertEqual(writer_host["writer_host_receipt_items_submitted"], 16)
+        self.assertEqual(writer_host["writer_host_max_pending_jobs"], 10)
+        self.assertEqual(writer_host["writer_host_max_pending_bytes"], 40960)
         self.assertEqual(writer_host["writer_host_authority_apply_wait_polls"], 12)
         self.assertEqual(writer_host["writer_host_authority_apply_wait_ns"], 70)
         self.assertIn("nested", timing["interpretation"])
