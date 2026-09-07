@@ -640,6 +640,14 @@ class OwnedProcess:
         self.owner_token = owner_token
         self.start_ns = start_ns
         self.end_ns = None
+        self.pid_start_ticks = self._pid_start_ticks()
+
+    def _pid_start_ticks(self):
+        try:
+            fields = pathlib.Path(f"/proc/{self.process.pid}/stat").read_text().rsplit(")", 1)[1].split()
+            return int(fields[19])
+        except (OSError, ValueError, IndexError):
+            return None
 
     def record_exit(self):
         if self.end_ns is None and self.process.poll() is not None:
@@ -657,8 +665,15 @@ class OwnedProcess:
         if not fields:
             return False
         expected = pathlib.Path(self.command[0]).name
-        return pathlib.Path(fields[0]).name == expected and any(
-            self.run_dir in field for field in fields
+        # Commands can name a runtime through symlinks while run_dir is
+        # canonical. Ownership is the child we launched, its birth identity
+        # and exact arguments; a path substring is neither identity nor proof
+        # that a nonmatching process has exited.
+        return (
+            self.pid_start_ticks is not None
+            and self._pid_start_ticks() == self.pid_start_ticks
+            and pathlib.Path(fields[0]).name == expected
+            and fields[1:] == self.command[1:]
         )
 
     def terminate_owned(self):
@@ -679,6 +694,7 @@ class OwnedProcess:
             "pid": self.process.pid,
             "command": self.command,
             "start_monotonic_ns": self.start_ns,
+            "pid_start_ticks": self.pid_start_ticks,
             "end_monotonic_ns": self.end_ns,
             "owner_token": self.owner_token,
             "returncode": self.process.poll(),

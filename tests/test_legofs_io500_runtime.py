@@ -270,23 +270,31 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertNotIn("request_flush", denial)
         self.assertNotIn("changed.await", denial)
         self.assertNotIn("async fn reserve_receipt_batch(", source)
-        self.assertEqual(source.count(".reserve_writer_host_receipt_batch("), 2)
+        self.assertEqual(source.count(".reserve_writer_host_receipt_batch("), 3)
         diagnostic = source.split("fn writer_persist_diagnostic(", 1)[1].split("#[inline]", 1)[0]
         self.assertIn('format!("{args}\\n")', diagnostic)
         self.assertIn("write_all(line.as_bytes())", diagnostic)
 
     def test_direct_mutation_apply_credit_gates_all_prepare_kinds(self):
         common = (ROOT / "components/legofs/badfs-common/src/serving_transport/direct_mutation.rs").read_text()
-        self.assertEqual(common.count("self.check_apply_credit(visible)?;"), 4)
+        self.assertEqual(common.count("self.check_apply_credit(visible)?;"), 5)
         client = (ROOT / "components/legofs/badfs-client/src/cxl_serving.rs").read_text()
-        for kind in ("create", "unlink", "empty-close", "small-close"):
-            self.assertIn(f'with_apply_credit_retry("{kind}",', client)
+        for kind in ("create", "unlink", "write-delta", "empty-close", "small-close"):
+            self.assertIn(f'with_apply_credit_progress(\n            "{kind}",', client)
+        self.assertNotIn("with_apply_credit_retry", client)
+        progress = client.split("fn with_apply_credit_progress<T>(", 1)[1].split(
+            "struct DirectMutationAllocationState", 1
+        )[0]
+        self.assertIn("wait_for_progress(lane_id, visible, applied)?", progress)
+        self.assertNotIn("sleep", progress)
+        self.assertNotIn("retry_limit", progress)
         create = client.split("    fn direct_create_with_origin(", 1)[1].split("    fn try_direct_create_with_origin(", 1)
         self.assertIn("self.direct_create_attempts.fetch_add", create[0])
         self.assertNotIn("self.direct_create_attempts.fetch_add", create[1])
         unlink = client.split("    fn try_direct_unlink(", 1)[1]
         self.assertNotIn("self.direct_unlink_attempts.fetch_add", unlink)
-        self.assertIn("BADFS_DIRECT_MUTATION_APPLY_BACKPRESSURE", client)
+        self.assertIn("BADFS_DIRECT_MUTATION_APPLY_PROGRESS", client)
+        self.assertIn("BADFS_DIRECT_MUTATION_APPLY_RESUME_COMPLETE", client)
 
     def test_writer_checkpoint_uses_os_clock_without_firmware_access_assumptions(self):
         # An RHCT/DT timebase describes frequency, not permission to execute
@@ -1395,6 +1403,25 @@ class Io500RuntimeTest(unittest.TestCase):
             stopped,
             ["server0", "client0", "client1", "cxlmemsim", "unrelated"],
         )
+
+    def test_unverified_live_child_is_not_reported_as_cleaned_up(self):
+        command = [os.sys.executable, "-c", "import time; time.sleep(60)", str(self.paths.run)]
+        process = subprocess.Popen(command)
+        try:
+            owned = self.runner.OwnedProcess(process, command, self.paths.run, "test", 0)
+            owned.pid_start_ticks += 1
+            status = self.runner.process_cleanup_status([owned])
+            self.assertEqual(status["owned_processes_remaining"], [process.pid])
+            self.assertEqual(status["unverified_live_processes"], [process.pid])
+            owned.terminate_owned()
+            self.assertIsNone(process.poll())
+            process.kill()
+            process.wait()
+            self.assertEqual(self.runner.process_cleanup_status([owned])["owned_processes_remaining"], [])
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
 
     def test_post_run_exporter_summary_accepts_supported_client_counts(self):
         for client_count in (2, 4, 6, 10):

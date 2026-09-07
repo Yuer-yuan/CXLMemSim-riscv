@@ -14,6 +14,9 @@ RUN_ID=
 BUILD_FIRST=false
 PREFLIGHT_ONLY=false
 PRINT_COMMAND=false
+CQ_WAIT_MODE=timer_sleep
+AUTHORITY_WAIT_MODE=timer_sleep
+SERVER_CPUS=
 
 usage()
 {
@@ -26,6 +29,9 @@ Required:
   --run-id ID
 
 Optional:
+  --cq-wait-mode timer_sleep|cooperative_yield (default: timer_sleep)
+  --authority-wait-mode timer_sleep|cooperative_yield (default: timer_sleep)
+  --server-cpus LIST  Bind server threads to CPUs in the reviewed server LLC.
   --build            Build and validate native artifacts first.
   --preflight-only   Validate the host and command without creating a run.
   --print-command    Print the quoted component-runner command and exit.
@@ -57,6 +63,18 @@ while (($#)); do
 	--run-id)
 		(($# >= 2)) || die "--run-id requires a value"
 		RUN_ID="$2"
+		shift 2
+		;;
+	--cq-wait-mode|--authority-wait-mode)
+		(($# >= 2)) || die "$1 requires a value"
+		case "$2" in timer_sleep|cooperative_yield) ;; *) die "invalid wait mode: $2" ;; esac
+		if [ "$1" = --cq-wait-mode ]; then CQ_WAIT_MODE="$2"; else AUTHORITY_WAIT_MODE="$2"; fi
+		shift 2
+		;;
+	--server-cpus)
+		(($# >= 2)) || die "--server-cpus requires a value"
+		[[ "$2" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "invalid --server-cpus: $2"
+		SERVER_CPUS="$2"
 		shift 2
 		;;
 	--build)
@@ -173,7 +191,8 @@ command=(
 	--wrong-node 0
 	--serving-transport cxl
 	--serving-cursor-mode owned
-	--serving-cq-wait-mode timer_sleep
+	--serving-cq-wait-mode "$CQ_WAIT_MODE"
+	--serving-authority-wait-mode "$AUTHORITY_WAIT_MODE"
 	--serving-max-clients 64
 	--region-size-gib 64
 	--server-cpu "$SERVER_CPU"
@@ -181,8 +200,12 @@ command=(
 	--rank-launcher "$LEGOFS_ROOT/scripts/giga_native_rank.py"
 )
 
+if [ -n "$SERVER_CPUS" ]; then
+	command+=(--server-cpus "$SERVER_CPUS")
+fi
+
 if [ "$PRINT_COMMAND" = true ]; then
-	printf '%s ' "${command[@]}"
+	printf '%q ' "${command[@]}"
 	printf '\n'
 	exit 0
 fi

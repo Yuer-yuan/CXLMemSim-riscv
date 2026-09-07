@@ -1,4 +1,5 @@
 import pathlib
+import shlex
 import subprocess
 import unittest
 
@@ -63,7 +64,34 @@ class GigaNativeIo500ScriptsTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        return completed.stdout
+        return " ".join(shlex.split(completed.stdout))
+
+    def test_wait_policies_are_independent_and_invalid_values_fail(self):
+        command = [str(RUN), "--print-command", "--topology", "1c1s",
+                   "--profile", "bounded", "--run-id", "wait-policy"]
+        completed = subprocess.run(command + ["--authority-wait-mode", "cooperative_yield"],
+                                   text=True, capture_output=True, check=True)
+        self.assertIn("--serving-authority-wait-mode cooperative_yield", completed.stdout)
+        self.assertIn("--serving-cq-wait-mode timer_sleep", completed.stdout)
+        self.assertNotEqual(subprocess.run(command + ["--cq-wait-mode", "invalid"],
+                                          capture_output=True).returncode, 0)
+
+    def test_server_cpu_set_is_forwarded_for_same_llc_diagnostics(self):
+        command = [str(RUN), "--print-command", "--topology", "3c1s",
+                   "--profile", "capacity-5s", "--run-id", "server-cpu-set"]
+        completed = subprocess.run(
+            command + ["--server-cpus", "18,19,20,21,22,23"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        rendered = " ".join(shlex.split(completed.stdout))
+        self.assertIn("--server-cpu 19", rendered)
+        self.assertIn("--server-cpus 18,19,20,21,22,23", rendered)
+        self.assertNotEqual(
+            subprocess.run(command + ["--server-cpus", "18-23"], capture_output=True).returncode,
+            0,
+        )
 
     def test_run_command_maps_each_topology_to_distinct_llcs(self):
         one = self.render("1c1s")

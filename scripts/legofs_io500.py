@@ -4090,6 +4090,7 @@ def parse_server_inspection(
             "state_log_write_ns",
             "state_log_fsync_ns",
             "deferred_state_capture_lock_wait_ns",
+            "deferred_state_delta_capture_ns",
             "deferred_state_clone_ns",
             "deferred_state_dependency_close_ns",
             "deferred_state_receipt_wait_ns",
@@ -5138,6 +5139,15 @@ def stop_process(item: OwnedProcess) -> None:
         pass
 
 
+def process_cleanup_status(all_owned: list[OwnedProcess]) -> dict:
+    # A failed identity check forbids signalling; it does not prove absence.
+    live = [item for item in all_owned if item.process.poll() is None]
+    return {
+        "owned_processes_remaining": [item.process.pid for item in live],
+        "unverified_live_processes": [item.process.pid for item in live if not item.matches_live_pid()],
+    }
+
+
 def finish_guest_processes(consoles: list[Console], grace_seconds: float = 5) -> None:
     """Give every guest the same shutdown grace period, then stop its owned PID."""
     def finish_one(console: Console) -> None:
@@ -5868,9 +5878,14 @@ def execute(
         result["processes"] = {
             f"process{index}": item.as_json() for index, item in enumerate(all_owned)
         }
-        remaining = [item.process.pid for item in all_owned if item.matches_live_pid()]
-        result["cleanup"] = {"owned_processes_remaining": remaining}
+        result["cleanup"] = process_cleanup_status(all_owned)
+        cleanup_failed = bool(result["cleanup"]["owned_processes_remaining"])
+        if cleanup_failed:
+            result["status"] = "failed"
+            result["first_failure"] = result["first_failure"] or "owned process cleanup incomplete"
         atomic_json(paths.result, result)
+        if cleanup_failed:
+            raise RuntimeError(result["first_failure"])
 
 
 def parse_args(argv=None):

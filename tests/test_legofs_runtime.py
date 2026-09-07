@@ -1,7 +1,10 @@
 import importlib.util
 import os
 import pathlib
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -26,6 +29,32 @@ class LegofsRuntimeTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_owned_process_terminates_with_a_symlinked_run_path(self):
+        root = pathlib.Path(self.temporary.name)
+        real = root / "real-runtime"
+        real.mkdir()
+        alias = root / "runtime-alias"
+        alias.symlink_to(real, target_is_directory=True)
+        command = [sys.executable, "-c", "import time; time.sleep(60)",
+                   str(alias / "guest-state.ext2")]
+        process = subprocess.Popen(command)
+        try:
+            owned = self.runner.OwnedProcess(process, command, alias, "test", time.monotonic_ns())
+            self.assertTrue(owned.matches_live_pid())
+            birth = owned.pid_start_ticks
+            owned.pid_start_ticks += 1
+            self.assertFalse(owned.matches_live_pid())
+            owned.terminate_owned()
+            self.assertIsNone(process.poll())
+            owned.pid_start_ticks = birth
+            owned.terminate_owned()
+            self.assertIsNotNone(process.poll())
+            self.assertIsNotNone(owned.as_json()["end_monotonic_ns"])
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
 
     def test_commands_are_exact_sifive_u_persistent_type3_nodes(self):
         commands = [
