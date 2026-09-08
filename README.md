@@ -12,10 +12,10 @@ a reverse `LegoFS -> platform -> LegoFS` dependency.
 
 ## Clone, build, and run
 
-On a native Linux host:
+On a native Linux host, set `REPOSITORY_URL` to this repository’s clone URL:
 
 ```bash
-git clone https://github.com/Yuer-yuan/CXLMemSim-riscv.git
+git clone "$REPOSITORY_URL" CXLMemSim-riscv
 cd CXLMemSim-riscv
 ./run.sh
 ```

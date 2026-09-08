@@ -12,9 +12,9 @@
 
 ## Working directory and file structure
 
-Execute this plan from `/root/cxl-u-boot`. Create the new independent Git
-repository at `/root/cxl-u-boot/CXLMemSim-riscv`; do not initialize or reuse
-the non-repository sentinel at `/root/cxl-u-boot/.git`.
+Execute this plan from `${WORKSPACE_ROOT}`. Create the new independent Git
+repository at `${WORKSPACE_ROOT}/CXLMemSim-riscv`; do not initialize or reuse
+the non-repository sentinel at `${WORKSPACE_ROOT}/.git`.
 
 Created superproject files and responsibilities:
 

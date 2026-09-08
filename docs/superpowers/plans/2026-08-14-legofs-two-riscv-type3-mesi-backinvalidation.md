@@ -18,10 +18,10 @@
 Execute every superproject command from:
 
 ```bash
-cd /root/cxl-u-boot/CXLMemSim-riscv
+cd ${WORKSPACE_ROOT}/CXLMemSim-riscv
 ```
 
-Do not use `/root/cxl-u-boot` as a Git repository. It is only the parent
+Do not use `${WORKSPACE_ROOT}` as a Git repository. It is only the parent
 directory. Preserve the existing `main` work and create an isolated worktree
 before implementation:
 
@@ -96,7 +96,7 @@ Generated output stays below `out/legofs-type3/` and remains ignored.
 Run:
 
 ```bash
-cd /root/cxl-u-boot/CXLMemSim-riscv-legofs
+cd ${WORKSPACE_ROOT}/CXLMemSim-riscv-legofs
 git -C components/qemu switch -c codex/sifive-u-type3-mesi-v2 \
   81cd7ad9a5e14470427c8ebafeccff4f52e555b4
 git -C components/cxlmemsim fetch origin \

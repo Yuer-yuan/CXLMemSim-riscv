@@ -2,3 +2,8 @@
 __pycache__/
 *.py[cod]
 .agents/skills/
+
+# Local experiment artifacts and machine-specific configuration.
+/target/
+/.codex/
+/scripts/sync_legofs_to_*_server.sh

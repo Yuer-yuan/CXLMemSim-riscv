@@ -3,7 +3,7 @@
 #
 # Local mode copies this script and its C payload into a unique directory under
 # giga:/tmp, executes remote mode, and removes the directory afterward.  The
-# author-owned /root/Splash/rlcxl tree is read-only: its arena implementation is
+# explicitly selected RLCXL_REMOTE_ROOT tree is read-only: its arena implementation is
 # compiled into the temporary probe but is never modified.
 #
 # Optional overrides:
@@ -25,7 +25,7 @@ ITERATIONS="${ITERATIONS:-100000}"
 SEQCLOCK_UPDATES="${SEQCLOCK_UPDATES:-1000000}"
 PAYLOAD_MIB="${PAYLOAD_MIB:-30}"
 HOLD_MS="${HOLD_MS:-4000}"
-RLCXL_REMOTE_ROOT="${RLCXL_REMOTE_ROOT:-/root/Splash/rlcxl}"
+RLCXL_REMOTE_ROOT="${RLCXL_REMOTE_ROOT:?Set RLCXL_REMOTE_ROOT to the remote source directory}"
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8)
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-REMOTE="${LEGOFS_VLM_REMOTE:-vlm-server:/home/guokc/mypro/gnn-mount-sda1/CXLMemSim-riscv/}"
+REMOTE="${LEGOFS_REMOTE:?Set LEGOFS_REMOTE to the explicit rsync destination}"
 
 # Source is maintained locally, while cross-toolchains and build products are
 # machine-local artifacts whose generated wrappers contain absolute prefixes.

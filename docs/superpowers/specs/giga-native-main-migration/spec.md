@@ -14,7 +14,7 @@ are reviewed/adapted, not accepted as the product design.
 Add native build/run scripts and their tests to parent main. Product changes and
 tests belong in its selected LegoFS submodule, as requested by the user.
 
-Deploy to the user-selected `giga:/root/cxlmemsim-riscv-io500` mirror (no .git).
+Deploy to the user-selected `${REMOTE_DEPLOYMENT}` mirror (no .git).
 Resolve hardware again: x86_64, CPU-less NUMA1, one 64 GiB sparse MAP_SHARED
 regular file on /dev/shm. CPUs for client/server are 1/7, 1,7/13, 1,7,13/19;
 verify distinct actual LLC IDs. Preserve remote old bundles before deployment.

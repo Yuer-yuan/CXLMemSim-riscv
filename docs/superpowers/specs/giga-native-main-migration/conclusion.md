@@ -11,7 +11,7 @@ was increased or relaxed to obtain these results.
 - Parent baseline: `c828826f47a6a579bc1f1a0f8c2a2c7080461263`.
 - LegoFS baseline: `0df6fddfc032f241e509ca0bf819a01adb97e211`.
 - LegoFS result commit: `16ea95dc567a03e02f1d2ae711d73674bbba0bd8`; parent scripts/spec are committed with this document.
-- Deployment: `giga:/root/cxlmemsim-riscv-io500`, an rsync mirror without `.git`.
+- Deployment: `${REMOTE_DEPLOYMENT}`, an rsync mirror without `.git`.
 - Shared tested build key: `84af7b8d87ce47aae6c50fd13fa5d507b57aee78bb56832b0166798159cd402d`.
 - Shared source manifest SHA256: `5ec404c4e5596a4c2bb44d0a6b8875efd55a095cd2858695a13bd0cb7310da8f`.
 - IO500/IOR/pfind: `a69cf60cf76538a34c1332bc448838cf9a560a9b`,
@@ -26,7 +26,7 @@ bytes to the resulting commits; historical manifests are not rewritten.
 
 ## Model and matrix
 
-Native x86_64 on `victoryang00-threadripper`: one server, one 64 GiB sparse
+Native x86_64 on the selected test host: one server, one 64 GiB sparse
 `MAP_SHARED` regular file on tmpfs, with every resident control, metadata and
 payload page verified on CPU-less NUMA1. Current layout-v7 uses 2048 packed
 2 MiB segments, batched close, coherent-seal-no-writeback and writer receipts

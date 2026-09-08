@@ -61,7 +61,7 @@ submodule is checked out at an exact commit:
 
 The CXLMemSim submodule pins the clean remote `main` commit. It must not
 capture or publish the unrelated dirty state in the existing local
-`/home/victoryang00/CXLMemSim` checkout.
+`${CXLMEMSIM_ROOT}` checkout.
 
 Submodule updates are intentional reviewable changes to the superproject.
 The automation never follows moving branch heads during a normal build.
