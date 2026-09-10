@@ -77,8 +77,8 @@ int main(int argc, char **argv)
     }
     if (!((argc == 2) || partial) ||
         (strcmp(argv[1], "scc") != 0 && strcmp(argv[1], "standard") != 0 &&
-         strcmp(argv[1], "stress-tiny") != 0)) {
-        fprintf(stderr, "usage: %s scc|standard|stress-tiny [--allow-partial]\n", argv[0]);
+         strcmp(argv[1], "stress-tiny") != 0 && strcmp(argv[1], "full22") != 0 && strcmp(argv[1], "pressure22") != 0)) {
+        fprintf(stderr, "usage: %s scc|standard|stress-tiny|full22|pressure22 [--allow-partial]\n", argv[0]);
         return 64;
     }
     if (snprintf(source_directory, sizeof(source_directory),

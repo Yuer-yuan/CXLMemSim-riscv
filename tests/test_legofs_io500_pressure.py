@@ -13,6 +13,62 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class PressureSmokeTests(unittest.TestCase):
+    def test_pressure22_preserves_all_stages_with_low_byte_geometry(self):
+        config = self.config("pressure22")
+        self.assertEqual(RUNNER.PRESSURE_SMOKE_PHASES["pressure22"], RUNNER.FULL_IO500_PHASES)
+        self.assertEqual(RUNNER.PRESSURE_SMOKE_RANKS["pressure22"], 10)
+        for phase in RUNNER.FULL_IO500_PHASES:
+            self.assertTrue(config.getboolean(phase, "run"), phase)
+        self.assertEqual(config["debug"]["stonewall-time"], "1")
+        self.assertEqual(config["ior-easy"]["transferSize"], "4k")
+        self.assertEqual(config["ior-easy"]["blockSize"], "260k")
+        self.assertTrue(config.getboolean("ior-easy-write", "legofs-fixed-work"))
+        # Pinned IOR rejects random blockSize <= the phase's transfer size.
+        for phase, transfer in (("ior-rnd4K", 4096), ("ior-rnd1MB", 1048576)):
+            block = config.getint(phase, "blockSize")
+            self.assertGreater(block, transfer)
+            self.assertEqual(block % transfer, 0)
+        self.assertTrue(config.getboolean("mdtest-easy-write", "legofs-fixed-work"))
+        self.assertEqual(config["mdtest-easy"]["n"], "102")
+        self.assertEqual(config["mdtest-hard"]["files-per-dir"], "102")
+        phases = [{"name": name, "seconds": 1.0} for name in RUNNER.FULL_IO500_PHASES]
+        for omitted in range(len(phases)):
+            with self.assertRaises(ValueError):
+                RUNNER.validate_pressure_phase_metrics("pressure22", {"phases": phases[:omitted] + phases[omitted+1:]})
+
+    def test_pressure22_random_shared_file_assigns_work_to_every_rank(self):
+        # Pinned IO500 rnd1MB uses --random-offset-seed=11 and 1MiB
+        # transfers. IOR distributes each offset using rand() % numTasks.
+        # The payload uses musl's 64-bit LCG, not glibc's rand stream.
+        def counts(block):
+            state = 11 - 1
+            ranks = [0] * 10
+            for _ in range(block // 1048576 * 10):
+                state = (6364136223846793005 * state + 1) & ((1 << 64) - 1)
+                ranks[(state >> 33) % 10] += 1
+            return ranks
+
+        self.assertEqual(counts(2097152)[9], 0)  # Reproduces the hung profile.
+        self.assertEqual(counts(3145728)[9], 0)
+        block = self.config("pressure22").getint("ior-rnd1MB", "blockSize")
+        self.assertGreater(min(counts(block)), 0)
+
+    def test_pressure22_requires_actual_full_job_cohorts_on_every_rank(self):
+        rows = self.summaries(10)
+        log = "\n".join(
+            f"LEGOFS_WRITER_FLUSH_TIMING owner={100 + rank} jobs={jobs} bytes={jobs * 3901} total_ns=1 success=true"
+            for rank in range(10) for jobs in (64, 1)
+        )
+        report = self.coverage("pressure22", rows, log, self.apply_log())
+        self.assertTrue(report["passed"], report)
+        self.assertFalse(report["byte_budget_exhaustion_required"])
+        for broken in (log.replace("owner=109", "owner=999"),
+                       log.replace("jobs=64", "jobs=63"),
+                       log.replace("jobs=1 ", "jobs=64 "),
+                       log.replace("success=true", "success=false")):
+            self.assertFalse(self.coverage("pressure22", rows, broken, self.apply_log())["passed"])
+        self.assertFalse(self.coverage("pressure22", rows, log, self.apply_log(), exporter=False)["passed"])
+
     def config(self, stage):
         parser = configparser.ConfigParser()
         self.assertTrue(parser.read(ROOT / "configs" / f"io500-{stage}.ini"))
@@ -45,7 +101,7 @@ class PressureSmokeTests(unittest.TestCase):
         self.assertEqual(self.config("standard")["debug"]["stonewall-time"], "300")
 
     def test_profiles_are_diagnostic_and_plumbed_through_payload(self):
-        for stage in ("stress-tiny", "rollover-smoke"):
+        for stage in ("stress-tiny", "rollover-smoke", "pressure22"):
             self.assertIn(stage, RUNNER.SEMANTIC_SMOKE_STAGES)
             self.assertIn(stage, RUNNER.PACKED_SMALL_WORKLOAD_STAGES)
             self.assertEqual(RUNNER.parse_args(["--stage", stage]).stage, stage)
@@ -59,7 +115,7 @@ class PressureSmokeTests(unittest.TestCase):
         self.assertIn("rollover-smoke", early_exec)
 
     def test_topology_and_provider_cannot_silently_reduce_coverage(self):
-        for stage, ranks in (("stress-tiny", 10), ("rollover-smoke", 2)):
+        for stage, ranks in (("stress-tiny", 10), ("rollover-smoke", 2), ("pressure22", 10)):
             args = RUNNER.parse_args(["--stage", stage, "--client-count", str(ranks), "--serving-transport", "cxl", "--durability-profile", "coherent-seal-no-writeback", "--payload-persistence-owner", "writer-receipt", "--writer-persist-provider", "riscv-zicbom-dax"])
             RUNNER.validate_pressure_smoke_options(args)
             args.client_count = 1
@@ -114,7 +170,7 @@ class PressureSmokeTests(unittest.TestCase):
         self.assertFalse(self.coverage("rollover-smoke", rows, server_output=self.apply_log() + rollover)["passed"])
 
     def test_each_pressure_stage_uses_600_second_phase_gate_before_mpi_success(self):
-        for stage in ("stress-tiny", "rollover-smoke"):
+        for stage in ("stress-tiny", "rollover-smoke", "pressure22"):
             console = mock.Mock()
             console.output = f"[RESULT] mdtest-hard-write 1.0 kIOPS : time 601.0 seconds\nLEGOFS_IO500_MPI_EXIT stage={stage} rc=0\n"
             console.condition = threading.Condition()
@@ -122,8 +178,9 @@ class PressureSmokeTests(unittest.TestCase):
                 RUNNER.wait_mpi_exit(console, stage, timeout=9000, start=0)
 
     def test_final_metrics_independently_require_enabled_phases(self):
-        for stage in ("stress-tiny", "rollover-smoke"):
+        for stage in ("stress-tiny", "rollover-smoke", "pressure22"):
             names = RUNNER.STANDARD_IO500_PHASES - {"ior-rnd4K-easy-read"} if stage == "stress-tiny" else {"mdtest-hard-write", "mdtest-hard-stat", "mdtest-hard-read", "mdtest-hard-delete", "find"}
+            names = RUNNER.PRESSURE_SMOKE_PHASES[stage]
             phases = [{"name": name, "seconds": 1.0} for name in names]
             RUNNER.validate_pressure_phase_metrics(stage, {"phases": phases})
             with self.assertRaises(ValueError):

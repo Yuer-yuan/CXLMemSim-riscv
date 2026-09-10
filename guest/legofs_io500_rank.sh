@@ -13,7 +13,7 @@ cmdline_value()
 }
 
 stage="${1:?missing IO500 stage}"
-case "$stage" in tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard) ;; *) exit 64 ;; esac
+case "$stage" in tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard|full22|pressure22) ;; *) exit 64 ;; esac
 
 endpoint_id="$(cat /run/endpoint-id)"
 mkdir -p /tmp/posix
@@ -132,8 +132,14 @@ tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k
 	;;
 esac
 
+# IO500 defaults to standard mode even when extended phase sections say run.
+# Select the workload mode explicitly for the complete 22-phase diagnostic.
+set --
+if { [ "$stage" = full22 ] || [ "$stage" = pressure22 ]; }; then
+    set -- --mode=extended
+fi
 set +e
-/payload/bin/io500 "/payload/etc/io500-$stage.ini"
+/payload/bin/io500 "/payload/etc/io500-$stage.ini" "$@"
 io500_rc=$?
 set -e
 if [ "$io500_rc" -ne 0 ]; then

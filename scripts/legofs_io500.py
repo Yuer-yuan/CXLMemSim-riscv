@@ -34,6 +34,11 @@ STANDARD_IO500_PHASES = frozenset({
     "ior-hard-read", "mdtest-hard-stat", "mdtest-easy-delete",
     "mdtest-hard-read", "mdtest-hard-delete", "ior-rnd4K-easy-read",
 })
+FULL_IO500_PHASES = STANDARD_IO500_PHASES | frozenset({
+    "ior-rnd4K-write", "ior-rnd1MB-write", "mdworkbench-create", "find-easy",
+    "ior-rnd4K-read", "ior-rnd1MB-read", "find-hard", "mdworkbench-bench",
+    "mdworkbench-delete",
+})
 DEFAULT_COHERENCE_CACHE_MIB = 32
 DEFAULT_SSD_CACHE_MIB = 512
 DEFAULT_OBSERVATION_SAMPLE_SHIFT = 4
@@ -104,6 +109,7 @@ MPI_FATAL_MARKERS = (
     "BADFS_DIRECT_MUTATION_WORKER_FAILED",
     "BADFS_DIRECT_MUTATION_APPLY_FAILED",
     "BADFS_DIRECT_MUTATION_MARK_FAILED",
+    "BADFS_DIRECT_WRITE_RING_PROOF_SCAN_FAILED",
     "LEGOFS_WRITER_PERSIST_FAILURE",
     "LEGOFS_IO500_FATAL",
     "application called MPI_Abort(",
@@ -144,6 +150,8 @@ GUEST_PROCESS_FAULT_MARKERS = (
 SEMANTIC_SMOKE_STAGES = (
     "tiny",
     "stress-tiny",
+    "full22",
+    "pressure22",
     "rollover-smoke",
     "easy-smoke",
     "hard-smoke",
@@ -158,6 +166,8 @@ SEMANTIC_SMOKE_STAGES = (
 PACKED_SMALL_WORKLOAD_STAGES = (
     "tiny",
     "stress-tiny",
+    "full22",
+    "pressure22",
     "rollover-smoke",
     "metadata-smoke",
     "small-close-smoke",
@@ -1896,13 +1906,13 @@ class IO500PhaseWatchdog:
         # MPI merges stderr with stdout between IO500's separate label/body
         # writes. Match the complete known-phase/rate/time body even when a
         # diagnostic detached [RESULT]. A diagnostic tag alone is not progress.
-        r"\b(" + "|".join(re.escape(name) for name in sorted(STANDARD_IO500_PHASES))
+        r"\b(" + "|".join(re.escape(name) for name in sorted(FULL_IO500_PHASES))
         + r")\s+\S+\s+(?:GiB/s|kIOPS)\s*:\s*time\s+([0-9.]+)\s+seconds"
     )
 
     def __init__(self, required_phases=STANDARD_IO500_PHASES):
         self.required_phases = frozenset(required_phases)
-        if not self.required_phases or not self.required_phases <= STANDARD_IO500_PHASES:
+        if not self.required_phases or not self.required_phases <= FULL_IO500_PHASES:
             raise ValueError("phase watchdog requires known nonempty IO500 phases")
         self.offset = 0
         self.partial = ""
@@ -1944,8 +1954,9 @@ class IO500PhaseWatchdog:
             )
 
 
-PRESSURE_SMOKE_RANKS = {"stress-tiny": 10, "rollover-smoke": 2}
+PRESSURE_SMOKE_RANKS = {"pressure22": 10, "stress-tiny": 10, "rollover-smoke": 2}
 PRESSURE_SMOKE_PHASES = {
+    "pressure22": FULL_IO500_PHASES,
     "stress-tiny": STANDARD_IO500_PHASES - {"ior-rnd4K-easy-read"},
     "rollover-smoke": frozenset({"mdtest-hard-write", "mdtest-hard-stat",
                                 "mdtest-hard-read", "mdtest-hard-delete", "find"}),
@@ -1982,13 +1993,17 @@ def pressure_smoke_coverage(stage, summaries, client_output, server_outputs,
     missing = []
     if sorted(record.get("mpi_rank", -1) for record in summaries) != list(range(ranks)):
         missing.append("exact unique MPI rank coverage")
-    full, tail = set(), set()
+    full, tail, full_jobs, tail_jobs = set(), set(), set(), set()
     flush_pattern = re.compile(
-        r"LEGOFS_WRITER_FLUSH_TIMING owner=(\d+) jobs=\d+ bytes=(\d+)"
+        r"LEGOFS_WRITER_FLUSH_TIMING owner=(\d+) jobs=(\d+) bytes=(\d+)"
         r"[^\r\n]* success=true\b"
     )
     for match in flush_pattern.finditer(client_output):
-        owner, size = map(int, match.groups())
+        owner, jobs, size = map(int, match.groups())
+        if jobs == 64 and size > 0:
+            full_jobs.add(owner)
+        elif 0 < jobs < 64 and size > 0:
+            tail_jobs.add(owner)
         if size == 4 * 1024**2:
             full.add(owner)
         elif 0 < size < 4 * 1024**2:
@@ -1998,7 +2013,16 @@ def pressure_smoke_coverage(stage, summaries, client_output, server_outputs,
         rank, owner = record.get("mpi_rank"), record.get("owner")
         stats = record.get("stats", {})
         observed = {"rank": rank, "owner": owner}
-        if stage == "stress-tiny":
+        if stage == "pressure22":
+            observed.update(full_job_cohort=owner in full_jobs,
+                            tail_job_cohort=owner in tail_jobs,
+                            max_pending_jobs=int(stats.get("writer_host_max_pending_jobs", 0)),
+                            small_writes=int(stats.get("write_size_le_4k_ops", 0)))
+            if (owner not in full_jobs or owner not in tail_jobs
+                    or observed["max_pending_jobs"] != 64
+                    or observed["small_writes"] < 102):
+                missing.append(f"rank {rank}: full 64-job cohort / tail / 64-job credit / 102 small writes")
+        elif stage == "stress-tiny":
             observed.update(write_bytes=int(stats.get("write_bytes", 0)),
                             full_cohort=owner in full, tail_cohort=owner in tail,
                             max_pending_jobs=int(stats.get("writer_host_max_pending_jobs", 0)),
@@ -2037,7 +2061,7 @@ def pressure_smoke_coverage(stage, summaries, client_output, server_outputs,
         missing.append("observed authority apply batch/in-flight bound <=32")
     if stage == "rollover-smoke" and (len(rollover_lanes) < ranks or max_tail != 0):
         missing.append("two distinct rollover lanes / zero foreground apply")
-    if stage == "stress-tiny" and not exporter_validated:
+    if stage in ("stress-tiny", "pressure22") and not exporter_validated:
         missing.append("validated LegoFS result-directory exporter")
     return {"stage": stage, "passed": not missing, "missing": missing,
             "per_rank": per_rank, "max_apply_records": max_records,
@@ -2045,6 +2069,7 @@ def pressure_smoke_coverage(stage, summaries, client_output, server_outputs,
             "rollover_lanes": sorted(rollover_lanes), "max_rollover_tail": max_tail,
             "backpressure_observed": "BADFS_DIRECT_MUTATION_APPLY_BACKPRESSURE" in client_output,
             "exporter_validated": exporter_validated,
+            "byte_budget_exhaustion_required": stage == "stress-tiny",
             "scope": "intentionally INVALID pressure coverage; not an official IO500 score"}
 
 
@@ -2067,8 +2092,8 @@ def wait_mpi_exit(
     )
     deadline = time.monotonic() + timeout
     phase_watchdog = (
-        IO500PhaseWatchdog(PRESSURE_SMOKE_PHASES.get(stage, STANDARD_IO500_PHASES))
-        if stage == "standard" or stage in PRESSURE_SMOKE_RANKS else None
+        IO500PhaseWatchdog(FULL_IO500_PHASES if stage == "full22" else PRESSURE_SMOKE_PHASES.get(stage, STANDARD_IO500_PHASES))
+        if stage in ("standard", "full22") or stage in PRESSURE_SMOKE_RANKS else None
     )
     if monitored_guests is None:
         monitored_guests = [("coordinator", console, start)]
@@ -4907,7 +4932,16 @@ def classify_io500_verifier(stage: str, rc: int, output: str) -> str:
         "[OK] But this is an invalid run!" in normalized
         and "ERROR:" not in normalized
     )
-    clean_ok = re.search(r"(?m)^\[OK\]$", normalized) is not None
+    clean_ok = (
+        re.search(r"(?m)^\[OK\]$", normalized) is not None
+        and "ERROR:" not in normalized
+    )
+    # The pinned verifier checks config/score hashes, not submission rules.
+    # Extended full22 can have clean hashes despite bounded geometry and
+    # setup-time INVALID warnings (main resets is_valid_phase before each
+    # phase). Keep the diagnostic scope independent of this raw hash verdict.
+    if stage in ("full22", "pressure22") and rc == 0 and clean_ok:
+        return f"PASS: integrity verified; diagnostic {stage}, not submission eligible (verifier rc=0)"
     if stage in SEMANTIC_SMOKE_STAGES:
         if rc == 1 and invalid_ok:
             return "PASS: integrity verified; expected INVALID smoke (verifier rc=1)"
@@ -4932,6 +4966,9 @@ def io500_verifier_record(stage: str, rc: int, output: str) -> dict:
         "verdict": verdict,
         "output": output,
         "failure": failure,
+        "submission_scope": (
+            "diagnostic_only" if stage in SEMANTIC_SMOKE_STAGES else "not_assessed"
+        ),
     }
 
 
@@ -4999,12 +5036,12 @@ def parse_io500_metrics(text: str) -> dict:
     }
 
 
-def validate_standard_phase_metrics(metrics: dict) -> None:
+def validate_standard_phase_metrics(metrics: dict, required_phases=STANDARD_IO500_PHASES) -> None:
     """Final artifact gate, independent of possibly interleaved console lines."""
     phases = metrics["phases"]
     names = [phase["name"] for phase in phases]
-    if len(names) != 13 or set(names) != STANDARD_IO500_PHASES:
-        raise ValueError(f"standard result lacks exactly 13 actual IO500 phases: {names}")
+    if len(names) != len(required_phases) or set(names) != required_phases:
+        raise ValueError(f"result lacks exactly {len(required_phases)} actual IO500 phases: {names}")
     for phase in phases:
         seconds = phase["seconds"]
         if not math.isfinite(seconds) or not 0 < seconds <= 600:
@@ -5095,6 +5132,21 @@ def io500_phase_enabled(config_text: str, phase: str) -> bool:
         raise ValueError(f"IO500 phase {phase} has an invalid run value") from error
 
 
+def validate_io500_find_results(text: str, config_text: str) -> None:
+    for phase in ("find", "find-easy", "find-hard"):
+        find_enabled = io500_phase_enabled(config_text, phase)
+        section = re.search(
+            rf"(?ms)^\[{re.escape(phase)}\]\s*$\n(.*?)(?=^\[|\Z)", text
+        )
+        find_section = re.search(r"(?m)^found\s*=\s*(\d+)\s*$", section.group(1)) if section else None
+        if find_enabled and (
+            find_section is None or int(find_section.group(1)) <= 0
+        ):
+            if phase == "find":
+                raise ValueError("IO500 find phase did not match any file")
+            raise ValueError(f"IO500 {phase} phase did not match any file")
+
+
 def extract_results(paths: Paths) -> dict:
     extracted = paths.bundle / "result-disk"
     extracted.mkdir()
@@ -5114,14 +5166,7 @@ def extract_results(paths: Paths) -> dict:
     shutil.copy2(config_path, paths.bundle / "config.ini")
     text = result_path.read_text(encoding="utf-8", errors="replace")
     config_text = config_path.read_text(encoding="utf-8", errors="strict")
-    find_enabled = io500_phase_enabled(config_text, "find")
-    find_section = re.search(
-        r"(?ms)^\[find\]\s*$.*?^found\s*=\s*(\d+)\s*$", text
-    )
-    if find_enabled and (
-        find_section is None or int(find_section.group(1)) <= 0
-    ):
-        raise ValueError("IO500 find phase did not match any file")
+    validate_io500_find_results(text, config_text)
     invalid_lines = [line for line in text.splitlines() if "[INVALID]" in line]
     return {
         "result_path": str(paths.bundle / "result.txt"),
@@ -5558,7 +5603,7 @@ def execute(
                 cost_started_ns,
                 time.monotonic_ns(),
             )
-            if paths.stage in ("scc", "standard", "stress-tiny") and serving_transport == "cxl":
+            if paths.stage in ("scc", "standard", "stress-tiny", "full22", "pressure22") and serving_transport == "cxl":
                 mpi_command = result["commands"]["mpi"]
                 mpi_output = client_consoles[0].output[
                     mpi_command["output_start"]:mpi_command["output_end"]
@@ -5769,8 +5814,8 @@ def execute(
         if paths.stage != "hello":
             io500 = extract_results(paths)
             result["io500"] = io500
-            if paths.stage == "standard":
-                validate_standard_phase_metrics(io500["metrics"])
+            if paths.stage in ("standard", "full22"):
+                validate_standard_phase_metrics(io500["metrics"], FULL_IO500_PHASES if paths.stage == "full22" else STANDARD_IO500_PHASES)
             elif paths.stage in PRESSURE_SMOKE_RANKS:
                 validate_pressure_phase_metrics(paths.stage, io500["metrics"])
             no_invalid = not io500["invalid"]
@@ -5786,6 +5831,7 @@ def execute(
                     ("EXPECTED_INVALID_SEMANTIC_SMOKE" if paths.stage in SEMANTIC_SMOKE_STAGES else "FAIL")
                 ),
                 "verifier": verifier["verdict"],
+                "submission_scope": verifier["submission_scope"],
                 "scale": (
                     f"{client_count} ranks / {client_count} independent client QEMU guests / "
                     f"{server_count} server guests"
@@ -5896,6 +5942,8 @@ def parse_args(argv=None):
             "hello",
             "tiny",
             "stress-tiny",
+            "full22",
+            "pressure22",
             "rollover-smoke",
             "easy-smoke",
             "hard-smoke",

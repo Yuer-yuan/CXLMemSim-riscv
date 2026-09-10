@@ -47,8 +47,8 @@ Usage: scripts/rebuild_legofs_io500_payload.sh [--jobs N]
 
 Rebuild only the LegoFS RISC-V server, benchmark and preload library, then
 atomically replace the IO500 guest payload image. Existing QEMU, CXLMemSim,
-OpenSBI, U-Boot, Linux, IO500, MPI and toolchain artifacts are prerequisites
-and are never rebuilt by this command.
+OpenSBI, U-Boot, Linux, MPI and toolchain artifacts are prerequisites.
+IOR and IO500 are incrementally rebuilt with the pinned PRNG compatibility fix.
 EOF
 }
 
@@ -129,7 +129,7 @@ require_executable "$STATIC_MUSL_CC"
 require_executable "$MUSL_CC"
 require_executable "$NOV_GCC"
 
-for stage in tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard; do
+for stage in tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard full22 pressure22; do
 	require_file "$ROOT/configs/io500-$stage.ini"
 done
 
@@ -150,6 +150,17 @@ platform_hashes()
 }
 
 platform_hashes_before="$(platform_hashes)"
+
+# The pinned IOR count/fill passes must seed the same rand() stream on musl.
+# Rebuild this narrow compatibility fix as well as LegoFS; do not reuse an
+# otherwise current payload containing the original random-offset overflow.
+python3 "$ROOT/scripts/patch_io500_pressure.py" \
+    --source "$SOURCES/io500/src/phase_mdtest_easy_write.c" \
+    --ior-easy-source "$SOURCES/io500/src/phase_ior_easy_write.c"
+python3 "$ROOT/scripts/patch_io500_ior_random_seed.py" \
+    --source "$SOURCES/io500/build/ior/src/ior.c"
+make -C "$SOURCES/io500/build/ior/src" -j "$JOBS" libaiori.a
+make -C "$SOURCES/io500" -j "$JOBS" CC="$MPICH_PREFIX/bin/mpicc" AR="${CROSS_COMPILE}ar"
 
 printf '%s\n' '[io500-payload] vendored RISC-V syscall interceptor'
 SYSINT_ROOT="$LEGOFS_ROOT/third_party/syscall-intercept-riscv" \
@@ -235,7 +246,7 @@ cp -a "${mpi_libraries[@]}" "$PAYLOAD_TREE/lib/"
 cp -a "${sysint_libraries[@]}" "$PAYLOAD_TREE/lib/"
 cp -a "${unwind_libraries[@]}" "$PAYLOAD_TREE/lib/"
 
-for stage in tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard; do
+for stage in tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard full22 pressure22; do
 	install -m 0644 "$ROOT/configs/io500-$stage.ini" \
 		"$PAYLOAD_TREE/etc/io500-$stage.ini"
 done

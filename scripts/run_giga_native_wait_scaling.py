@@ -7,6 +7,7 @@ code alone is insufficient: some perf versions return zero for a failed child.
 """
 import argparse
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -43,7 +44,9 @@ def main(argv=None):
     p.add_argument("--label", required=True)
     p.add_argument("--policies", nargs="+", choices=POLICIES, default=["timer", "both-yield"])
     p.add_argument("--repetitions", type=int, default=2)
-    p.add_argument("--order", default="1,3,2")
+    p.add_argument("--order", default="1,3,2,6,10")
+    p.add_argument("--server-cores", nargs="+", type=int, choices=[1, 2, 4], default=[4])
+    p.add_argument("--server-runtime-workers", nargs="+", type=int, choices=range(0, 65), default=[0], help="0 selects the server CPU budget, capped at 4")
     p.add_argument("--profile", choices=["bounded", "capacity-5s", "capacity-20s"], default="capacity-5s")
     p.add_argument("--pmu", help="optional sysfs PMU device, e.g. cxl_pmu_mem0.0")
     p.add_argument("--events", default="m2s_req_memrd,m2s_rwd_memwr,ddr_casrd,ddr_caswr")
@@ -51,8 +54,10 @@ def main(argv=None):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,70}", a.label):
         p.error("invalid label")
     order = [int(x) for x in a.order.split(",")]
-    if sorted(order) != [1, 2, 3] or a.repetitions < 1:
-        p.error("order must contain 1, 2, 3 exactly once; repetitions must be positive")
+    if len(set(a.server_runtime_workers)) != len(a.server_runtime_workers):
+        p.error("runtime worker counts must be unique")
+    if not order or len(set(order)) != len(order) or not set(order) <= {1, 2, 3, 6, 10} or a.repetitions < 1:
+        p.error("order must contain unique values from 1,2,3,6,10; repetitions must be positive")
     root = a.root.resolve()
     out = root / "target/results/legofs-dual-host/native" / a.label
     out.mkdir(parents=True, exist_ok=False)
@@ -73,15 +78,21 @@ def main(argv=None):
     for repeat in range(1, a.repetitions + 1):
         policies = a.policies if repeat % 2 else list(reversed(a.policies))
         topologies = order if repeat % 2 else list(reversed(order))
+        worker_counts = a.server_runtime_workers if repeat % 2 else list(reversed(a.server_runtime_workers))
         for policy in policies:
             client_mode, server_mode = POLICIES[policy]
-            for n in topologies:
-                label = f"dual-{a.label}-r{repeat}-{policy}-{n}c1s"
-                sample = out / f"r{repeat}-{policy}-{n}c1s"
+            for n, server_cores, requested_workers in itertools.product(topologies, a.server_cores, worker_counts):
+                workers = requested_workers or min(server_cores, 4)
+                label = f"dual-{a.label}-r{repeat}-{policy}-{n}c1s-s{server_cores}"
+                suffix = f"-w{workers}" if workers != 4 else ""
+                label += suffix
+                sample = out / f"r{repeat}-{policy}-{n}c1s-s{server_cores}{suffix}"
                 sample.mkdir()
                 wrapper = [str(root / "scripts/run_giga_native_legofs_io500.sh"),
                            "--topology", f"{n}c1s", "--profile", a.profile, "--run-id", label,
-                           "--cq-wait-mode", client_mode, "--authority-wait-mode", server_mode]
+                           "--cq-wait-mode", client_mode, "--authority-wait-mode", server_mode,
+                           "--server-cpus", {1: "19", 2: "18,19", 4: "18,19,20,21"}[server_cores],
+                           "--server-runtime-workers", str(workers)]
                 command = shlex.split(subprocess.check_output([*wrapper, "--print-command"], text=True))
                 bundle = Path(command[command.index("--bundle-dir") + 1])
                 run_root = Path(command[command.index("--run-root") + 1])
@@ -92,7 +103,8 @@ def main(argv=None):
                     measured = ["perf", "stat", "-a", "-I", "1000", "-x", ",", "-o",
                                 str(sample / "perf.csv"), "-e",
                                 ",".join(f"{a.pmu}/{e}/" for e in events), "--", *command]
-                entry = dict(label=label, repetition=repeat, policy=policy, clients=n,
+                entry = dict(label=label, repetition=repeat, policy=policy, clients=n, server_cores=server_cores,
+                             server_runtime_workers=workers,
                              command=command, measured_command=measured, bundle=str(bundle),
                              started_unix=time.time(), started_monotonic=time.monotonic(),
                              build_manifest_sha256=hashlib.sha256(source).hexdigest())

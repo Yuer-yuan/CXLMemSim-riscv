@@ -169,6 +169,20 @@ elif [ "$index" = 0 ]; then
 	mkdir -p "/results/$stage"
 fi
 
+# Preserve the first full-workload crash without dumping the shared CXL map.
+# Only client0 owns a result disk; the other guests retain register diagnostics.
+if { [ "$stage" = full22 ] || [ "$stage" = pressure22 ]; } && [ "$role" = client ]; then
+    if [ -w /proc/sys/kernel/print-fatal-signals ]; then
+        echo 1 > /proc/sys/kernel/print-fatal-signals
+    fi
+    if [ "$index" = 0 ] && [ -w /proc/sys/kernel/core_pattern ]; then
+        echo '/results/core.%e.%p' > /proc/sys/kernel/core_pattern
+        ulimit -c 262144
+        echo 0x33 > /proc/self/coredump_filter
+        echo "LEGOFS_CRASH_CAPTURE endpoint=0 limit_kib=262144 shared_file_maps=excluded"
+    fi
+fi
+
 # Each guest must discover its sole device-DAX child from sysfs.  Never assume
 # that a particular daxN.M number survives across kernels or boot order.
 dax_name=
@@ -523,7 +537,7 @@ while IFS= read -r line; do
 		hello)
 			application=/payload/bin/mpi-hello
 			;;
-		tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard)
+		tiny|stress-tiny|rollover-smoke|easy-smoke|hard-smoke|metadata-smoke|small-close-smoke|rnd4k|scc|standard|full22|pressure22)
 			application=/payload/bin/run-io500-rank
 			;;
 		*)
@@ -539,8 +553,8 @@ while IFS= read -r line; do
 				"$application" "$mpi_stage"
 			rc=$?
 			case "$mpi_stage:$rc" in
-			scc:0|standard:0|stress-tiny:0) ;;
-			scc:*|standard:*|stress-tiny:*)
+			scc:0|standard:0|stress-tiny:0|full22:0|pressure22:0) ;;
+			scc:*|standard:*|stress-tiny:*|full22:*|pressure22:*)
 				# MPI_Abort terminates the rank scripts before their normal
 				# exporter can run.  Preserve the benchmark's own error files
 				# through a fresh CLIENT_FS lane while every authority and CXL

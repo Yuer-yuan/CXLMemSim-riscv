@@ -17,6 +17,7 @@ PRINT_COMMAND=false
 CQ_WAIT_MODE=timer_sleep
 AUTHORITY_WAIT_MODE=timer_sleep
 SERVER_CPUS=
+SERVER_RUNTIME_WORKERS=
 
 usage()
 {
@@ -24,7 +25,7 @@ usage()
 Usage: run_giga_native_legofs_io500.sh OPTIONS
 
 Required:
-  --topology 1c1s|2c1s|3c1s
+  --topology 1c1s|2c1s|3c1s|6c1s|10c1s
   --profile bounded|find-valid|capacity-5s|capacity-20s|official
   --run-id ID
 
@@ -32,6 +33,7 @@ Optional:
   --cq-wait-mode timer_sleep|cooperative_yield (default: timer_sleep)
   --authority-wait-mode timer_sleep|cooperative_yield (default: timer_sleep)
   --server-cpus LIST  Bind server threads to CPUs in the reviewed server LLC.
+  --server-runtime-workers N  Tokio workers per server, 1..64 (default: server CPU count, capped at 4).
   --build            Build and validate native artifacts first.
   --preflight-only   Validate the host and command without creating a run.
   --print-command    Print the quoted component-runner command and exit.
@@ -77,6 +79,12 @@ while (($#)); do
 		SERVER_CPUS="$2"
 		shift 2
 		;;
+	--server-runtime-workers)
+		(($# >= 2)) || die "--server-runtime-workers requires a value"
+		[[ "$2" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || die "invalid runtime worker count: $2"
+		SERVER_RUNTIME_WORKERS="$2"
+		shift 2
+		;;
 	--build)
 		BUILD_FIRST=true
 		shift
@@ -100,12 +108,12 @@ done
 case "$TOPOLOGY" in
 1c1s)
 	MPI_RANKS=1
-	SERVER_CPU=7
+	SERVER_CPU=19
 	CLIENT_CPUS=1
 	;;
 2c1s)
 	MPI_RANKS=2
-	SERVER_CPU=13
+	SERVER_CPU=19
 	CLIENT_CPUS=1,7
 	;;
 3c1s)
@@ -113,8 +121,26 @@ case "$TOPOLOGY" in
 	SERVER_CPU=19
 	CLIENT_CPUS=1,7,13
 	;;
-*) die "--topology must be 1c1s, 2c1s, or 3c1s" ;;
+6c1s)
+	MPI_RANKS=6
+	SERVER_CPU=19
+	CLIENT_CPUS=1,7,13,2,8,14
+	;;
+10c1s)
+	MPI_RANKS=10
+	SERVER_CPU=19
+	CLIENT_CPUS=1,7,13,2,8,14,3,9,15,4
+	;;
+*) die "--topology must be 1c1s, 2c1s, 3c1s, 6c1s, or 10c1s" ;;
 esac
+
+if [ -z "$SERVER_RUNTIME_WORKERS" ]; then
+	IFS=, read -r -a worker_cpus <<< "${SERVER_CPUS:-$SERVER_CPU}"
+	declare -A unique_worker_cpus=()
+	for cpu in "${worker_cpus[@]}"; do unique_worker_cpus["$cpu"]=1; done
+	SERVER_RUNTIME_WORKERS=${#unique_worker_cpus[@]}
+	if ((SERVER_RUNTIME_WORKERS > 4)); then SERVER_RUNTIME_WORKERS=4; fi
+fi
 
 case "$PROFILE" in
 bounded)
@@ -196,6 +222,7 @@ command=(
 	--serving-max-clients 64
 	--region-size-gib 64
 	--server-cpu "$SERVER_CPU"
+	--server-runtime-workers "$SERVER_RUNTIME_WORKERS"
 	--client-cpus "$CLIENT_CPUS"
 	--rank-launcher "$LEGOFS_ROOT/scripts/giga_native_rank.py"
 )

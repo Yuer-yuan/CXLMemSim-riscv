@@ -459,6 +459,10 @@ MPICC="$MPICH_PREFIX/bin/mpicc"
 
 printf '%s\n' '[io500-build] real-MPI IOR, pfind, IO500, and verifier'
 IOR_SOURCE="$SOURCES/io500/build/ior"
+python3 "$ROOT/scripts/patch_io500_pressure.py" \
+    --source "$SOURCES/io500/src/phase_mdtest_easy_write.c" \
+    --ior-easy-source "$SOURCES/io500/src/phase_ior_easy_write.c"
+python3 "$ROOT/scripts/patch_io500_ior_random_seed.py" --source "$IOR_SOURCE/src/ior.c"
 if [ ! -x "$IOR_SOURCE/configure" ]; then
 	(
 		cd "$IOR_SOURCE"
@@ -542,7 +546,7 @@ install -m 0755 "$CARGO_TARGET/$RUST_MUSL_TARGET/release/libbadfs_intercept.so" 
 cp -a "$MPICH_PREFIX/lib/"libmpi.so* "$PAYLOAD_ROOT/lib/"
 cp -a "$SYSINT_BUILD_ROOT/build/"libsyscall_intercept.so* "$PAYLOAD_ROOT/lib/"
 cp -a "$LIBUNWIND_PREFIX/lib/"libunwind.so* "$PAYLOAD_ROOT/lib/"
-for stage in tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard; do
+for stage in tiny stress-tiny rollover-smoke easy-smoke hard-smoke metadata-smoke small-close-smoke rnd4k scc standard full22 pressure22; do
 	install -m 0644 "$ROOT/configs/io500-$stage.ini" "$PAYLOAD_ROOT/etc/io500-$stage.ini"
 done
 for index in $(seq 0 9); do

@@ -93,21 +93,45 @@ class GigaNativeIo500ScriptsTest(unittest.TestCase):
             0,
         )
 
+    def test_runtime_workers_are_explicit_and_do_not_change_affinity(self):
+        command = [str(RUN), "--print-command", "--topology", "3c1s",
+                   "--profile", "capacity-5s", "--run-id", "runtime-workers"]
+        for workers in (1, 4, 64):
+            result = subprocess.run(command + ["--server-runtime-workers", str(workers)],
+                                    text=True, capture_output=True, check=True)
+            self.assertIn(f"--server-runtime-workers {workers}", result.stdout)
+            self.assertIn("--server-cpu 19", result.stdout)
+            self.assertIn("--mpi-ranks 3", result.stdout)
+        for value in ("0", "65", "-1", "1,4", "bad"):
+            self.assertNotEqual(subprocess.run(command + ["--server-runtime-workers", value],
+                                              capture_output=True).returncode, 0)
+        self.assertIn("--server-runtime-workers 1", self.render("1c1s"))
+        for cpus, expected in [("18,19", 2), ("18,19,20,21", 4)]:
+            result = subprocess.run(command + ["--server-cpus", cpus], capture_output=True, text=True, check=True)
+            self.assertIn(f"--server-runtime-workers {expected}", result.stdout)
+
     def test_run_command_maps_each_topology_to_distinct_llcs(self):
         one = self.render("1c1s")
         self.assertIn("--mpi-ranks 1", one)
-        self.assertIn("--server-cpu 7", one)
+        self.assertIn("--server-cpu 19", one)
         self.assertIn("--client-cpus 1", one)
 
         two = self.render("2c1s")
         self.assertIn("--mpi-ranks 2", two)
-        self.assertIn("--server-cpu 13", two)
+        self.assertIn("--server-cpu 19", two)
         self.assertIn("--client-cpus 1,7", two)
 
         three = self.render("3c1s")
         self.assertIn("--mpi-ranks 3", three)
         self.assertIn("--server-cpu 19", three)
         self.assertIn("--client-cpus 1,7,13", three)
+
+    def test_high_client_counts_share_client_llcs_with_fixed_server(self):
+        for n, cpus in [(6, "1,7,13,2,8,14"), (10, "1,7,13,2,8,14,3,9,15,4")]:
+            rendered = self.render(f"{n}c1s", "capacity-5s")
+            self.assertIn(f"--mpi-ranks {n}", rendered)
+            self.assertIn(f"--client-cpus {cpus}", rendered)
+            self.assertIn("--server-cpu 19", rendered)
 
     def test_capacity_five_second_profile_preserves_official_geometry(self):
         rendered = self.render("2c1s", "capacity-5s")

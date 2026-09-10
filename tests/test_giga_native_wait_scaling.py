@@ -18,3 +18,7 @@ class MeasuredCommandVerdictTest(unittest.TestCase):
                 (bundle / "result.json").write_text(json.dumps({"verdict": verdict, "cleanup": {"absent": absent}}))
                 self.assertEqual(MODULE.accepted_case(0, bundle)["accepted"], expected)
             self.assertFalse(MODULE.accepted_case(1, bundle)["accepted"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -251,6 +251,43 @@ def recovery_checkpoint(server=0):
 
 
 class Io500RuntimeTest(unittest.TestCase):
+    def test_full22_requires_all_phases_and_keeps_pressure_separate(self):
+        module = load_runner()
+        self.assertEqual(len(module.FULL_IO500_PHASES), 22)
+        self.assertEqual(len(module.PRESSURE_SMOKE_PHASES["stress-tiny"]), 12)
+        phases = [{"name": name, "seconds": 5.0} for name in module.FULL_IO500_PHASES]
+        module.validate_standard_phase_metrics({"phases": phases}, module.FULL_IO500_PHASES)
+        for invalid in [phases[:-1], phases + [phases[0]],
+                        [{"name": p["name"], "seconds": 601} for p in phases]]:
+            with self.assertRaises(ValueError):
+                module.validate_standard_phase_metrics({"phases": invalid}, module.FULL_IO500_PHASES)
+        watchdog = module.IO500PhaseWatchdog(module.FULL_IO500_PHASES)
+        output = "IO500 version test\n"
+        for name in sorted(module.FULL_IO500_PHASES):
+            output += f"[RESULT] {name} 1.0 kIOPS : time 5.0 seconds\n"
+        watchdog.observe(output, 0)
+        self.assertEqual(watchdog.completed, module.FULL_IO500_PHASES)
+
+    def test_full22_config_and_payload_entrypoints(self):
+        import configparser
+        module = load_runner()
+        config = configparser.ConfigParser()
+        config.read(ROOT / "configs/io500-full22.ini")
+        self.assertEqual(config["debug"]["stonewall-time"], "60")
+        self.assertGreaterEqual(config.getint("mdtest-easy", "n"), 102)
+        self.assertGreaterEqual(config.getint("mdtest-hard", "n"), 102)
+        self.assertEqual(config.getint("mdtest-hard", "files-per-dir"), 102)
+        for phase in module.FULL_IO500_PHASES:
+            self.assertEqual(config[phase]["run"], "TRUE", phase)
+        self.assertEqual(config["global"]["resultdir"], "/badfs/io500-full22-results")
+        for path in [TOP_LEVEL_RUNNER, BUILD_SCRIPT, PAYLOAD_REBUILD_SCRIPT,
+                     RANK_SCRIPT, INIT_SCRIPT, RESULT_EXPORT_SOURCE]:
+            self.assertIn("full22", path.read_text(), str(path))
+        self.assertIn("full22", module.SEMANTIC_SMOKE_STAGES)
+        self.assertIn('if { [ "$stage" = full22 ] || [ "$stage" = pressure22 ]; }; then\n    set -- --mode=extended', RANK_SCRIPT.read_text())
+        self.assertIn('/payload/bin/io500 "/payload/etc/io500-$stage.ini" "$@"', RANK_SCRIPT.read_text())
+
+
     def test_blocking_payload_wait_propagates_caller_and_dependency_identity(self):
         common = (ROOT / "components/legofs/badfs-common/src/lifecycle.rs").read_text()
         for name in ("wait_for_payload_receipts", "close_payload_dependencies", "persist_locked_with_barrier", "persist_locked"):
@@ -1829,7 +1866,7 @@ class Io500RuntimeTest(unittest.TestCase):
             self.runner.wait_mpi_exit(console, "tiny", timeout=3600, start=0)
 
         console.output = "LEGOFS_IO500_MPI_EXIT stage=metadata-smoke rc=0\r\n"
-        for marker in ("BADFS_DIRECT_MUTATION_WORKER_FAILED", "BADFS_DIRECT_MUTATION_APPLY_FAILED", "BADFS_DIRECT_MUTATION_MARK_FAILED", "LEGOFS_WRITER_PERSIST_FAILURE"):
+        for marker in ("BADFS_DIRECT_MUTATION_WORKER_FAILED", "BADFS_DIRECT_MUTATION_APPLY_FAILED", "BADFS_DIRECT_MUTATION_MARK_FAILED", "BADFS_DIRECT_WRITE_RING_PROOF_SCAN_FAILED", "LEGOFS_WRITER_PERSIST_FAILURE"):
             with self.subTest(marker=marker):
                 server = FakeConsole(marker + " lane=7 error=EIO\r\n")
                 with self.assertRaisesRegex(RuntimeError, "server0.*fatal marker"):
@@ -2065,6 +2102,25 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertIn("failed clean verification", failed["failure"])
         self.assertTrue(failed["verdict"].startswith("FAIL:"))
 
+    def test_full22_hash_verification_does_not_imply_submission_eligibility(self):
+        for rc, output in (
+            (0, "Verbosity: 1\r\r\n[OK]\r\r\n"),
+            (1, "[OK] But this is an invalid run!\r\n"),
+        ):
+            record = self.runner.io500_verifier_record("full22", rc, output)
+            self.assertIsNone(record["failure"])
+            self.assertEqual(record["submission_scope"], "diagnostic_only")
+        for rc, output in (
+            (0, "ERROR: Configuration hash expected: A read: B\n[OK]\n"),
+            (1, "ERROR: Score hash expected: A read: B\n[OK] But this is an invalid run!\n"),
+            (0, "prefix [OK]\n"),
+            (1, "[OK]\n"),
+            (0, "[OK] But this is an invalid run!\n"),
+        ):
+            self.assertIsNotNone(
+                self.runner.io500_verifier_record("full22", rc, output)["failure"]
+            )
+
         source = RUNNER.read_text()
         self.assertLess(
             source.index("io500 = extract_results(paths)"),
@@ -2085,6 +2141,19 @@ class Io500RuntimeTest(unittest.TestCase):
         self.assertFalse(
             self.runner.io500_phase_enabled("[find]\nrun = FALSE\n", "find")
         )
+
+    def test_all_enabled_find_phases_require_their_own_positive_result(self):
+        phases = ("find", "find-easy", "find-hard")
+        config = "".join(f"[{phase}]\nrun = TRUE\n" for phase in phases)
+        good = "".join(f"[{phase}]\nfound = 10\n" for phase in phases)
+        self.runner.validate_io500_find_results(good, config)
+        for phase in phases:
+            for body in ("found = 0", "total-files = 100"):
+                with self.subTest(phase=phase, body=body):
+                    bad = good.replace(f"[{phase}]\nfound = 10", f"[{phase}]\n{body}")
+                    with self.assertRaisesRegex(ValueError, phase):
+                        self.runner.validate_io500_find_results(bad, config)
+        self.runner.validate_io500_find_results("", "[find]\nrun = FALSE\n")
 
     def test_tiny_hard_mdtest_completes_an_io500_find_candidate(self):
         config = (ROOT / "configs" / "io500-tiny.ini").read_text()
